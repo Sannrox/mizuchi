@@ -1,0 +1,6 @@
+# Ported from Sannrox/shikigami@331897846885e4a55697b0f1006d03b4f2a7495e .agents/skills/prepare-release/agents/openai.yaml (adapted for mizuchi).
+# Compare against the source to detect drift.
+interface:
+  display_name: "Prepare Release"
+  short_description: "Build evidence for a safe project release"
+  default_prompt: "Use $prepare-release to prepare the next mizuchi release."

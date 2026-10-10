@@ -1,0 +1,10 @@
+/target
+.state/
+/.worktrees/
+/bench-data/
+*.spill
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

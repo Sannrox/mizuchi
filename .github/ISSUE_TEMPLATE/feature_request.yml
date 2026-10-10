@@ -1,0 +1,68 @@
+name: Feature request
+description: Propose a focused capability or improvement.
+title: "feat: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem needs to be solved?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior rather than only an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance evidence
+      description: What observable examples, tests, or measurements will demonstrate that the outcome is complete?
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: What related behavior is intentionally outside this request?
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: How is the problem handled today, and what tradeoffs did you consider?
+  - type: dropdown
+    id: boundary
+    attributes:
+      label: Primary area
+      options:
+        - SQL and logical plan
+        - Optimizer
+        - Execution and memory
+        - Readers and formats
+        - Correctness and benchmarks
+        - Integration (embedding runners)
+        - Distributed execution
+        - Python API
+        - Documentation
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Compatibility and risk
+      description: Note contract, security, privacy, or operator implications.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and pull requests.
+          required: true
+        - label: I omitted hostnames, home paths, and other private environment details.
+          required: true
+        - label: Inputs and outputs stay standard Arrow, or this explains why the boundary should change.
+          required: true

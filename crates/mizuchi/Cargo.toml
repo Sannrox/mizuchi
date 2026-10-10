@@ -1,0 +1,13 @@
+[package]
+name = "mizuchi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Arrow-native query and transform engine in Rust: single-node first, distributed later."
+keywords = ["sql", "arrow", "query-engine", "dataframe", "data"]
+categories = ["database-implementations"]
+homepage = "https://github.com/Sannrox/mizuchi"
+
+[dependencies]

@@ -1,0 +1,6 @@
+# Ported from Sannrox/shikigami@331897846885e4a55697b0f1006d03b4f2a7495e .agents/skills/capture-project-decision/agents/openai.yaml (verbatim).
+# Compare against the source to detect drift.
+interface:
+  display_name: "Capture Project Decision"
+  short_description: "Promote decisions into durable knowledge"
+  default_prompt: "Use $capture-project-decision to record the durable outcome of this design decision."

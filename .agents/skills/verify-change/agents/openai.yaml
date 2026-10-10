@@ -1,0 +1,6 @@
+# Ported from Sannrox/shikigami@331897846885e4a55697b0f1006d03b4f2a7495e .agents/skills/verify-change/agents/openai.yaml (verbatim).
+# Compare against the source to detect drift.
+interface:
+  display_name: "Verify Change"
+  short_description: "Run proportionate Rust change verification"
+  default_prompt: "Use $verify-change to verify this repository change and report the evidence."
