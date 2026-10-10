@@ -15,3 +15,4 @@ All notable changes to this project are documented here.
 - Pull-based vectorized scan, filter, and projection over in-memory tables; end-to-end SELECT ... WHERE (ADR 0004).
 - Hash aggregate: grouped and ungrouped COUNT, SUM, MIN, MAX, AVG, and COUNT DISTINCT over Arrow batches, including empty input and null grouping keys.
 - Hash join: inner, left, right, full, semi, and anti over Arrow batches. Null keys never match; CROSS JOIN is a nested loop.
+- Sort, top-k, and limit/offset over Arrow batches. ORDER BY honors ASC/DESC and NULLS FIRST/LAST; LIMIT after ORDER BY sorts only the kept prefix.
