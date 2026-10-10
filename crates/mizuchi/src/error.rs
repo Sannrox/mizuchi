@@ -13,6 +13,8 @@ pub enum Error {
     InvalidPolicy(&'static str),
     /// Scalar expression evaluation failed.
     Eval(String),
+    /// SQL lexing or parsing failed.
+    Parse(String),
 }
 
 impl std::fmt::Display for Error {
@@ -23,6 +25,7 @@ impl std::fmt::Display for Error {
             Error::InvalidBatch(reason) => write!(f, "invalid batch: {reason}"),
             Error::InvalidPolicy(reason) => write!(f, "invalid batch policy: {reason}"),
             Error::Eval(reason) => write!(f, "expression eval: {reason}"),
+            Error::Parse(reason) => write!(f, "sql parse: {reason}"),
         }
     }
 }
