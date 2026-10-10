@@ -173,13 +173,39 @@ fn physical(plan: &LogicalPlan, session: &Session) -> Result<Exec> {
             schema: schema.clone(),
             done: false,
         }),
-        LogicalPlan::Scan { table, .. } => {
+        LogicalPlan::Scan {
+            table,
+            projection,
+            filters,
+            ..
+        } => {
             let table = session
                 .tables
                 .get(&normalize_name(table))
                 .ok_or_else(|| Error::Plan(format!("table not found at execution: {table}")))?;
             let mut morsels = Vec::new();
             for batch in &table.batches {
+                let mut batch = batch.clone();
+                for pred in filters {
+                    match filter_batch(&batch, pred)? {
+                        Some(kept) => batch = kept,
+                        None => {
+                            batch = Batch::empty(batch.schema())?;
+                            break;
+                        }
+                    }
+                }
+                if let Some(names) = projection {
+                    let mut indices = Vec::with_capacity(names.len());
+                    for name in names {
+                        let idx = batch
+                            .schema()
+                            .index_of(name)
+                            .map_err(|e| Error::Plan(format!("scan projection: {e}")))?;
+                        indices.push(idx);
+                    }
+                    batch = batch.project(&indices)?;
+                }
                 morsels.extend(batch.split_by_policy(&session.policy));
             }
             Ok(Exec::Scan {
@@ -416,6 +442,14 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_filter_after_reordering_projection() {
+        let out = session()
+            .execute_sql("SELECT a FROM (SELECT b, a FROM t) s WHERE COALESCE(a, 0) > 1")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(2), Some(3)]);
+    }
+
+    #[test]
     fn filter_drops_null_predicates() {
         let out = session()
             .execute_sql("SELECT a FROM t WHERE a = 1")
@@ -587,6 +621,18 @@ mod tests {
         assert_eq!(
             sorted_pairs(&out, "a", "id"),
             vec![(Some(2), Some(2)), (Some(2), Some(2))]
+        );
+    }
+
+    #[test]
+    fn join_coalesce_filter_pushes_to_right() {
+        let s = join_session();
+        let out = s
+            .execute_sql("SELECT t.a, u.x FROM t JOIN u ON t.a = u.id WHERE COALESCE(u.x, 0) > 20")
+            .unwrap();
+        assert_eq!(
+            sorted_pairs(&out, "a", "x"),
+            vec![(Some(2), Some(30)), (Some(2), Some(30))]
         );
     }
 

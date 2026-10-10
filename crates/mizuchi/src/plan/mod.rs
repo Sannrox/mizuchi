@@ -158,10 +158,14 @@ pub enum LogicalPlan {
     Scan {
         /// Catalog table name.
         table: String,
-        /// Scan schema.
+        /// Output schema after any pushed projection.
         schema: SchemaRef,
         /// Optional alias used in name resolution.
         alias: Option<String>,
+        /// Column names to read; `None` reads every table column.
+        projection: Option<Vec<String>>,
+        /// Predicates pushed into the scan, evaluated on the table schema.
+        filters: Vec<Expr>,
     },
     /// Filter rows by a boolean predicate.
     Filter {
@@ -264,15 +268,34 @@ fn explain_into(plan: &LogicalPlan, indent: usize, out: &mut String) {
             table,
             schema,
             alias,
-        } => match alias {
-            Some(alias) if alias != table => {
-                out.push_str(&format!(
-                    "{pad}Scan {table} AS {alias} {}\n",
-                    fmt_schema(schema)
-                ));
+            projection,
+            filters,
+        } => {
+            let mut extra = String::new();
+            if let Some(names) = projection {
+                extra.push_str(&format!(" projection=[{}]", names.join(", ")));
             }
-            _ => out.push_str(&format!("{pad}Scan {table} {}\n", fmt_schema(schema))),
-        },
+            if !filters.is_empty() {
+                let preds = filters
+                    .iter()
+                    .map(|f| fmt_expr(f, schema))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                extra.push_str(&format!(" filters=[{preds}]"));
+            }
+            match alias {
+                Some(alias) if alias != table => {
+                    out.push_str(&format!(
+                        "{pad}Scan {table} AS {alias}{extra} {}\n",
+                        fmt_schema(schema)
+                    ));
+                }
+                _ => out.push_str(&format!(
+                    "{pad}Scan {table}{extra} {}\n",
+                    fmt_schema(schema)
+                )),
+            }
+        }
         LogicalPlan::Filter { input, predicate } => {
             out.push_str(&format!(
                 "{pad}Filter {}\n",
