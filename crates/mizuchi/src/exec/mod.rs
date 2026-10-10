@@ -3,6 +3,8 @@
 //! See `docs/decisions/0004-pull-vectorized-execution.md`.
 
 mod agg;
+mod join;
+mod key;
 
 use std::collections::BTreeMap;
 
@@ -170,7 +172,27 @@ fn physical(plan: &LogicalPlan, session: &Session) -> Result<Exec> {
             let batches = agg::run(child, group, aggs, schema.clone(), &session.policy)?;
             Ok(Exec::Scan { batches, index: 0 })
         }
-        LogicalPlan::Join { .. } => Err(Error::NotImplemented("physical join")),
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+            schema,
+        } => {
+            let batches = join::run(
+                physical(left, session)?,
+                physical(right, session)?,
+                join::JoinSpec {
+                    join_type: *join_type,
+                    on: on.as_ref(),
+                    left_schema: left.schema().clone(),
+                    right_schema: right.schema().clone(),
+                    schema: schema.clone(),
+                },
+                &session.policy,
+            )?;
+            Ok(Exec::Scan { batches, index: 0 })
+        }
         LogicalPlan::Sort { .. } => Err(Error::NotImplemented("physical sort")),
         LogicalPlan::Limit { .. } => Err(Error::NotImplemented("physical limit")),
         LogicalPlan::Union { .. } => Err(Error::NotImplemented("physical union")),
@@ -187,7 +209,7 @@ fn collect(mut exec: Exec) -> Result<Vec<Batch>> {
     Ok(out)
 }
 
-fn filter_batch(batch: &Batch, predicate: &Expr) -> Result<Option<Batch>> {
+pub(super) fn filter_batch(batch: &Batch, predicate: &Expr) -> Result<Option<Batch>> {
     let mask = predicate.eval(batch)?;
     let bools = mask
         .as_any()
@@ -349,15 +371,155 @@ mod tests {
         assert_eq!(col_i64(&out, "x"), vec![Some(1)]);
     }
 
+    fn join_session() -> Session {
+        let t_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let t = Batch::try_new(
+            t_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![
+                Some(1),
+                Some(2),
+                Some(2),
+                Some(3),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let u_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+        ]));
+        let u = Batch::try_new(
+            u_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(2), Some(2), Some(4), None])),
+                Arc::new(Int64Array::from(vec![
+                    Some(10),
+                    Some(30),
+                    Some(40),
+                    Some(99),
+                ])),
+            ],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("t", t_schema, vec![t]).unwrap();
+        s.register("u", u_schema, vec![u]).unwrap();
+        s
+    }
+
+    fn sorted_pairs(batches: &[Batch], left: &str, right: &str) -> Vec<(Option<i64>, Option<i64>)> {
+        let mut rows: Vec<(Option<i64>, Option<i64>)> = col_i64(batches, left)
+            .into_iter()
+            .zip(col_i64(batches, right))
+            .collect();
+        rows.sort_by_key(|(l, r)| (l.unwrap_or(i64::MIN), r.unwrap_or(i64::MIN)));
+        rows
+    }
+
+    /// Independent nested-loop reference with SQL null-equality (null never matches).
+    fn reference_join(kind: &str) -> Vec<(Option<i64>, Option<i64>)> {
+        let left = [Some(1i64), Some(2), Some(2), Some(3), None];
+        let right = [Some(2i64), Some(2), Some(4), None];
+        let mut out = Vec::new();
+        let mut right_hit = [false; 4];
+        for l in left {
+            let mut matched = false;
+            for (ri, r) in right.iter().enumerate() {
+                let eq = matches!((l, r), (Some(a), Some(b)) if a == *b);
+                if eq {
+                    matched = true;
+                    right_hit[ri] = true;
+                    if kind != "semi" && kind != "anti" {
+                        out.push((l, *r));
+                    }
+                }
+            }
+            match kind {
+                "semi" if matched => out.push((l, l)),
+                "anti" if !matched => out.push((l, l)),
+                "left" | "full" if !matched => out.push((l, None)),
+                _ => {}
+            }
+        }
+        if kind == "right" || kind == "full" {
+            for (ri, r) in right.iter().enumerate() {
+                if !right_hit[ri] {
+                    out.push((None, *r));
+                }
+            }
+        }
+        out.sort_by_key(|(l, r)| (l.unwrap_or(i64::MIN), r.unwrap_or(i64::MIN)));
+        out
+    }
+
     #[test]
-    fn join_is_not_physically_implemented() {
-        let (schema, batches) = table();
-        let mut s = session();
-        s.register("u", schema, batches).unwrap();
-        assert!(matches!(
-            s.execute_sql("SELECT t.a FROM t JOIN u ON t.a = u.a"),
-            Err(Error::NotImplemented("physical join"))
-        ));
+    fn join_type_matrix_matches_reference() {
+        let s = join_session();
+        let cases = [
+            ("inner", "SELECT t.a, u.id FROM t JOIN u ON t.a = u.id"),
+            ("left", "SELECT t.a, u.id FROM t LEFT JOIN u ON t.a = u.id"),
+            (
+                "right",
+                "SELECT t.a, u.id FROM t RIGHT JOIN u ON t.a = u.id",
+            ),
+            (
+                "full",
+                "SELECT t.a, u.id FROM t FULL OUTER JOIN u ON t.a = u.id",
+            ),
+        ];
+        for (kind, sql) in cases {
+            let out = s.execute_sql(sql).unwrap();
+            assert_eq!(
+                sorted_pairs(&out, "a", "id"),
+                reference_join(kind),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn semi_and_anti_keep_left_rows() {
+        let s = join_session();
+        let semi = s
+            .execute_sql("SELECT t.a FROM t LEFT SEMI JOIN u ON t.a = u.id")
+            .unwrap();
+        let mut got = col_i64(&semi, "a");
+        got.sort_by_key(|v| v.unwrap_or(i64::MIN));
+        let mut want: Vec<Option<i64>> =
+            reference_join("semi").into_iter().map(|(l, _)| l).collect();
+        want.sort_by_key(|v| v.unwrap_or(i64::MIN));
+        assert_eq!(got, want);
+
+        let anti = s
+            .execute_sql("SELECT t.a FROM t LEFT ANTI JOIN u ON t.a = u.id")
+            .unwrap();
+        let mut got = col_i64(&anti, "a");
+        got.sort_by_key(|v| v.unwrap_or(i64::MIN));
+        let mut want: Vec<Option<i64>> =
+            reference_join("anti").into_iter().map(|(l, _)| l).collect();
+        want.sort_by_key(|v| v.unwrap_or(i64::MIN));
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn cross_join_is_cartesian() {
+        let s = join_session();
+        let out = s
+            .execute_sql("SELECT t.a, u.id FROM t CROSS JOIN u")
+            .unwrap();
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 5 * 4);
+    }
+
+    #[test]
+    fn join_residual_predicate() {
+        let s = join_session();
+        let out = s
+            .execute_sql("SELECT t.a, u.id FROM t JOIN u ON t.a = u.id AND u.x > 10")
+            .unwrap();
+        assert_eq!(
+            sorted_pairs(&out, "a", "id"),
+            vec![(Some(2), Some(2)), (Some(2), Some(2))]
+        );
     }
 
     #[test]
