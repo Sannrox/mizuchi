@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use sqlparser::ast::{
-    BinaryOperator, CastKind, Distinct, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator, LimitClause, ObjectName,
-    ObjectNamePart, Offset, OrderByKind, Query, Select, SelectItem,
+    BinaryOperator, CastKind, Distinct, DuplicateTreatment, Expr as SqlExpr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
+    LimitClause, ObjectName, ObjectNamePart, Offset, OrderByKind, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
     TableWithJoins, UnaryOperator, Value, WildcardAdditionalOptions,
 };
@@ -454,7 +454,14 @@ fn classify_agg(func: &Function) -> Option<AggKind> {
     })
 }
 
-fn make_agg(kind: AggKind, arg: Option<Expr>) -> Result<AggCall> {
+fn make_agg(kind: AggKind, arg: Option<Expr>, distinct: bool) -> Result<AggCall> {
+    if distinct {
+        return match (kind, arg) {
+            (AggKind::Count, Some(e)) => Ok(AggCall::CountDistinct(e)),
+            (AggKind::Count, None) => Err(Error::Plan("COUNT(DISTINCT *) is not valid".into())),
+            _ => Err(Error::NotImplemented("DISTINCT aggregate")),
+        };
+    }
     match (kind, arg) {
         (AggKind::Count, None) => Ok(AggCall::CountStar),
         (AggKind::Count, Some(e)) => Ok(AggCall::Count(e)),
@@ -502,7 +509,8 @@ fn bind_aggregate(input: LogicalPlan, scope: &Scope, select: &Select) -> Result<
                         return Err(Error::NotImplemented("window function"));
                     }
                     let arg = agg_arg(func, scope)?;
-                    let call = make_agg(kind, arg)?;
+                    let distinct = agg_distinct(func)?;
+                    let call = make_agg(kind, arg, distinct)?;
                     let name = match item {
                         SelectItem::ExprWithAlias { alias, .. } => ident_key(alias),
                         _ => infer_sql_name(expr),
@@ -557,9 +565,21 @@ fn agg_arg(func: &Function, scope: &Scope) -> Result<Option<Expr>> {
     if func.filter.is_some() {
         return Err(Error::NotImplemented("FILTER on aggregate"));
     }
+    if !func.within_group.is_empty() {
+        return Err(Error::NotImplemented("WITHIN GROUP"));
+    }
+    if func.null_treatment.is_some() {
+        return Err(Error::NotImplemented("null treatment on aggregate"));
+    }
+    if !matches!(func.parameters, FunctionArguments::None) {
+        return Err(Error::NotImplemented("function parameters"));
+    }
     match &func.args {
         FunctionArguments::None => Ok(None),
         FunctionArguments::List(list) => {
+            if !list.clauses.is_empty() {
+                return Err(Error::NotImplemented("aggregate argument clause"));
+            }
             if list.args.len() == 1 {
                 match &list.args[0] {
                     FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Ok(None),
@@ -574,6 +594,17 @@ fn agg_arg(func: &Function, scope: &Scope) -> Result<Option<Expr>> {
                 Err(Error::Plan("aggregate expects 0 or 1 argument".into()))
             }
         }
+        FunctionArguments::Subquery(_) => Err(Error::NotImplemented("subquery aggregate argument")),
+    }
+}
+
+fn agg_distinct(func: &Function) -> Result<bool> {
+    match &func.args {
+        FunctionArguments::List(list) => Ok(matches!(
+            list.duplicate_treatment,
+            Some(DuplicateTreatment::Distinct)
+        )),
+        FunctionArguments::None => Ok(false),
         FunctionArguments::Subquery(_) => Err(Error::NotImplemented("subquery aggregate argument")),
     }
 }
