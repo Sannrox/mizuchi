@@ -8,3 +8,4 @@ All notable changes to this project are documented here.
 
 - Workspace skeleton with a placeholder library crate.
 - ADR 0001 (record architecture decisions) and ADR 0002 (own query engine as a side project).
+- Arrow record-batch API: schema round-trip for supported types, owned and borrowed batches that wrap standard Arrow arrays without a private memory format, and a configurable max-rows policy (default 4096).

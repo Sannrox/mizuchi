@@ -1,28 +1,22 @@
 //! mizuchi: an Arrow-native query and transform engine.
 //!
-//! Nothing executes yet. See `docs/decisions/0002-own-query-engine.md` and the
-//! GitHub Issue roadmap. Planned layers, outside in:
+//! Columnar memory is standard Apache Arrow record batches. See [`batch`] and
+//! [`schema`]. Planned layers, outside in:
 //! SQL / DataFrame -> logical plan -> optimizer -> physical plan -> execution.
+
+pub mod batch;
+mod error;
+pub mod schema;
+
+pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
+pub use error::Error;
+pub use schema::{from_arrow_schema, is_supported_data_type, to_arrow_schema};
+
+pub use arrow::array::{ArrayRef, RecordBatch};
+pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 /// Crate version, for receipts and diagnostics in embedding runners.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Errors returned by the engine.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Error {
-    /// The requested feature is not implemented yet.
-    NotImplemented(&'static str),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::NotImplemented(what) => write!(f, "not implemented: {what}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 /// Plan a SQL statement. Placeholder until the SQL front end lands.
 pub fn plan_sql(_sql: &str) -> Result<(), Error> {
