@@ -18,12 +18,14 @@ use super::{
 use crate::error::{Error, Result};
 use crate::expr::{BinaryOp, Expr, UnaryOp};
 
+#[derive(Clone)]
 struct ScopeCol {
     qualifier: Option<String>,
     name: String,
     index: usize,
 }
 
+#[derive(Clone)]
 struct Scope {
     columns: Vec<ScopeCol>,
     schema: SchemaRef,
@@ -362,11 +364,11 @@ fn bind_join(left: BoundFrom, right: BoundFrom, op: &JoinOperator) -> Result<Bou
         JoinOperator::Anti(c) | JoinOperator::LeftAnti(c) => (JoinType::Anti, c),
         _ => return Err(Error::NotImplemented("join type")),
     };
-    let scope = Scope::join(left.scope, right.scope);
+    let concat = Scope::join(left.scope.clone(), right.scope.clone());
     let on = match constraint {
         JoinConstraint::On(expr) => {
-            let pred = bind_scalar(expr, &scope)?;
-            require_boolean(expr_type(&pred, &scope.schema)?, "JOIN ON")?;
+            let pred = bind_scalar(expr, &concat)?;
+            require_boolean(expr_type(&pred, &concat.schema)?, "JOIN ON")?;
             Some(pred)
         }
         JoinConstraint::None => None,
@@ -379,7 +381,10 @@ fn bind_join(left: BoundFrom, right: BoundFrom, op: &JoinOperator) -> Result<Bou
     if join_type != JoinType::Cross && on.is_none() {
         return Err(Error::Plan("join requires ON".into()));
     }
-    let schema = scope.schema.clone();
+    let (schema, scope) = match join_type {
+        JoinType::Semi | JoinType::Anti => (left.plan.schema().clone(), left.scope),
+        _ => (concat.schema.clone(), concat),
+    };
     Ok(BoundFrom {
         plan: LogicalPlan::Join {
             left: Box::new(left.plan),
