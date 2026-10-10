@@ -6,6 +6,7 @@
 
 pub mod batch;
 mod error;
+pub mod exec;
 pub mod expr;
 pub mod plan;
 pub mod schema;
@@ -13,6 +14,7 @@ pub mod sql;
 
 pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
 pub use error::Error;
+pub use exec::Session;
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use plan::{Catalog, JoinType, LogicalPlan, plan_sql};
 pub use schema::{from_arrow_schema, is_supported_data_type, to_arrow_schema};
