@@ -25,8 +25,8 @@
 # Requires: git, gh, jq, base64
 set -euo pipefail
 
-# Ported from Sannrox/shikigami@331897846885e4a55697b0f1006d03b4f2a7495e scripts/gh-verified-push.sh (verbatim).
-# Compare against the source to detect drift.
+# Canonical source: Sannrox/agent-kit scripts/gh-verified-push.sh. Derived from Sannrox/shikigami@331897846885e4a55697b0f1006d03b4f2a7495e.
+# Consuming repositories vendor this file byte-for-byte; scripts/validate-workflow-skills.sh checks it.
 
 usage() {
   sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
