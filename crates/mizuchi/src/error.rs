@@ -17,6 +17,8 @@ pub enum Error {
     Parse(String),
     /// Name resolution, type checking, or binding failed.
     Plan(String),
+    /// A caller-supplied path could not be read.
+    Io(String),
 }
 
 impl std::fmt::Display for Error {
@@ -29,6 +31,7 @@ impl std::fmt::Display for Error {
             Error::Eval(reason) => write!(f, "expression eval: {reason}"),
             Error::Parse(reason) => write!(f, "sql parse: {reason}"),
             Error::Plan(reason) => write!(f, "plan: {reason}"),
+            Error::Io(reason) => write!(f, "io: {reason}"),
         }
     }
 }

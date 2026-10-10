@@ -11,5 +11,6 @@ repository = "https://github.com/Sannrox/mizuchi"
 publish = false
 
 [workspace.dependencies]
-arrow = { version = "60.0.0", default-features = false }
+arrow = { version = "60.0.0", default-features = false, features = ["csv"] }
+parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }
 sqlparser = { version = "0.63.0" }

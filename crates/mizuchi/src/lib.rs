@@ -9,6 +9,7 @@ mod error;
 pub mod exec;
 pub mod expr;
 pub mod plan;
+pub mod read;
 pub mod schema;
 pub mod sql;
 
@@ -17,6 +18,7 @@ pub use error::Error;
 pub use exec::Session;
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use plan::{Catalog, JoinType, LogicalPlan, plan_sql};
+pub use read::{CsvReadOptions, ParquetReadOptions, RowGroupStats, read_csv, read_parquet};
 pub use schema::{from_arrow_schema, is_supported_data_type, to_arrow_schema};
 pub use sql::parse_sql;
 
