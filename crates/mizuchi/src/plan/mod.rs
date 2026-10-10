@@ -91,6 +91,8 @@ pub enum AggCall {
     CountStar,
     /// `COUNT(expr)`.
     Count(Expr),
+    /// `COUNT(DISTINCT expr)`.
+    CountDistinct(Expr),
     /// `SUM(expr)`.
     Sum(Expr),
     /// `AVG(expr)`.
@@ -104,7 +106,7 @@ pub enum AggCall {
 impl AggCall {
     pub(crate) fn result_type(&self, input: &Schema) -> Result<DataType> {
         match self {
-            Self::CountStar | Self::Count(_) => Ok(DataType::Int64),
+            Self::CountStar | Self::Count(_) | Self::CountDistinct(_) => Ok(DataType::Int64),
             Self::Avg(expr) => {
                 require_numeric(expr_type(expr, input)?, "AVG")?;
                 Ok(DataType::Float64)
@@ -124,6 +126,7 @@ impl fmt::Display for AggCall {
         match self {
             Self::CountStar => f.write_str("count(*)"),
             Self::Count(e) => write!(f, "count({e:?})"),
+            Self::CountDistinct(e) => write!(f, "count(distinct {e:?})"),
             Self::Sum(e) => write!(f, "sum({e:?})"),
             Self::Avg(e) => write!(f, "avg({e:?})"),
             Self::Min(e) => write!(f, "min({e:?})"),
@@ -640,6 +643,9 @@ mod tests {
         let agg = explain("SELECT a, COUNT(*) FROM t GROUP BY a");
         assert!(agg.contains("Aggregate"), "{agg}");
         assert!(agg.contains("count(*)"), "{agg}");
+
+        let distinct = explain("SELECT COUNT(DISTINCT a) FROM t");
+        assert!(distinct.contains("count(distinct"), "{distinct}");
 
         let union = explain("SELECT a FROM t UNION ALL SELECT a FROM t");
         assert!(union.contains("Union all"), "{union}");
