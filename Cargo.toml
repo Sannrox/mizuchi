@@ -9,3 +9,6 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/Sannrox/mizuchi"
 publish = false
+
+[workspace.dependencies]
+arrow = { version = "60.0.0", default-features = false }

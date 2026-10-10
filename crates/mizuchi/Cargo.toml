@@ -11,3 +11,4 @@ categories = ["database-implementations"]
 homepage = "https://github.com/Sannrox/mizuchi"
 
 [dependencies]
+arrow = { workspace = true }
