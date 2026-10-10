@@ -17,3 +17,4 @@ All notable changes to this project are documented here.
 - Hash join: inner, left, right, full, semi, and anti over Arrow batches. Null keys never match; CROSS JOIN is a nested loop.
 - Sort, top-k, and limit/offset over Arrow batches. ORDER BY honors ASC/DESC and NULLS FIRST/LAST; LIMIT after ORDER BY sorts only the kept prefix.
 - Parquet and CSV readers that yield Arrow batches. Parquet projection decodes only requested columns; row-group skip is a footer-stats hook. CSV can infer types or keep Utf8.
+- Rule-based optimizer: constant folding, boolean simplification, filter merge, limit pushdown through projection, and redundant projection removal.

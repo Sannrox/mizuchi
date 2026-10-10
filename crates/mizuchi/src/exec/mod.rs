@@ -65,6 +65,7 @@ impl Session {
             catalog.register(name, table.schema.clone())?;
         }
         let plan = crate::plan::plan_sql(sql, &catalog)?;
+        let plan = crate::opt::optimize(plan)?;
         collect(physical(&plan, self)?)
     }
 }
