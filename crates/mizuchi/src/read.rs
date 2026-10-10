@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
-use arrow::array::RecordBatch;
+use arrow::array::{Array, RecordBatch};
 use arrow::csv::ReaderBuilder;
 use arrow::csv::reader::Format;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -18,7 +18,20 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::batch::{Batch, BatchPolicy, DEFAULT_MAX_ROWS};
 use crate::error::{Error, Result};
+use crate::expr::{BinaryOp, Expr};
 use crate::schema::from_arrow_schema;
+use parquet::file::statistics::Statistics;
+
+/// Int64 min/max from a Parquet column chunk footer.
+#[derive(Clone, Debug)]
+pub struct ColumnRange {
+    /// Column name.
+    pub name: String,
+    /// Minimum stored value, if present.
+    pub min_i64: Option<i64>,
+    /// Maximum stored value, if present.
+    pub max_i64: Option<i64>,
+}
 
 /// Footer facts for one Parquet row group, used to skip groups before decode.
 #[derive(Clone, Debug)]
@@ -29,6 +42,8 @@ pub struct RowGroupStats {
     pub num_rows: i64,
     /// Root column names in file order.
     pub column_names: Vec<String>,
+    /// Int64 column ranges from footer statistics.
+    pub i64_ranges: Vec<ColumnRange>,
 }
 
 /// Options for [`read_parquet`].
@@ -38,6 +53,8 @@ pub struct ParquetReadOptions<'a> {
     pub projection: Option<&'a [String]>,
     /// Return true to skip this row group. `None` keeps every group.
     pub prune_row_group: Option<&'a dyn Fn(&RowGroupStats) -> bool>,
+    /// Comparison predicates used to skip row groups from footer min/max.
+    pub filters: Option<&'a [Expr]>,
     /// Morsel size for decoded batches.
     pub policy: BatchPolicy,
 }
@@ -73,16 +90,37 @@ pub fn read_parquet(path: impl AsRef<Path>, opts: ParquetReadOptions<'_>) -> Res
 
     let mut keep_groups = Vec::new();
     for (index, rg) in builder.metadata().row_groups().iter().enumerate() {
+        let mut i64_ranges = Vec::new();
+        // Leaf chunks line up with Arrow root fields only on flat schemas.
+        // Nested files leave ranges empty so prune stays conservative.
+        let cols = rg.columns();
+        if cols.len() == column_names.len() {
+            for (ci, col) in cols.iter().enumerate() {
+                let name = column_names[ci].clone();
+                if let Some(Statistics::Int64(s)) = col.statistics() {
+                    i64_ranges.push(ColumnRange {
+                        name,
+                        min_i64: s.min_opt().copied(),
+                        max_i64: s.max_opt().copied(),
+                    });
+                }
+            }
+        }
         let stats = RowGroupStats {
             index,
             num_rows: rg.num_rows(),
             column_names: column_names.clone(),
+            i64_ranges,
         };
-        let skip = opts
+        let skip_hook = opts
             .prune_row_group
             .map(|prune| prune(&stats))
             .unwrap_or(false);
-        if !skip {
+        let skip_stats = opts
+            .filters
+            .map(|preds| preds.iter().any(|p| row_group_cannot_match(&stats, p)))
+            .unwrap_or(false);
+        if !skip_hook && !skip_stats {
             keep_groups.push(index);
         }
     }
@@ -197,6 +235,65 @@ fn collect_csv<R: std::io::Read>(
 
 fn io_err(path: &Path, err: std::io::Error) -> Error {
     Error::Io(format!("{}: {err}", path.display()))
+}
+
+/// True when footer min/max prove `pred` cannot hold for any row in the group.
+pub fn row_group_cannot_match(stats: &RowGroupStats, pred: &Expr) -> bool {
+    match pred {
+        Expr::Binary(BinaryOp::And, l, r) => {
+            row_group_cannot_match(stats, l) || row_group_cannot_match(stats, r)
+        }
+        Expr::Binary(op, l, r) => {
+            let (name, lit, swapped) = match (col_name(l), i64_lit(r), col_name(r), i64_lit(l)) {
+                (Some(n), Some(v), _, _) => (n, v, false),
+                (_, _, Some(n), Some(v)) => (n, v, true),
+                _ => return false,
+            };
+            let Some(range) = stats.i64_ranges.iter().find(|c| c.name == name) else {
+                return false;
+            };
+            let op = if swapped { swap_cmp(*op) } else { *op };
+            match op {
+                BinaryOp::Gt => range.max_i64.is_some_and(|m| m <= lit),
+                BinaryOp::GtEq => range.max_i64.is_some_and(|m| m < lit),
+                BinaryOp::Lt => range.min_i64.is_some_and(|m| m >= lit),
+                BinaryOp::LtEq => range.min_i64.is_some_and(|m| m > lit),
+                BinaryOp::Eq => {
+                    range.max_i64.is_some_and(|m| m < lit) || range.min_i64.is_some_and(|m| m > lit)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn swap_cmp(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        other => other,
+    }
+}
+
+fn col_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Column(n) => Some(n.clone()),
+        _ => None,
+    }
+}
+
+fn i64_lit(expr: &Expr) -> Option<i64> {
+    let Expr::Literal(arr) = expr else {
+        return None;
+    };
+    let a = arr.as_any().downcast_ref::<arrow::array::Int64Array>()?;
+    if a.len() != 1 || a.is_null(0) {
+        return None;
+    }
+    Some(a.value(0))
 }
 
 #[cfg(test)]
@@ -395,5 +492,83 @@ mod tests {
     fn missing_file_fails_closed() {
         let err = read_parquet("/no/such/file.parquet", ParquetReadOptions::default()).unwrap_err();
         assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn parquet_footer_stats_skip_row_groups() {
+        let path = write_parquet(&[sample_batch()], 2);
+        let pred = Expr::Binary(
+            crate::expr::BinaryOp::Gt,
+            Box::new(Expr::column("id")),
+            Box::new(Expr::lit_i64(2)),
+        );
+        let filters = [pred];
+        let out = read_parquet(
+            &path,
+            ParquetReadOptions {
+                filters: Some(&filters),
+                projection: Some(&["id".to_string()]),
+                ..ParquetReadOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out[0].num_columns(), 1);
+        assert_eq!(col_i64(&out, "id"), vec![Some(3), Some(4)]);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn parquet_nested_schema_does_not_prune_by_root_name() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new(
+                "s",
+                DataType::Struct(
+                    vec![
+                        Field::new("x", DataType::Int64, true),
+                        Field::new("y", DataType::Int64, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let nested = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1)])),
+                Arc::new(arrow::array::StructArray::from(vec![
+                    (
+                        Arc::new(Field::new("x", DataType::Int64, true)),
+                        Arc::new(Int64Array::from(vec![Some(1)])) as arrow::array::ArrayRef,
+                    ),
+                    (
+                        Arc::new(Field::new("y", DataType::Int64, true)),
+                        Arc::new(Int64Array::from(vec![Some(1)])) as arrow::array::ArrayRef,
+                    ),
+                ])),
+                Arc::new(Int64Array::from(vec![Some(1000)])),
+            ],
+        )
+        .unwrap();
+        let path = write_parquet(&[nested], 1);
+        let pred = Expr::Binary(
+            crate::expr::BinaryOp::Gt,
+            Box::new(Expr::column("b")),
+            Box::new(Expr::lit_i64(500)),
+        );
+        let filters = [pred];
+        let out = read_parquet(
+            &path,
+            ParquetReadOptions {
+                filters: Some(&filters),
+                projection: Some(&["b".to_string()]),
+                ..ParquetReadOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(col_i64(&out, "b"), vec![Some(1000)]);
+        std::fs::remove_file(path).ok();
     }
 }

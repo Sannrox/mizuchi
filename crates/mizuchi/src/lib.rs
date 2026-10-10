@@ -20,7 +20,10 @@ pub use exec::Session;
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use opt::optimize;
 pub use plan::{Catalog, JoinType, LogicalPlan, plan_sql};
-pub use read::{CsvReadOptions, ParquetReadOptions, RowGroupStats, read_csv, read_parquet};
+pub use read::{
+    ColumnRange, CsvReadOptions, ParquetReadOptions, RowGroupStats, read_csv, read_parquet,
+    row_group_cannot_match,
+};
 pub use schema::{from_arrow_schema, is_supported_data_type, to_arrow_schema};
 pub use sql::parse_sql;
 
