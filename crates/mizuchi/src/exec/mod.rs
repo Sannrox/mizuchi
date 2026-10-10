@@ -5,6 +5,7 @@
 mod agg;
 mod join;
 mod key;
+mod sort;
 
 use std::collections::BTreeMap;
 
@@ -87,6 +88,11 @@ enum Exec {
         exprs: Vec<NamedExpr>,
         schema: SchemaRef,
     },
+    Limit {
+        input: Box<Exec>,
+        skip: u64,
+        fetch: Option<u64>,
+    },
 }
 
 impl Exec {
@@ -125,7 +131,38 @@ impl Exec {
                 };
                 Ok(Some(project_batch(&batch, exprs, schema.clone())?))
             }
+            Self::Limit { input, skip, fetch } => limit_next(input, skip, fetch),
         }
+    }
+}
+
+fn limit_next(input: &mut Exec, skip: &mut u64, fetch: &mut Option<u64>) -> Result<Option<Batch>> {
+    if matches!(fetch, Some(0)) {
+        return Ok(None);
+    }
+    loop {
+        let Some(batch) = input.next_batch()? else {
+            return Ok(None);
+        };
+        let n = batch.num_rows() as u64;
+        if *skip >= n {
+            *skip -= n;
+            continue;
+        }
+        let start = *skip as usize;
+        *skip = 0;
+        let available = batch.num_rows() - start;
+        let take_n = match *fetch {
+            None => available,
+            Some(f) => available.min(usize::try_from(f).unwrap_or(usize::MAX)),
+        };
+        if take_n == 0 {
+            return Ok(None);
+        }
+        if let Some(f) = fetch {
+            *f -= take_n as u64;
+        }
+        return Ok(Some(batch.slice(start, take_n)?));
     }
 }
 
@@ -193,8 +230,38 @@ fn physical(plan: &LogicalPlan, session: &Session) -> Result<Exec> {
             )?;
             Ok(Exec::Scan { batches, index: 0 })
         }
-        LogicalPlan::Sort { .. } => Err(Error::NotImplemented("physical sort")),
-        LogicalPlan::Limit { .. } => Err(Error::NotImplemented("physical limit")),
+        LogicalPlan::Sort { input, order } => {
+            let batches = sort::ordered(
+                physical(input, session)?,
+                input.schema().clone(),
+                order,
+                0,
+                None,
+                &session.policy,
+            )?;
+            Ok(Exec::Scan { batches, index: 0 })
+        }
+        LogicalPlan::Limit { input, skip, fetch } => match input.as_ref() {
+            LogicalPlan::Sort {
+                input: sorted,
+                order,
+            } => {
+                let batches = sort::ordered(
+                    physical(sorted, session)?,
+                    sorted.schema().clone(),
+                    order,
+                    *skip,
+                    *fetch,
+                    &session.policy,
+                )?;
+                Ok(Exec::Scan { batches, index: 0 })
+            }
+            _ => Ok(Exec::Limit {
+                input: Box::new(physical(input, session)?),
+                skip: *skip,
+                fetch: *fetch,
+            }),
+        },
         LogicalPlan::Union { .. } => Err(Error::NotImplemented("physical union")),
     }
 }
@@ -885,5 +952,115 @@ mod tests {
         for n_groups in [1, 16, 257, 4097] {
             assert_matches_reference(n_groups, 3);
         }
+    }
+
+    #[test]
+    fn limit_keeps_input_order() {
+        let out = session().execute_sql("SELECT a FROM t LIMIT 2").unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn limit_offset_skips_then_takes() {
+        let out = session()
+            .execute_sql("SELECT a FROM t LIMIT 2 OFFSET 1")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn offset_past_end_is_empty() {
+        let out = session().execute_sql("SELECT a FROM t OFFSET 10").unwrap();
+        assert!(out.iter().all(|b| b.num_rows() == 0) || out.is_empty());
+    }
+
+    #[test]
+    fn limit_zero_is_empty() {
+        let out = session().execute_sql("SELECT a FROM t LIMIT 0").unwrap();
+        assert!(out.iter().all(|b| b.num_rows() == 0) || out.is_empty());
+    }
+
+    #[test]
+    fn order_by_asc_nulls_last() {
+        let out = session().execute_sql("SELECT a FROM t ORDER BY a").unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2), Some(3), None]);
+    }
+
+    #[test]
+    fn order_by_desc_nulls_first() {
+        let out = session()
+            .execute_sql("SELECT a FROM t ORDER BY a DESC")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![None, Some(3), Some(2), Some(1)]);
+    }
+
+    #[test]
+    fn order_by_nulls_first_and_last() {
+        let first = session()
+            .execute_sql("SELECT a FROM t ORDER BY a NULLS FIRST")
+            .unwrap();
+        assert_eq!(col_i64(&first, "a"), vec![None, Some(1), Some(2), Some(3)]);
+        let last = session()
+            .execute_sql("SELECT a FROM t ORDER BY a DESC NULLS LAST")
+            .unwrap();
+        assert_eq!(col_i64(&last, "a"), vec![Some(3), Some(2), Some(1), None]);
+    }
+
+    #[test]
+    fn order_by_two_keys() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+        ]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("b"), Some("a"), Some("a")])),
+                Arc::new(Int64Array::from(vec![Some(0), Some(2), Some(1)])),
+            ],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("k", schema, vec![batch]).unwrap();
+        let out = s.execute_sql("SELECT g, n FROM k ORDER BY g, n").unwrap();
+        assert_eq!(
+            col_utf8(&out, "g"),
+            vec![Some("a".into()), Some("a".into()), Some("b".into())]
+        );
+        assert_eq!(col_i64(&out, "n"), vec![Some(1), Some(2), Some(0)]);
+    }
+
+    #[test]
+    fn order_by_limit_is_topk() {
+        let out = session()
+            .execute_sql("SELECT a FROM t ORDER BY a LIMIT 2")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2)]);
+        let out = session()
+            .execute_sql("SELECT a FROM t ORDER BY a DESC LIMIT 2 OFFSET 1")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(3), Some(2)]);
+    }
+
+    #[test]
+    fn topk_on_large_input_matches_reference() {
+        let n = 5000i64;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let values: Vec<Option<i64>> = (0..n).rev().map(Some).collect();
+        let batch =
+            Batch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))]).unwrap();
+        let mut s = Session::new();
+        s.register("big", schema, vec![batch]).unwrap();
+        let out = s
+            .execute_sql("SELECT a FROM big ORDER BY a LIMIT 7 OFFSET 3")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), (3..10).map(Some).collect::<Vec<_>>());
+        let desc = s
+            .execute_sql("SELECT a FROM big ORDER BY a DESC LIMIT 5")
+            .unwrap();
+        assert_eq!(
+            col_i64(&desc, "a"),
+            (n - 5..n).rev().map(Some).collect::<Vec<_>>()
+        );
     }
 }
