@@ -15,6 +15,8 @@ pub enum Error {
     Eval(String),
     /// SQL lexing or parsing failed.
     Parse(String),
+    /// Name resolution, type checking, or binding failed.
+    Plan(String),
 }
 
 impl std::fmt::Display for Error {
@@ -26,6 +28,7 @@ impl std::fmt::Display for Error {
             Error::InvalidPolicy(reason) => write!(f, "invalid batch policy: {reason}"),
             Error::Eval(reason) => write!(f, "expression eval: {reason}"),
             Error::Parse(reason) => write!(f, "sql parse: {reason}"),
+            Error::Plan(reason) => write!(f, "plan: {reason}"),
         }
     }
 }
