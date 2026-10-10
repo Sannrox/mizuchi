@@ -11,6 +11,8 @@ pub enum Error {
     InvalidBatch(String),
     /// A batch-size policy value was rejected.
     InvalidPolicy(&'static str),
+    /// Scalar expression evaluation failed.
+    Eval(String),
 }
 
 impl std::fmt::Display for Error {
@@ -20,6 +22,7 @@ impl std::fmt::Display for Error {
             Error::UnsupportedType(dt) => write!(f, "unsupported Arrow type: {dt}"),
             Error::InvalidBatch(reason) => write!(f, "invalid batch: {reason}"),
             Error::InvalidPolicy(reason) => write!(f, "invalid batch policy: {reason}"),
+            Error::Eval(reason) => write!(f, "expression eval: {reason}"),
         }
     }
 }
