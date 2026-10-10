@@ -12,3 +12,4 @@ publish = false
 
 [workspace.dependencies]
 arrow = { version = "60.0.0", default-features = false }
+sqlparser = { version = "0.63.0" }
