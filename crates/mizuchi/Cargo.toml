@@ -12,4 +12,5 @@ homepage = "https://github.com/Sannrox/mizuchi"
 
 [dependencies]
 arrow = { workspace = true }
+parquet = { workspace = true }
 sqlparser = { workspace = true }
