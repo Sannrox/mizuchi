@@ -6,10 +6,12 @@
 
 pub mod batch;
 mod error;
+pub mod expr;
 pub mod schema;
 
 pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
 pub use error::Error;
+pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use schema::{from_arrow_schema, is_supported_data_type, to_arrow_schema};
 
 pub use arrow::array::{ArrayRef, RecordBatch};
