@@ -17,6 +17,7 @@ mod op;
 mod recursive;
 mod report;
 mod schedule;
+mod setop;
 mod sort;
 mod stage;
 mod stream;
@@ -1196,7 +1197,9 @@ fn collect_scan_reports(plan: &LogicalPlan, session: &Session, out: &mut Vec<Inp
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Window { input, .. } => collect_scan_reports(input, session, out),
-        LogicalPlan::Join { left, right, .. } => {
+        LogicalPlan::Join { left, right, .. }
+        | LogicalPlan::Intersect { left, right, .. }
+        | LogicalPlan::Except { left, right, .. } => {
             collect_scan_reports(left, session, out);
             collect_scan_reports(right, session, out);
         }
@@ -1662,7 +1665,97 @@ fn build_physical(
                 ))
             }
         },
-        LogicalPlan::Union { .. } => Err(Error::NotImplemented("physical union")),
+        LogicalPlan::Union {
+            inputs,
+            schema,
+            all,
+        } => {
+            let mut ops = Vec::with_capacity(inputs.len());
+            let mut children = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                let (op, node) = build_physical(input, session, pool, analyze, work)?;
+                ops.push(op);
+                children.push(node);
+            }
+            let t0 = Instant::now();
+            let batches = setop::union(
+                ops,
+                schema.clone(),
+                *all,
+                &session.policy,
+                pool,
+                &session.cancel,
+            )?;
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let (op, node) =
+                metrics::finish("Union", lowering.scan(batches)?, children, analyze, pool);
+            if analyze {
+                metrics::add_blocking(&node, ns, pool.peak());
+            }
+            Ok((op, node))
+        }
+        LogicalPlan::Intersect {
+            left,
+            right,
+            schema,
+            all,
+        } => {
+            let (left_op, left_node) = build_physical(left, session, pool, analyze, work)?;
+            let (right_op, right_node) = build_physical(right, session, pool, analyze, work)?;
+            let t0 = Instant::now();
+            let batches = setop::intersect(
+                left_op,
+                right_op,
+                schema.clone(),
+                *all,
+                &session.policy,
+                pool,
+                &session.cancel,
+            )?;
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let (op, node) = metrics::finish(
+                "Intersect",
+                lowering.scan(batches)?,
+                vec![left_node, right_node],
+                analyze,
+                pool,
+            );
+            if analyze {
+                metrics::add_blocking(&node, ns, pool.peak());
+            }
+            Ok((op, node))
+        }
+        LogicalPlan::Except {
+            left,
+            right,
+            schema,
+            all,
+        } => {
+            let (left_op, left_node) = build_physical(left, session, pool, analyze, work)?;
+            let (right_op, right_node) = build_physical(right, session, pool, analyze, work)?;
+            let t0 = Instant::now();
+            let batches = setop::except(
+                left_op,
+                right_op,
+                schema.clone(),
+                *all,
+                &session.policy,
+                pool,
+                &session.cancel,
+            )?;
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let (op, node) = metrics::finish(
+                "Except",
+                lowering.scan(batches)?,
+                vec![left_node, right_node],
+                analyze,
+                pool,
+            );
+            if analyze {
+                metrics::add_blocking(&node, ns, pool.peak());
+            }
+            Ok((op, node))
+        }
         LogicalPlan::Recursive {
             name,
             anchors,
@@ -2666,6 +2759,66 @@ mod tests {
         assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2), Some(3)]);
         let err = session().execute_sql("SELECT a FROM t, LATERAL (SELECT a AS x LIMIT 0) s");
         assert!(matches!(err, Err(Error::NotImplemented(_))), "{err:?}");
+    }
+
+    #[test]
+    fn setops_union_intersect_except() {
+        let s = session();
+        let out = s.execute_sql("SELECT 1 AS x UNION SELECT 2").unwrap();
+        assert_eq!(col_i64(&out, "x"), vec![Some(1), Some(2)]);
+        let out = s.execute_sql("SELECT 1 AS x UNION ALL SELECT 1").unwrap();
+        assert_eq!(col_i64(&out, "x"), vec![Some(1), Some(1)]);
+        let out = s
+            .execute_sql("SELECT 1 AS x UNION DISTINCT SELECT 1")
+            .unwrap();
+        assert_eq!(col_i64(&out, "x"), vec![Some(1)]);
+        let out = s
+            .execute_sql("SELECT a FROM t UNION SELECT a FROM t")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2), Some(3), None]);
+        let out = s
+            .execute_sql("SELECT a FROM t INTERSECT SELECT a FROM t WHERE a = 1")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1)]);
+        let out = s
+            .execute_sql("SELECT a FROM t EXCEPT SELECT a FROM t WHERE a = 1")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(2), Some(3), None]);
+        let out = s
+            .execute_sql(
+                "SELECT a FROM t WHERE a IS NOT NULL INTERSECT ALL SELECT a FROM t WHERE a = 1",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1)]);
+        let out = s
+            .execute_sql("SELECT a FROM t WHERE a IN (1, 1) EXCEPT ALL SELECT a FROM t WHERE a = 2")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1)]);
+        let err = s.execute_sql("SELECT 1 UNION SELECT 'x'");
+        assert!(matches!(err, Err(Error::Plan(_))), "{err:?}");
+        let err = s.execute_sql("SELECT 1, 2 UNION SELECT 1");
+        assert!(matches!(err, Err(Error::Plan(_))), "{err:?}");
+        let out = s.execute_sql("SELECT NULL AS x UNION SELECT 1").unwrap();
+        assert_eq!(col_i64(&out, "x"), vec![None, Some(1)]);
+        let out = s
+            .execute_sql("SELECT CAST(1 AS INT) AS x UNION SELECT 2")
+            .unwrap();
+        assert_eq!(col_i64(&out, "x"), vec![Some(1), Some(2)]);
+        let err = s.execute_sql("SELECT ARRAY[1] AS a UNION SELECT ARRAY[1]");
+        assert!(matches!(err, Err(Error::NotImplemented(_))), "{err:?}");
+        let out = s
+            .execute_sql("SELECT ARRAY[1] AS a UNION ALL SELECT ARRAY[1]")
+            .unwrap();
+        assert_eq!(out.iter().map(Batch::num_rows).sum::<usize>(), 2);
+    }
+
+    #[test]
+    fn setops_fails_closed_without_spill() {
+        let (s, cap) = register_numbered(12, 32);
+        let err = s
+            .with_memory_limit(cap)
+            .execute_sql("SELECT a FROM t UNION ALL SELECT a FROM t");
+        assert!(matches!(err, Err(Error::Memory(_))), "{err:?}");
     }
 
     #[test]

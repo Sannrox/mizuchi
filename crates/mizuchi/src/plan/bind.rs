@@ -812,17 +812,19 @@ fn bind_set_expr(expr: &SetExpr, ctx: &BindCtx<'_>) -> Result<LogicalPlan> {
             set_quantifier,
             right,
         } => {
-            if *op != SetOperator::Union {
-                return Err(Error::NotImplemented("EXCEPT/INTERSECT"));
-            }
             let all = match set_quantifier {
                 SetQuantifier::All => true,
                 SetQuantifier::None | SetQuantifier::Distinct => false,
-                _ => return Err(Error::NotImplemented("UNION BY NAME")),
+                _ => return Err(Error::NotImplemented("set operator BY NAME")),
             };
             let left = bind_set_expr(left, ctx)?;
             let right = bind_set_expr(right, ctx)?;
-            bind_union(left, right, all)
+            match op {
+                SetOperator::Union => bind_union(left, right, all),
+                SetOperator::Intersect => bind_intersect(left, right, all),
+                SetOperator::Except => bind_except(left, right, all),
+                _ => Err(Error::NotImplemented("set operator")),
+            }
         }
         SetExpr::Values(_) => Err(Error::NotImplemented("VALUES")),
         _ => Err(Error::NotImplemented("set expression")),
@@ -830,26 +832,147 @@ fn bind_set_expr(expr: &SetExpr, ctx: &BindCtx<'_>) -> Result<LogicalPlan> {
 }
 
 fn bind_union(left: LogicalPlan, right: LogicalPlan, all: bool) -> Result<LogicalPlan> {
-    if left.schema().fields().len() != right.schema().fields().len() {
-        return Err(Error::Plan(
-            "UNION inputs must have the same number of columns".into(),
-        ));
+    let schema = setop_schema("UNION", &left, &right)?;
+    if !all {
+        require_hashable_setop(&schema)?;
     }
-    for (l, r) in left.schema().fields().iter().zip(right.schema().fields()) {
-        if l.data_type() != r.data_type() {
-            return Err(Error::Plan(format!(
-                "UNION type mismatch: {} vs {}",
-                l.data_type(),
-                r.data_type()
-            )));
-        }
+    let left = align_setop_input(left, &schema)?;
+    let right = align_setop_input(right, &schema)?;
+    let mut inputs = Vec::new();
+    match left {
+        LogicalPlan::Union {
+            inputs: nested,
+            all: nested_all,
+            ..
+        } if nested_all == all => inputs.extend(nested),
+        other => inputs.push(other),
     }
-    let schema = left.schema().clone();
+    match right {
+        LogicalPlan::Union {
+            inputs: nested,
+            all: nested_all,
+            ..
+        } if nested_all == all => inputs.extend(nested),
+        other => inputs.push(other),
+    }
     Ok(LogicalPlan::Union {
-        inputs: vec![left, right],
+        inputs,
         schema,
         all,
     })
+}
+
+fn bind_intersect(left: LogicalPlan, right: LogicalPlan, all: bool) -> Result<LogicalPlan> {
+    let schema = setop_schema("INTERSECT", &left, &right)?;
+    require_hashable_setop(&schema)?;
+    Ok(LogicalPlan::Intersect {
+        left: Box::new(align_setop_input(left, &schema)?),
+        right: Box::new(align_setop_input(right, &schema)?),
+        schema,
+        all,
+    })
+}
+
+fn bind_except(left: LogicalPlan, right: LogicalPlan, all: bool) -> Result<LogicalPlan> {
+    let schema = setop_schema("EXCEPT", &left, &right)?;
+    require_hashable_setop(&schema)?;
+    Ok(LogicalPlan::Except {
+        left: Box::new(align_setop_input(left, &schema)?),
+        right: Box::new(align_setop_input(right, &schema)?),
+        schema,
+        all,
+    })
+}
+
+fn setop_schema(op: &str, left: &LogicalPlan, right: &LogicalPlan) -> Result<SchemaRef> {
+    if left.schema().fields().len() != right.schema().fields().len() {
+        return Err(Error::Plan(format!(
+            "{op} inputs must have the same number of columns"
+        )));
+    }
+    let mut fields = Vec::new();
+    for (l, r) in left.schema().fields().iter().zip(right.schema().fields()) {
+        let dt = super::widen(l.data_type().clone(), r.data_type().clone()).map_err(|_| {
+            Error::Plan(format!(
+                "{op} type mismatch: {} vs {}",
+                l.data_type(),
+                r.data_type()
+            ))
+        })?;
+        let nullable = l.is_nullable()
+            || r.is_nullable()
+            || l.data_type() == &DataType::Null
+            || r.data_type() == &DataType::Null;
+        fields.push(Field::new(l.name(), dt, nullable));
+    }
+    schema_from_fields(fields)
+}
+
+fn align_setop_input(plan: LogicalPlan, target: &SchemaRef) -> Result<LogicalPlan> {
+    let src = plan.schema();
+    let already = src.fields().len() == target.fields().len()
+        && src
+            .fields()
+            .iter()
+            .zip(target.fields())
+            .all(|(a, b)| a.data_type() == b.data_type() && a.name() == b.name());
+    if already {
+        return Ok(plan);
+    }
+    let exprs = src
+        .fields()
+        .iter()
+        .zip(target.fields())
+        .enumerate()
+        .map(|(i, (src_f, tgt_f))| {
+            let expr = if src_f.data_type() == tgt_f.data_type() {
+                Expr::nth(i)
+            } else {
+                Expr::Cast {
+                    expr: Box::new(Expr::nth(i)),
+                    data_type: tgt_f.data_type().clone(),
+                }
+            };
+            NamedExpr {
+                expr,
+                name: tgt_f.name().clone(),
+            }
+        })
+        .collect();
+    Ok(LogicalPlan::Project {
+        input: Box::new(plan),
+        exprs,
+        schema: target.clone(),
+    })
+}
+
+fn require_hashable_setop(schema: &SchemaRef) -> Result<()> {
+    for f in schema.fields() {
+        if !setop_hashable(f.data_type()) {
+            return Err(Error::NotImplemented("set operator on this type"));
+        }
+    }
+    Ok(())
+}
+
+fn setop_hashable(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Null
+    )
 }
 
 fn bind_select(select: &Select, ctx: &BindCtx<'_>) -> Result<LogicalPlan> {

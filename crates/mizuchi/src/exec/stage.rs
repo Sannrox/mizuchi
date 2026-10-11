@@ -109,6 +109,18 @@ enum PhysicalPlan {
         schema: SchemaRef,
         all: bool,
     },
+    Intersect {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        schema: SchemaRef,
+        all: bool,
+    },
+    Except {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        schema: SchemaRef,
+        all: bool,
+    },
     Window {
         input: Box<PhysicalPlan>,
         partition: Vec<Expr>,
@@ -154,6 +166,8 @@ impl PhysicalPlan {
             | Self::Aggregate { schema, .. }
             | Self::Join { schema, .. }
             | Self::Union { schema, .. }
+            | Self::Intersect { schema, .. }
+            | Self::Except { schema, .. }
             | Self::Window { schema, .. }
             | Self::Recursive { schema, .. }
             | Self::WorkScan { schema, .. }
@@ -181,6 +195,8 @@ impl PhysicalPlan {
             | Self::WorkScan { .. }
             | Self::Scalar { .. }
             | Self::Union { .. }
+            | Self::Intersect { .. }
+            | Self::Except { .. }
             | Self::Recursive { .. } => 1,
         }
     }
@@ -263,6 +279,28 @@ fn from_logical(plan: &LogicalPlan) -> PhysicalPlan {
             all,
         } => PhysicalPlan::Union {
             inputs: inputs.iter().map(from_logical).collect(),
+            schema: schema.clone(),
+            all: *all,
+        },
+        LogicalPlan::Intersect {
+            left,
+            right,
+            schema,
+            all,
+        } => PhysicalPlan::Intersect {
+            left: Box::new(from_logical(left)),
+            right: Box::new(from_logical(right)),
+            schema: schema.clone(),
+            all: *all,
+        },
+        LogicalPlan::Except {
+            left,
+            right,
+            schema,
+            all,
+        } => PhysicalPlan::Except {
+            left: Box::new(from_logical(left)),
+            right: Box::new(from_logical(right)),
             schema: schema.clone(),
             all: *all,
         },
@@ -449,11 +487,68 @@ fn ensure_distribution(plan: PhysicalPlan, n: usize, next_id: &mut usize) -> Phy
         } => PhysicalPlan::Union {
             inputs: inputs
                 .into_iter()
-                .map(|p| ensure_distribution(p, n, next_id))
+                .map(|p| {
+                    let p = ensure_distribution(p, n, next_id);
+                    if p.output_partitions() == 1 {
+                        p
+                    } else {
+                        exchange(p, Vec::new(), 1, next_id)
+                    }
+                })
                 .collect(),
             schema,
             all,
         },
+        PhysicalPlan::Intersect {
+            left,
+            right,
+            schema,
+            all,
+        } => {
+            let left = ensure_distribution(*left, n, next_id);
+            let right = ensure_distribution(*right, n, next_id);
+            let left = if left.output_partitions() == 1 {
+                left
+            } else {
+                exchange(left, Vec::new(), 1, next_id)
+            };
+            let right = if right.output_partitions() == 1 {
+                right
+            } else {
+                exchange(right, Vec::new(), 1, next_id)
+            };
+            PhysicalPlan::Intersect {
+                left: Box::new(left),
+                right: Box::new(right),
+                schema,
+                all,
+            }
+        }
+        PhysicalPlan::Except {
+            left,
+            right,
+            schema,
+            all,
+        } => {
+            let left = ensure_distribution(*left, n, next_id);
+            let right = ensure_distribution(*right, n, next_id);
+            let left = if left.output_partitions() == 1 {
+                left
+            } else {
+                exchange(left, Vec::new(), 1, next_id)
+            };
+            let right = if right.output_partitions() == 1 {
+                right
+            } else {
+                exchange(right, Vec::new(), 1, next_id)
+            };
+            PhysicalPlan::Except {
+                left: Box::new(left),
+                right: Box::new(right),
+                schema,
+                all,
+            }
+        }
         other => other,
     }
 }
@@ -552,6 +647,28 @@ fn fragment(plan: PhysicalPlan, stages: &mut Vec<Stage>) -> PhysicalPlan {
             all,
         } => PhysicalPlan::Union {
             inputs: inputs.into_iter().map(|p| fragment(p, stages)).collect(),
+            schema,
+            all,
+        },
+        PhysicalPlan::Intersect {
+            left,
+            right,
+            schema,
+            all,
+        } => PhysicalPlan::Intersect {
+            left: Box::new(fragment(*left, stages)),
+            right: Box::new(fragment(*right, stages)),
+            schema,
+            all,
+        },
+        PhysicalPlan::Except {
+            left,
+            right,
+            schema,
+            all,
+        } => PhysicalPlan::Except {
+            left: Box::new(fragment(*left, stages)),
+            right: Box::new(fragment(*right, stages)),
             schema,
             all,
         },
@@ -656,6 +773,20 @@ fn explain_physical(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             for input in inputs {
                 explain_physical(input, indent + 1, out);
             }
+        }
+        PhysicalPlan::Intersect {
+            left, right, all, ..
+        } => {
+            out.push_str(&format!("{pad}Intersect all={all}\n"));
+            explain_physical(left, indent + 1, out);
+            explain_physical(right, indent + 1, out);
+        }
+        PhysicalPlan::Except {
+            left, right, all, ..
+        } => {
+            out.push_str(&format!("{pad}Except all={all}\n"));
+            explain_physical(left, indent + 1, out);
+            explain_physical(right, indent + 1, out);
         }
         PhysicalPlan::Exchange {
             input,
@@ -1631,7 +1762,59 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
             }
             _ => lowering.limit(execute_physical(input, ctx)?, *skip, *fetch),
         },
-        PhysicalPlan::Union { .. } => Err(Error::NotImplemented("physical union")),
+        PhysicalPlan::Union {
+            inputs,
+            schema,
+            all,
+        } => {
+            let mut ops = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                ops.push(execute_physical(input, ctx)?);
+            }
+            let batches = super::setop::union(
+                ops,
+                schema.clone(),
+                *all,
+                &ctx.session.policy,
+                ctx.pool.as_ref(),
+                &ctx.session.cancel,
+            )?;
+            lowering.scan(batches)
+        }
+        PhysicalPlan::Intersect {
+            left,
+            right,
+            schema,
+            all,
+        } => {
+            let batches = super::setop::intersect(
+                execute_physical(left, ctx)?,
+                execute_physical(right, ctx)?,
+                schema.clone(),
+                *all,
+                &ctx.session.policy,
+                ctx.pool.as_ref(),
+                &ctx.session.cancel,
+            )?;
+            lowering.scan(batches)
+        }
+        PhysicalPlan::Except {
+            left,
+            right,
+            schema,
+            all,
+        } => {
+            let batches = super::setop::except(
+                execute_physical(left, ctx)?,
+                execute_physical(right, ctx)?,
+                schema.clone(),
+                *all,
+                &ctx.session.policy,
+                ctx.pool.as_ref(),
+                &ctx.session.cancel,
+            )?;
+            lowering.scan(batches)
+        }
         PhysicalPlan::Recursive {
             name,
             anchors,

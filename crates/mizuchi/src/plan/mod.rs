@@ -361,6 +361,28 @@ pub enum LogicalPlan {
         /// `true` for `UNION ALL`.
         all: bool,
     },
+    /// Rows that appear in both inputs. Schema is the left input.
+    Intersect {
+        /// Left input; output order follows first-seen rows here.
+        left: Box<LogicalPlan>,
+        /// Right input, used as the probe table.
+        right: Box<LogicalPlan>,
+        /// Output schema from the left input.
+        schema: SchemaRef,
+        /// `true` for `INTERSECT ALL` (bag counts); `false` is DISTINCT.
+        all: bool,
+    },
+    /// Left rows that do not appear in the right input. Schema is the left.
+    Except {
+        /// Left input; output order follows first-seen rows here.
+        left: Box<LogicalPlan>,
+        /// Right input, used as the probe table.
+        right: Box<LogicalPlan>,
+        /// Output schema from the left input.
+        schema: SchemaRef,
+        /// `true` for `EXCEPT ALL` (bag counts); `false` is DISTINCT.
+        all: bool,
+    },
     /// Window functions: input columns plus one column per function.
     Window {
         /// Child plan.
@@ -418,6 +440,8 @@ impl LogicalPlan {
             | Self::Aggregate { schema, .. }
             | Self::Join { schema, .. }
             | Self::Union { schema, .. }
+            | Self::Intersect { schema, .. }
+            | Self::Except { schema, .. }
             | Self::Window { schema, .. }
             | Self::Recursive { schema, .. }
             | Self::WorkScan { schema, .. }
@@ -562,6 +586,22 @@ fn explain_into(plan: &LogicalPlan, indent: usize, out: &mut String) {
             for input in inputs {
                 explain_into(input, indent + 1, out);
             }
+        }
+        LogicalPlan::Intersect {
+            left, right, all, ..
+        } => {
+            let kind = if *all { "all" } else { "distinct" };
+            out.push_str(&format!("{pad}Intersect {kind}\n"));
+            explain_into(left, indent + 1, out);
+            explain_into(right, indent + 1, out);
+        }
+        LogicalPlan::Except {
+            left, right, all, ..
+        } => {
+            let kind = if *all { "all" } else { "distinct" };
+            out.push_str(&format!("{pad}Except {kind}\n"));
+            explain_into(left, indent + 1, out);
+            explain_into(right, indent + 1, out);
         }
         LogicalPlan::Window {
             input,
@@ -840,7 +880,7 @@ pub(crate) fn require_numeric(dt: DataType, what: &str) -> Result<()> {
     }
 }
 
-fn widen(l: DataType, r: DataType) -> Result<DataType> {
+pub(crate) fn widen(l: DataType, r: DataType) -> Result<DataType> {
     if l == r {
         return Ok(l);
     }
@@ -977,6 +1017,10 @@ mod tests {
 
         let union = explain("SELECT a FROM t UNION ALL SELECT a FROM t");
         assert!(union.contains("Union all"), "{union}");
+        let intersect = explain("SELECT a FROM t INTERSECT SELECT a FROM t");
+        assert!(intersect.contains("Intersect distinct"), "{intersect}");
+        let except = explain("SELECT a FROM t EXCEPT ALL SELECT a FROM t");
+        assert!(except.contains("Except all"), "{except}");
 
         let window = explain("SELECT ROW_NUMBER() OVER (ORDER BY a) FROM t");
         assert!(window.contains("Window"), "{window}");

@@ -103,6 +103,10 @@ pub fn estimate_rows(plan: &LogicalPlan) -> Option<f64> {
             }
             Some(n.max(1.0))
         }
+        LogicalPlan::Intersect { left, right, .. } => {
+            Some(estimate_rows(left)?.min(estimate_rows(right)?).max(1.0))
+        }
+        LogicalPlan::Except { left, .. } => estimate_rows(left),
         LogicalPlan::Recursive { anchors, .. } => {
             let mut n = 0.0;
             for anchor in anchors {
@@ -276,6 +280,28 @@ fn map_children(
                 all,
             })
         }
+        LogicalPlan::Intersect {
+            left,
+            right,
+            schema,
+            all,
+        } => Ok(LogicalPlan::Intersect {
+            left: Box::new(f(*left)?),
+            right: Box::new(f(*right)?),
+            schema,
+            all,
+        }),
+        LogicalPlan::Except {
+            left,
+            right,
+            schema,
+            all,
+        } => Ok(LogicalPlan::Except {
+            left: Box::new(f(*left)?),
+            right: Box::new(f(*right)?),
+            schema,
+            all,
+        }),
         LogicalPlan::Window {
             input,
             partition,
