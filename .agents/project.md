@@ -32,7 +32,7 @@ the public engine API, the logical plan format, the memory and spill manager, an
 
 ## Compatibility and failure obligations
 
-Embedding runner and Arrow version pins, partial runs (crash after output written but before it is reported, an adapter losing its claim mid-run), retries owned by the source, cleanup of scratch and processes, and memory and spill files.
+Embedding runner and Arrow version pins; cancelled or failed queries (a memory limit hit, a worker or task failure mid-query) must release memory and leave no partial output; cleanup of spill files and threads on success, failure, and cancellation.
 
 ## Evidence map
 
@@ -43,10 +43,10 @@ Unit tests for pure logic; sqllogictest and plan snapshots for SQL and optimizer
 | Surface | Required evidence |
 | --- | --- |
 | SQL, planner, optimizer | sqllogictest and plan snapshot tests; results match a reference engine on the affected queries |
-| staging, hashing, cleanup | deterministic tests: identical inputs give identical hashes; scratch removed on success, failure, and timeout |
+| file formats (Parquet, CSV, Arrow IPC) | round-trip tests against fixtures; malformed input rejected with an error, never a panic |
 | execution, memory, spill | operator unit tests including spill paths and memory limit hits; no unbounded allocation |
 | dependency pins (arrow, parquet, sqlparser) | `Cargo.lock` diff reviewed; the pinned tag exists upstream; upstream release notes read |
-| runtime image / Python packages | image builds; package set matches the documented policy |
+| Python bindings (later phase) | binding tests run against the built wheel; Arrow data passes zero-copy |
 
 ## Release audit
 
@@ -54,5 +54,5 @@ Unit tests for pure logic; sqllogictest and plan snapshots for SQL and optimizer
 - pinned Arrow, Parquet and parser versions, and their release notes;
 - public API, SQL dialect and plan format changes;
 - configuration additions, removals, and defaults;
-- runtime image contents and the Python package set;
+- Python binding packaging, once the Python API exists;
 - packaging, rollback, and upgrade actions.

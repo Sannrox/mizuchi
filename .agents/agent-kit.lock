@@ -1,7 +1,0 @@
-# Sannrox/agent-kit pin. Change ref and commit together, then run
-# `bash scripts/validate-workflow-skills.sh --render` and commit the result.
-repo=Sannrox/agent-kit
-ref=v0.1.0
-commit=9de696cba13a1514c90fa7ef71135dbd08690762
-skills=advance-issue-frontier assess-change-impact capture-project-decision deliver-ready-issue prepare-release refactor-docs shape-work-item technical-documentation verify-change
-scripts=gh-verified-push.sh validate-workflow-skills.sh
