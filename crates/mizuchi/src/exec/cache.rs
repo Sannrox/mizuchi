@@ -70,7 +70,9 @@ fn collect_tables(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Window { input, .. } => collect_tables(input, out),
-        LogicalPlan::Join { left, right, .. } => {
+        LogicalPlan::Join { left, right, .. }
+        | LogicalPlan::Intersect { left, right, .. }
+        | LogicalPlan::Except { left, right, .. } => {
             collect_tables(left, out);
             collect_tables(right, out);
         }

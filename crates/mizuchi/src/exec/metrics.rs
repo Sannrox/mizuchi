@@ -130,6 +130,13 @@ pub(super) fn physical_shape(plan: &LogicalPlan) -> PhysNode {
         LogicalPlan::Union { inputs, .. } => {
             node("Union", inputs.iter().map(physical_shape).collect())
         }
+        LogicalPlan::Intersect { left, right, .. } => node(
+            "Intersect",
+            vec![physical_shape(left), physical_shape(right)],
+        ),
+        LogicalPlan::Except { left, right, .. } => {
+            node("Except", vec![physical_shape(left), physical_shape(right)])
+        }
         LogicalPlan::Window { input, .. } => node("Window", vec![physical_shape(input)]),
         LogicalPlan::Recursive { anchors, step, .. } => {
             let mut children: Vec<PhysNode> = anchors.iter().map(physical_shape).collect();

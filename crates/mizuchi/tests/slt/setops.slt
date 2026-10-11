@@ -1,46 +1,129 @@
-# Set operators. UNION DISTINCT and UNION ALL bind, then fail at physical union.
-# INTERSECT and EXCEPT fail in the binder.
+# Set operators. UNION DISTINCT and UNION ALL concatenate; DISTINCT hashes
+# whole rows. INTERSECT and EXCEPT probe the right input. Nulls compare equal.
 
-skipif mizuchi
 query I
 SELECT 1 UNION SELECT 2
 ----
 1
 2
 
-skipif mizuchi
 query I
 SELECT 1 UNION ALL SELECT 1
 ----
 1
 1
 
-skipif mizuchi
 query I
 SELECT 1 UNION DISTINCT SELECT 1
 ----
 1
 
-skipif mizuchi
 query I
 SELECT 1 INTERSECT SELECT 1
 ----
 1
 
-skipif mizuchi
 query I
 SELECT 1 INTERSECT ALL SELECT 1
 ----
 1
 
-skipif mizuchi
 query I
 SELECT 1 EXCEPT SELECT 2
 ----
 1
 
-skipif mizuchi
 query I
 SELECT 1 EXCEPT ALL SELECT 2
 ----
 1
+
+statement ok
+CREATE TABLE a (x INTEGER)
+
+statement ok
+INSERT INTO a VALUES (1), (1), (2)
+
+statement ok
+CREATE TABLE b (x INTEGER)
+
+statement ok
+INSERT INTO b VALUES (1), (3)
+
+query I
+SELECT x FROM a UNION SELECT x FROM b
+----
+1
+2
+3
+
+query I
+SELECT x FROM a UNION ALL SELECT x FROM b
+----
+1
+1
+2
+1
+3
+
+query I
+SELECT x FROM a INTERSECT SELECT x FROM b
+----
+1
+
+query I
+SELECT x FROM a INTERSECT ALL SELECT x FROM b
+----
+1
+
+query I
+SELECT x FROM a EXCEPT SELECT x FROM b
+----
+2
+
+query I
+SELECT x FROM a EXCEPT ALL SELECT x FROM b
+----
+1
+2
+
+statement ok
+CREATE TABLE n1 (x INTEGER)
+
+statement ok
+INSERT INTO n1 VALUES (NULL), (1)
+
+statement ok
+CREATE TABLE n2 (x INTEGER)
+
+statement ok
+INSERT INTO n2 VALUES (NULL), (2)
+
+query I
+SELECT x FROM n1 INTERSECT SELECT x FROM n2
+----
+NULL
+
+query I
+SELECT x FROM n1 EXCEPT SELECT x FROM n2
+----
+1
+
+query I
+SELECT x FROM n1 UNION SELECT x FROM n2
+----
+NULL
+1
+2
+
+query I
+SELECT NULL UNION SELECT 1
+----
+NULL
+1
+
+query I
+SELECT CAST(1 AS INT) UNION SELECT 2
+----
+1
+2
