@@ -36,3 +36,4 @@ All notable changes to this project are documented here.
 - ADR 0005: incremental execution as micro-batches on the same hash aggregate. `MicroBatchAgg` folds append-only batches and emits the complete group table.
 - Query result cache on `execute_sql`: identical plans reuse stored Arrow batches while scanned table generations match. Re-registering a table invalidates entries that used it.
 - ADR 0006: GPU operators are a no-go for this phase. The default decision-support suite is too small for device copy to pay off; revisit when inputs are gigabyte-scale and a runner grants a device.
+- Gigabyte-scale decision-support baseline: SF1 and SF10 TPC-H/TPC-DS-style queries versus DuckDB and DataFusion on the same Snappy Parquet. Reproduce with `scripts/bench-gb.sh`; committed times and method in `docs/bench/`. Optional `workflow_dispatch` smoke at `--sf tiny`; default `cargo test` is unchanged.
