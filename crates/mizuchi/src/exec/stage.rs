@@ -8,6 +8,9 @@
 //! round-robin to a bounded worker pool. A failed task is retried on any
 //! remaining worker up to four attempts; committed shuffle blocks are kept
 //! and reused. Partial writes from a failed attempt are discarded.
+//! After shuffle-map stages finish, join partitions that exceed both five
+//! times the median size and a byte threshold are split by grouping map
+//! outputs; the matching other-side partition is replicated for each split.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -28,6 +31,7 @@ use arrow::ipc::writer::FileWriter;
 
 use super::join::{self, JoinSpec};
 use super::key;
+use super::memory::batch_bytes;
 use super::{Exec, Session, collect, physical};
 use crate::batch::Batch;
 use crate::error::{Error, Result};
@@ -557,6 +561,10 @@ static JOB_SEQ: AtomicU64 = AtomicU64::new(1);
 /// individual task failures before the stage is aborted.
 const MAX_TASK_ATTEMPTS: u32 = 4;
 
+/// A partition is skewed when it is larger than this times the median size
+/// (and also larger than the session byte threshold).
+const SKEW_FACTOR: u64 = 5;
+
 #[cfg(test)]
 static INJECT_TASK_FAILURES: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
@@ -567,7 +575,19 @@ static MAP_COMMITS: AtomicU64 = AtomicU64::new(0);
 struct ShuffleStore {
     /// In-memory blocks keyed by `(shuffle_id, map_partition, reduce_partition)`.
     memory: Mutex<HashMap<(usize, usize, usize), Vec<Batch>>>,
+    /// Committed block sizes for adaptive splits, same key as `memory`.
+    sizes: Mutex<HashMap<(usize, usize, usize), u64>>,
     dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct TaskSpec {
+    partition: usize,
+    /// Map id used when this task writes a shuffle. Unique per split so
+    /// parallel join tasks do not overwrite each other's blocks.
+    output_map: usize,
+    /// shuffle_id -> map ids to read. Empty means every map.
+    maps: HashMap<usize, Vec<usize>>,
 }
 
 struct ShuffleJob {
@@ -587,6 +607,7 @@ impl ShuffleStore {
     fn memory() -> Self {
         Self {
             memory: Mutex::new(HashMap::new()),
+            sizes: Mutex::new(HashMap::new()),
             dir: None,
         }
     }
@@ -595,6 +616,7 @@ impl ShuffleStore {
         fs::create_dir_all(&dir).map_err(|e| Error::Io(e.to_string()))?;
         Ok(Self {
             memory: Mutex::new(HashMap::new()),
+            sizes: Mutex::new(HashMap::new()),
             dir: Some(dir),
         })
     }
@@ -615,6 +637,11 @@ impl ShuffleStore {
         schema: SchemaRef,
         batches: Vec<Batch>,
     ) -> Result<()> {
+        let bytes = batches.iter().map(batch_bytes).sum();
+        self.sizes
+            .lock()
+            .map_err(|_| Error::Eval("shuffle size lock poisoned".into()))?
+            .insert((shuffle_id, map, reduce), bytes);
         if let Some(path) = self.block_path(shuffle_id, map, reduce) {
             return write_ipc(&path, schema, &batches);
         }
@@ -626,27 +653,33 @@ impl ShuffleStore {
         Ok(())
     }
 
-    fn read(&self, shuffle_id: usize, reduce: usize, schema: SchemaRef) -> Result<Vec<Batch>> {
+    fn read(
+        &self,
+        shuffle_id: usize,
+        reduce: usize,
+        schema: SchemaRef,
+        maps: Option<&[usize]>,
+    ) -> Result<Vec<Batch>> {
         if let Some(dir) = &self.dir {
-            return read_ipc_reduce(dir, shuffle_id, reduce, schema);
+            return read_ipc_reduce(dir, shuffle_id, reduce, schema, maps);
         }
         let g = self
             .memory
             .lock()
             .map_err(|_| Error::Eval("shuffle lock poisoned".into()))?;
-        let mut maps: Vec<(usize, Vec<Batch>)> = g
+        let mut blocks: Vec<(usize, Vec<Batch>)> = g
             .iter()
             .filter_map(|((sid, map, red), batches)| {
-                if *sid == shuffle_id && *red == reduce {
+                if *sid == shuffle_id && *red == reduce && maps.is_none_or(|m| m.contains(map)) {
                     Some((*map, batches.clone()))
                 } else {
                     None
                 }
             })
             .collect();
-        maps.sort_by_key(|(map, _)| *map);
+        blocks.sort_by_key(|(map, _)| *map);
         let mut out = Vec::new();
-        for (_, batches) in maps {
+        for (_, batches) in blocks {
             out.extend(batches);
         }
         if out.is_empty() {
@@ -655,8 +688,50 @@ impl ShuffleStore {
         Ok(out)
     }
 
+    fn map_sizes(&self, shuffle_id: usize, reduce: usize) -> Result<Vec<(usize, u64)>> {
+        let g = self
+            .sizes
+            .lock()
+            .map_err(|_| Error::Eval("shuffle size lock poisoned".into()))?;
+        let mut out: Vec<(usize, u64)> = g
+            .iter()
+            .filter_map(|((sid, map, red), bytes)| {
+                if *sid == shuffle_id && *red == reduce {
+                    Some((*map, *bytes))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.sort_by_key(|(map, _)| *map);
+        Ok(out)
+    }
+
+    fn reduce_bytes(&self, shuffle_id: usize, n_reduce: usize) -> Result<Vec<u64>> {
+        let g = self
+            .sizes
+            .lock()
+            .map_err(|_| Error::Eval("shuffle size lock poisoned".into()))?;
+        let mut out = vec![0u64; n_reduce.max(1)];
+        for ((sid, _map, red), bytes) in g.iter() {
+            if *sid == shuffle_id && *red < out.len() {
+                out[*red] = out[*red].saturating_add(*bytes);
+            }
+        }
+        Ok(out)
+    }
+
     /// Drop a failed map attempt so a retry does not mix with partial output.
     fn abort_map(&self, shuffle_id: usize, map: usize, reduces: usize) -> Result<()> {
+        {
+            let mut sizes = self
+                .sizes
+                .lock()
+                .map_err(|_| Error::Eval("shuffle size lock poisoned".into()))?;
+            for reduce in 0..reduces {
+                sizes.remove(&(shuffle_id, map, reduce));
+            }
+        }
         if self.dir.is_some() {
             for reduce in 0..reduces {
                 if let Some(path) = self.block_path(shuffle_id, map, reduce) {
@@ -716,6 +791,7 @@ fn read_ipc_reduce(
     shuffle_id: usize,
     reduce: usize,
     schema: SchemaRef,
+    maps: Option<&[usize]>,
 ) -> Result<Vec<Batch>> {
     let prefix = format!("shuffle-{shuffle_id}-map-");
     let suffix = format!("-reduce-{reduce}.arrow");
@@ -725,9 +801,19 @@ fn read_ipc_reduce(
             let ent = ent.map_err(|e| Error::Io(e.to_string()))?;
             let name = ent.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(&prefix) && name.ends_with(&suffix) {
-                paths.push(ent.path());
+            if !name.starts_with(&prefix) || !name.ends_with(&suffix) {
+                continue;
             }
+            if let Some(maps) = maps {
+                let mid = &name[prefix.len()..name.len() - suffix.len()];
+                let Ok(map) = mid.parse::<usize>() else {
+                    continue;
+                };
+                if !maps.contains(&map) {
+                    continue;
+                }
+            }
+            paths.push(ent.path());
         }
     }
     paths.sort();
@@ -754,9 +840,38 @@ struct TaskCtx {
     partitions: usize,
     shuffle: Arc<ShuffleStore>,
     pool: Arc<super::memory::MemoryPool>,
+    map_filter: HashMap<usize, Vec<usize>>,
 }
 
 pub(super) fn execute_staged(logical: &LogicalPlan, session: &Session) -> Result<Vec<Batch>> {
+    let mut notes = Vec::new();
+    execute_staged_inner(logical, session, &mut notes)
+}
+
+pub(super) fn explain_analyze(logical: &LogicalPlan, session: &Session) -> Result<String> {
+    let mut notes = Vec::new();
+    let batches = execute_staged_inner(logical, session, &mut notes)?;
+    let mut text = explain_stages(logical, session.workers.max(1))?;
+    if notes.is_empty() {
+        text.push_str("Adaptive: no partition splits\n");
+    } else {
+        for note in &notes {
+            text.push_str(note);
+            if !note.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+    }
+    let rows: usize = batches.iter().map(Batch::num_rows).sum();
+    text.push_str(&format!("rows={rows}\n"));
+    Ok(text)
+}
+
+fn execute_staged_inner(
+    logical: &LogicalPlan,
+    session: &Session,
+    notes: &mut Vec<String>,
+) -> Result<Vec<Batch>> {
     let workers = session.workers.max(1);
     let stages = plan_stages(logical, workers);
     let job = match &session.shuffle_dir {
@@ -776,12 +891,196 @@ pub(super) fn execute_staged(logical: &LogicalPlan, session: &Session) -> Result
     let pool = Arc::new(session.memory_pool()?);
     let mut result = Vec::new();
     for stage in &stages {
-        let out = run_stage(stage, session, &job.store, workers, pool.clone())?;
+        let tasks = if join_shuffle_reads(&stage.plan).is_some() {
+            adaptive_tasks(stage, &job.store, session, notes)?
+        } else {
+            default_tasks(stage.partitions)
+        };
+        let out = run_stage(stage, session, &job.store, workers, pool.clone(), tasks)?;
         if stage.kind == StageKind::Result {
             result = out;
         }
     }
     Ok(result)
+}
+
+fn default_tasks(partitions: usize) -> Vec<TaskSpec> {
+    (0..partitions.max(1))
+        .map(|p| TaskSpec {
+            partition: p,
+            output_map: p,
+            maps: HashMap::new(),
+        })
+        .collect()
+}
+
+fn adaptive_tasks(
+    stage: &Stage,
+    store: &ShuffleStore,
+    session: &Session,
+    notes: &mut Vec<String>,
+) -> Result<Vec<TaskSpec>> {
+    let Some((left_sid, right_sid, n_reduce, join_type)) = join_shuffle_reads(&stage.plan) else {
+        return Ok(default_tasks(stage.partitions));
+    };
+    let left_bytes = store.reduce_bytes(left_sid, n_reduce)?;
+    let right_bytes = store.reduce_bytes(right_sid, n_reduce)?;
+    let left_med = median_u64(&left_bytes);
+    let right_med = median_u64(&right_bytes);
+    let left_thr = skew_threshold(left_med, session.skew_threshold);
+    let right_thr = skew_threshold(right_med, session.skew_threshold);
+    let left_target = target_size(&left_bytes, left_thr, session.advisory_partition_size);
+    let right_target = target_size(&right_bytes, right_thr, session.advisory_partition_size);
+    let mut tasks = Vec::new();
+    let mut splits = 0usize;
+    for p in 0..n_reduce.max(1) {
+        let left_maps = store.map_sizes(left_sid, p)?;
+        let right_maps = store.map_sizes(right_sid, p)?;
+        let left_sz = left_bytes.get(p).copied().unwrap_or(0);
+        let right_sz = right_bytes.get(p).copied().unwrap_or(0);
+        let left_ids: Vec<usize> = left_maps.iter().map(|(m, _)| *m).collect();
+        let right_ids: Vec<usize> = right_maps.iter().map(|(m, _)| *m).collect();
+        let can_split_left = matches!(
+            join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti
+        );
+        let can_split_right = matches!(join_type, JoinType::Inner | JoinType::Right);
+        // Split the preserved side (or the larger side for inner). Replicating a
+        // preserved side would emit unmatched rows once per split task.
+        let groups = if can_split_left
+            && left_sz > left_thr
+            && (left_sz >= right_sz || !can_split_right || right_sz <= right_thr)
+        {
+            let groups = group_maps(&left_maps, left_target);
+            if groups.len() > 1 {
+                notes.push(format!(
+                    "Adaptive skew: shuffle {left_sid} partition {p} bytes={left_sz} median={left_med} split into {}\n",
+                    groups.len()
+                ));
+                splits += groups.len();
+            }
+            groups
+                .into_iter()
+                .map(|g| (g, right_ids.clone()))
+                .collect::<Vec<_>>()
+        } else if can_split_right && right_sz > right_thr {
+            let groups = group_maps(&right_maps, right_target);
+            if groups.len() > 1 {
+                notes.push(format!(
+                    "Adaptive skew: shuffle {right_sid} partition {p} bytes={right_sz} median={right_med} split into {}\n",
+                    groups.len()
+                ));
+                splits += groups.len();
+            }
+            groups
+                .into_iter()
+                .map(|g| (left_ids.clone(), g))
+                .collect::<Vec<_>>()
+        } else {
+            vec![(left_ids, right_ids)]
+        };
+        for (lm, rm) in groups {
+            let mut maps = HashMap::new();
+            maps.insert(left_sid, lm);
+            maps.insert(right_sid, rm);
+            tasks.push(TaskSpec {
+                partition: p,
+                output_map: tasks.len(),
+                maps,
+            });
+        }
+    }
+    if splits > 0 {
+        notes.push(format!(
+            "Adaptive skew: join tasks {} -> {}\n",
+            n_reduce.max(1),
+            tasks.len()
+        ));
+    }
+    if tasks.is_empty() {
+        Ok(default_tasks(stage.partitions))
+    } else {
+        Ok(tasks)
+    }
+}
+
+fn join_shuffle_reads(plan: &PhysicalPlan) -> Option<(usize, usize, usize, JoinType)> {
+    match plan {
+        PhysicalPlan::Join {
+            left,
+            right,
+            join_type,
+            ..
+        } => match (left.as_ref(), right.as_ref()) {
+            (
+                PhysicalPlan::ShuffleRead {
+                    shuffle_id: l,
+                    partitions: lp,
+                    ..
+                },
+                PhysicalPlan::ShuffleRead {
+                    shuffle_id: r,
+                    partitions: rp,
+                    ..
+                },
+            ) => Some((*l, *r, (*lp).max(*rp), *join_type)),
+            _ => None,
+        },
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::Limit { input, .. } => join_shuffle_reads(input),
+        _ => None,
+    }
+}
+
+fn skew_threshold(median: u64, floor: u64) -> u64 {
+    floor.max(median.saturating_mul(SKEW_FACTOR))
+}
+
+fn median_u64(values: &[u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut v = values.to_vec();
+    v.sort_unstable();
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        v[n / 2 - 1] / 2 + v[n / 2] / 2
+    }
+}
+
+fn target_size(sizes: &[u64], skew_thr: u64, advisory: u64) -> u64 {
+    let non: Vec<u64> = sizes.iter().copied().filter(|s| *s <= skew_thr).collect();
+    let avg = if non.is_empty() {
+        0
+    } else {
+        non.iter().sum::<u64>() / non.len() as u64
+    };
+    advisory.max(avg).max(1)
+}
+
+fn group_maps(maps: &[(usize, u64)], target: u64) -> Vec<Vec<usize>> {
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    let mut acc = 0u64;
+    for (map, bytes) in maps {
+        if !cur.is_empty() && acc.saturating_add(*bytes) > target {
+            out.push(std::mem::take(&mut cur));
+            acc = 0;
+        }
+        cur.push(*map);
+        acc = acc.saturating_add(*bytes);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(Vec::new());
+    }
+    out
 }
 
 fn run_stage(
@@ -790,11 +1089,12 @@ fn run_stage(
     shuffle: &Arc<ShuffleStore>,
     workers: usize,
     pool: Arc<super::memory::MemoryPool>,
+    tasks: Vec<TaskSpec>,
 ) -> Result<Vec<Batch>> {
     let n = stage.partitions.max(1);
-    let workers = workers.min(n).max(1);
-    let pending: Arc<Mutex<Vec<(usize, u32)>>> =
-        Arc::new(Mutex::new((0..n).map(|p| (p, 0u32)).collect()));
+    let workers = workers.min(tasks.len().max(1)).max(1);
+    let pending: Arc<Mutex<Vec<(TaskSpec, u32)>>> =
+        Arc::new(Mutex::new(tasks.into_iter().map(|t| (t, 0u32)).collect()));
     let abort: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
     let mut out = Vec::new();
     loop {
@@ -842,18 +1142,18 @@ fn run_stage(
                             .map_err(|_| Error::Eval("task queue lock poisoned".into()))?;
                         g.pop()
                     };
-                    let Some((p, attempts)) = job else {
+                    let Some((spec, attempts)) = job else {
                         break;
                     };
                     {
                         let mut g = in_flight
                             .lock()
                             .map_err(|_| Error::Eval("in-flight lock poisoned".into()))?;
-                        g[i] = Some((p, attempts));
+                        g[i] = Some((spec.clone(), attempts));
                     }
                     let ran = panic::catch_unwind(AssertUnwindSafe(|| {
                         inject_failure(kind);
-                        run_one_task(&plan, &write, &session, p, n, &shuffle, &pool)
+                        run_one_task(&plan, &write, &session, &spec, n, &shuffle, &pool)
                     }));
                     {
                         let mut g = in_flight
@@ -864,13 +1164,15 @@ fn run_stage(
                     match ran {
                         Ok(Ok(batches)) => local.extend(batches),
                         Ok(Err(e)) => {
-                            requeue_or_abort(&pending, &abort, p, attempts, e, &write, &shuffle)?;
+                            requeue_or_abort(
+                                &pending, &abort, spec, attempts, e, &write, &shuffle,
+                            )?;
                         }
                         Err(_) => {
                             requeue_or_abort(
                                 &pending,
                                 &abort,
-                                p,
+                                spec,
                                 attempts,
                                 Error::Eval("worker panicked".into()),
                                 &write,
@@ -900,11 +1202,11 @@ fn run_stage(
                             .map_err(|_| Error::Eval("in-flight lock poisoned".into()))?;
                         g[i].take()
                     };
-                    if let Some((p, attempts)) = job {
+                    if let Some((spec, attempts)) = job {
                         requeue_or_abort(
                             &pending,
                             &abort,
-                            p,
+                            spec,
                             attempts,
                             Error::Eval("worker panicked".into()),
                             &stage.write,
@@ -953,24 +1255,25 @@ fn run_one_task(
     plan: &PhysicalPlan,
     write: &Option<ShuffleWrite>,
     session: &Session,
-    partition: usize,
+    spec: &TaskSpec,
     partitions: usize,
     shuffle: &Arc<ShuffleStore>,
     pool: &Arc<super::memory::MemoryPool>,
 ) -> Result<Vec<Batch>> {
     let ctx = TaskCtx {
         session: session.clone(),
-        partition,
+        partition: spec.partition,
         partitions,
         shuffle: shuffle.clone(),
         pool: pool.clone(),
+        map_filter: spec.maps.clone(),
     };
     let batches = collect(execute_physical(plan, &ctx)?, &session.cancel)?;
     if let Some(write) = write {
         let parts = partition_batches(&batches, &write.keys, write.partitions)?;
         let schema = plan.schema().clone();
         for (r, part) in parts.into_iter().enumerate() {
-            shuffle.write(write.shuffle_id, partition, r, schema.clone(), part)?;
+            shuffle.write(write.shuffle_id, spec.output_map, r, schema.clone(), part)?;
         }
         #[cfg(test)]
         MAP_COMMITS.fetch_add(1, Ordering::Relaxed);
@@ -981,9 +1284,9 @@ fn run_one_task(
 }
 
 fn requeue_or_abort(
-    pending: &Mutex<Vec<(usize, u32)>>,
+    pending: &Mutex<Vec<(TaskSpec, u32)>>,
     abort: &Mutex<Option<Error>>,
-    partition: usize,
+    spec: TaskSpec,
     attempts: u32,
     cause: Error,
     write: &Option<ShuffleWrite>,
@@ -999,7 +1302,7 @@ fn requeue_or_abort(
         return Ok(());
     }
     if let Some(write) = write {
-        shuffle.abort_map(write.shuffle_id, partition, write.partitions)?;
+        shuffle.abort_map(write.shuffle_id, spec.output_map, write.partitions)?;
     }
     let next = attempts.saturating_add(1);
     if next >= MAX_TASK_ATTEMPTS {
@@ -1008,7 +1311,8 @@ fn requeue_or_abort(
             .map_err(|_| Error::Eval("abort lock poisoned".into()))?;
         if g.is_none() {
             *g = Some(Error::Eval(format!(
-                "task partition {partition} failed after {MAX_TASK_ATTEMPTS} attempts: {cause}"
+                "task partition {} failed after {MAX_TASK_ATTEMPTS} attempts: {cause}",
+                spec.partition
             )));
         }
         return Ok(());
@@ -1016,7 +1320,7 @@ fn requeue_or_abort(
     pending
         .lock()
         .map_err(|_| Error::Eval("task queue lock poisoned".into()))?
-        .push((partition, next));
+        .push((spec, next));
     Ok(())
 }
 
@@ -1056,12 +1360,15 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
         }
         PhysicalPlan::ShuffleRead {
             shuffle_id, schema, ..
-        } => Ok(Exec::Scan {
-            batches: ctx
-                .shuffle
-                .read(*shuffle_id, ctx.partition, schema.clone())?,
-            index: 0,
-        }),
+        } => {
+            let maps = ctx.map_filter.get(shuffle_id).map(|v| v.as_slice());
+            Ok(Exec::Scan {
+                batches: ctx
+                    .shuffle
+                    .read(*shuffle_id, ctx.partition, schema.clone(), maps)?,
+                index: 0,
+            })
+        }
         PhysicalPlan::Filter { input, predicate } => Ok(Exec::Filter {
             input: Box::new(execute_physical(input, ctx)?),
             predicate: predicate.clone(),
@@ -1396,7 +1703,7 @@ mod tests {
         let reader = FileReader::try_new(file, None).unwrap();
         let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
         assert_eq!(rows, 2);
-        let got = store.read(0, 1, schema).unwrap();
+        let got = store.read(0, 1, schema, None).unwrap();
         assert_eq!(got.iter().map(Batch::num_rows).sum::<usize>(), 2);
         let _ = fs::remove_dir_all(&root);
     }
@@ -1498,5 +1805,78 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         assert!(leftover.is_empty(), "{leftover:?}");
         reset_inject();
+    }
+
+    fn skewed_join_session() -> Session {
+        let t_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let u_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+        ]));
+        let mut t_vals = vec![Some(1i64); 800];
+        t_vals.extend([Some(2), Some(3), Some(4), Some(5), Some(99)]);
+        let t = Batch::try_new(t_schema.clone(), vec![Arc::new(Int64Array::from(t_vals))]).unwrap();
+        let mut u_ids = vec![Some(1i64); 40];
+        u_ids.extend([Some(2), Some(3), Some(4), Some(5), Some(77)]);
+        let u_x = vec![Some(0i64); u_ids.len()];
+        let u = Batch::try_new(
+            u_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(u_ids)),
+                Arc::new(Int64Array::from(u_x)),
+            ],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("t", t_schema, vec![t]).unwrap();
+        s.register("u", u_schema, vec![u]).unwrap();
+        s.with_workers(4)
+            .unwrap()
+            .with_skew_threshold(1)
+            .with_advisory_partition_size(1)
+    }
+
+    #[test]
+    fn skewed_join_matches_pull_and_splits() {
+        let _g = lock_stage_tests();
+        let s = skewed_join_session();
+        let sql = "SELECT t.a, u.id FROM t JOIN u ON t.a = u.id";
+        let pull = s.execute_sql(sql).unwrap();
+        let staged = s.execute_staged(sql).unwrap();
+        assert_eq!(
+            sorted_pairs(&pull, "a", "id"),
+            sorted_pairs(&staged, "a", "id")
+        );
+        let text = s.explain_analyze(sql).unwrap();
+        assert!(text.contains("Adaptive skew"), "{text}");
+        assert!(text.contains("split into"), "{text}");
+        assert!(text.contains("join tasks"), "{text}");
+        let pull_rows = sorted_pairs(&pull, "a", "id").len();
+        assert!(text.contains(&format!("rows={pull_rows}")), "{text}");
+
+        let left_sql = "SELECT t.a, u.id FROM t LEFT JOIN u ON t.a = u.id";
+        let left_pull = s.execute_sql(left_sql).unwrap();
+        let left_staged = s.execute_staged(left_sql).unwrap();
+        assert_eq!(
+            sorted_pairs(&left_pull, "a", "id"),
+            sorted_pairs(&left_staged, "a", "id")
+        );
+        let right_sql = "SELECT t.a, u.id FROM t RIGHT JOIN u ON t.a = u.id";
+        let right_pull = s.execute_sql(right_sql).unwrap();
+        let right_staged = s.execute_staged(right_sql).unwrap();
+        assert_eq!(
+            sorted_pairs(&right_pull, "a", "id"),
+            sorted_pairs(&right_staged, "a", "id")
+        );
+    }
+
+    #[test]
+    fn default_threshold_does_not_split_tiny_joins() {
+        let _g = lock_stage_tests();
+        let s = join_session().with_workers(2).unwrap();
+        let text = s
+            .explain_analyze("SELECT t.a, u.id FROM t JOIN u ON t.a = u.id")
+            .unwrap();
+        assert!(text.contains("Adaptive: no partition splits"), "{text}");
     }
 }

@@ -73,6 +73,11 @@ pub struct Session {
     cancel: CancelToken,
     /// Shared owner budget when this session was opened from [`Engine`].
     budget: Option<std::sync::Arc<memory::Budget>>,
+    /// A shuffle partition is skewed when it exceeds this many bytes and
+    /// also exceeds five times the median partition size.
+    skew_threshold: u64,
+    /// Target size when splitting a skewed partition.
+    advisory_partition_size: u64,
 }
 
 impl Default for Session {
@@ -86,6 +91,8 @@ impl Default for Session {
             spill_dir: None,
             cancel: CancelToken::new(),
             budget: None,
+            skew_threshold: 256 * 1024 * 1024,
+            advisory_partition_size: 64 * 1024 * 1024,
         }
     }
 }
@@ -152,6 +159,19 @@ impl Session {
         self
     }
 
+    /// Byte floor for treating a shuffle partition as skewed. Also must exceed
+    /// five times the median partition size.
+    pub fn with_skew_threshold(mut self, bytes: u64) -> Self {
+        self.skew_threshold = bytes;
+        self
+    }
+
+    /// Target size in bytes when splitting a skewed shuffle partition.
+    pub fn with_advisory_partition_size(mut self, bytes: u64) -> Self {
+        self.advisory_partition_size = bytes.max(1);
+        self
+    }
+
     /// Register an in-memory table. All batches must share `schema`.
     pub fn register(
         &mut self,
@@ -200,6 +220,11 @@ impl Session {
     /// Run `sql` as shuffle-map and result stages on `workers` threads.
     pub fn execute_staged(&self, sql: &str) -> Result<Vec<Batch>> {
         stage::execute_staged(&self.bind_optimized(sql)?, self)
+    }
+
+    /// Run the staged plan and describe adaptive partition splits.
+    pub fn explain_analyze(&self, sql: &str) -> Result<String> {
+        stage::explain_analyze(&self.bind_optimized(sql)?, self)
     }
 
     pub(super) fn memory_pool(&self) -> Result<memory::MemoryPool> {
