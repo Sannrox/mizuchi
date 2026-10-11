@@ -12,9 +12,13 @@ repository = "https://github.com/Sannrox/mizuchi"
 publish = false
 
 [workspace.dependencies]
-arrow = { version = "60.0.0", default-features = false, features = ["csv", "ipc", "ffi"] }
+arrow = { version = "60.0.0", default-features = false, features = ["csv", "ipc", "ffi", "json"] }
+arrow-avro = { version = "60.0.0", default-features = false }
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }
 sqlparser = { version = "0.63.0" }
 object_store = { version = "0.14.1", default-features = false }
 futures = { version = "0.3.31", default-features = false, features = ["std", "executor"] }
 serde_json = { version = "1.0.152", default-features = false, features = ["std"] }
+postgres = { version = "0.19.10" }
+postgres-native-tls = { version = "0.5.2" }
+native-tls = { version = "0.2.14" }

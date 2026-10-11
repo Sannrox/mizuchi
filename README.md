@@ -46,22 +46,25 @@ Tracked as GitHub Issues and milestones:
 
 Runners open a [`Session`](crates/mizuchi/src/exec/mod.rs) from
 `SessionConfig` (memory limit, worker count, spill directory, allowed
-read/write paths), register Arrow record batches, Parquet/CSV files,
-Delta or Iceberg snapshots, or an Arrow C stream, and pull result
-batches. Cooperative cancellation is a `CancelToken`.
-`execute_sql_reported` / `write_parquet_reported` return
+read/write paths, network grant), register Arrow record batches,
+Parquet/CSV/JSON/Avro/ORC files, Delta or Iceberg snapshots, or an
+Arrow C stream, and pull result batches. Cooperative cancellation is a
+`CancelToken`. `execute_sql_reported` / `write_parquet_reported` return
 a `QueryReport` (inputs after partition prune, outputs, version, plan).
 `write_delta` / `write_iceberg` commit a new snapshot; `TimeTravel`
 reads a past version. `Session::merge_sql` runs `MERGE INTO`.
 `mizuchi::VERSION` and `Session::explain` are the strings a runner
 records. A complete walk-through is `cargo run -p mizuchi --example embed`.
-The engine never opens network connections. Runners apply OS filesystem,
-memory, and CPU limits; mizuchi honors `SessionConfig` and returns
-`Error::Io` or `Error::Memory` when a grant is denied. Optional Linux
-filesystem-limit tests use `--features sandbox` and
-`.github/workflows/sandbox.yml` (`workflow_dispatch` only).
-`Cluster` sizes in-process workers, scales them, and may run speculative
-task copies. Layouts for a runner to deploy are under `deploy/`.
+The engine opens TCP only when `SessionConfig.allow_network` is set
+(ADR 0008). Runners apply OS filesystem, memory, and CPU limits; mizuchi
+honors `SessionConfig` and returns `Error::Io` or `Error::Memory` when a
+grant is denied. Optional Linux filesystem-limit tests use
+`--features sandbox` and `.github/workflows/sandbox.yml`
+(`workflow_dispatch` only). PostgreSQL source tests use
+`--features postgres` and `.github/workflows/postgres.yml`
+(`workflow_dispatch` only). `Cluster` sizes in-process workers, scales
+them, and may run speculative task copies. Layouts for a runner to
+deploy are under `deploy/`.
 
 ## Releases
 

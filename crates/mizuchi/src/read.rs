@@ -1,18 +1,21 @@
-//! Parquet and CSV readers that yield Arrow record batches.
+//! File readers that yield Arrow record batches.
 //!
 //! Callers pass the path. Parquet projection uses the file column mask so
 //! unread columns are not decoded. Row-group skip is a hook the optimizer can
 //! fill from footer statistics. CSV schema inference is optional; without it
-//! every column is Utf8.
+//! every column is Utf8. JSON is newline-delimited with inference. Avro is
+//! Object Container Files. ORC is the uncompressed DIRECT subset in
+//! [`crate::orc`].
 
 use std::fs::File;
-use std::io::{Seek, SeekFrom};
+use std::io::{BufReader, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Arc;
 
 use arrow::array::{Array, RecordBatch};
 use arrow::csv::ReaderBuilder;
 use arrow::csv::reader::Format;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -67,6 +70,33 @@ pub struct CsvReadOptions<'a> {
     /// Scan values to pick types. When false, every column is Utf8.
     pub infer_schema: bool,
     /// Column names to keep. `None` keeps every column.
+    pub projection: Option<&'a [String]>,
+    /// Morsel size for decoded batches.
+    pub policy: BatchPolicy,
+}
+
+/// Options for [`read_json`].
+#[derive(Clone, Debug, Default)]
+pub struct JsonReadOptions<'a> {
+    /// Column names to keep. `None` keeps every inferred column.
+    pub projection: Option<&'a [String]>,
+    /// Morsel size for decoded batches.
+    pub policy: BatchPolicy,
+}
+
+/// Options for [`read_avro`].
+#[derive(Clone, Debug, Default)]
+pub struct AvroReadOptions<'a> {
+    /// Column names to keep. `None` keeps every column.
+    pub projection: Option<&'a [String]>,
+    /// Morsel size for decoded batches.
+    pub policy: BatchPolicy,
+}
+
+/// Options for [`read_orc`].
+#[derive(Clone, Debug, Default)]
+pub struct OrcReadOptions<'a> {
+    /// Column names to keep. Unread ORC columns are not decoded.
     pub projection: Option<&'a [String]>,
     /// Morsel size for decoded batches.
     pub policy: BatchPolicy,
@@ -188,6 +218,52 @@ pub fn read_csv(path: impl AsRef<Path>, opts: CsvReadOptions<'_>) -> Result<Vec<
     collect_csv(reader, &opts.policy)
 }
 
+/// Read newline-delimited JSON. Schema is inferred from the file; unread
+/// projected columns are omitted from the decoder schema.
+pub fn read_json(path: impl AsRef<Path>, opts: JsonReadOptions<'_>) -> Result<Vec<Batch>> {
+    let path = path.as_ref();
+    let file = File::open(path).map_err(|e| io_err(path, e))?;
+    let mut reader = BufReader::new(file);
+    let (inferred, _) = arrow::json::reader::infer_json_schema(&mut reader, None)
+        .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+    let schema = project_schema(Arc::new(inferred), opts.projection)?;
+    let schema = from_arrow_schema(schema)?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| io_err(path, e))?;
+    let batch_size = opts.policy.max_rows().unwrap_or(DEFAULT_MAX_ROWS);
+    let json_reader = arrow::json::ReaderBuilder::new(schema)
+        .with_batch_size(batch_size)
+        .build(reader)
+        .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+    collect_reader(json_reader, &opts.policy)
+}
+
+/// Read an Avro Object Container File. Schema comes from the file header.
+pub fn read_avro(path: impl AsRef<Path>, opts: AvroReadOptions<'_>) -> Result<Vec<Batch>> {
+    let path = path.as_ref();
+    let file = File::open(path).map_err(|e| io_err(path, e))?;
+    let header_reader = arrow_avro::reader::ReaderBuilder::new()
+        .build(BufReader::new(file))
+        .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+    let indices = projection_indices(header_reader.schema().as_ref(), opts.projection)?;
+    let file = File::open(path).map_err(|e| io_err(path, e))?;
+    let batch_size = opts.policy.max_rows().unwrap_or(DEFAULT_MAX_ROWS);
+    let mut builder = arrow_avro::reader::ReaderBuilder::new().with_batch_size(batch_size);
+    if let Some(idx) = indices {
+        builder = builder.with_projection(idx);
+    }
+    let reader = builder
+        .build(BufReader::new(file))
+        .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+    collect_reader(reader, &opts.policy)
+}
+
+/// Read an uncompressed ORC file. Projection skips unread columns.
+pub fn read_orc(path: impl AsRef<Path>, opts: OrcReadOptions<'_>) -> Result<Vec<Batch>> {
+    crate::orc::read_file(path, opts.projection, opts.policy)
+}
+
 fn projection_mask(
     parquet_schema: &parquet::schema::types::SchemaDescriptor,
     arrow_schema: &Schema,
@@ -207,6 +283,13 @@ fn csv_projection_indices(
     schema: &Schema,
     projection: Option<&[String]>,
 ) -> Result<Option<Vec<usize>>> {
+    projection_indices(schema, projection)
+}
+
+fn projection_indices(
+    schema: &Schema,
+    projection: Option<&[String]>,
+) -> Result<Option<Vec<usize>>> {
     let Some(names) = projection else {
         return Ok(None);
     };
@@ -218,6 +301,22 @@ fn csv_projection_indices(
         indices.push(idx);
     }
     Ok(Some(indices))
+}
+
+fn project_schema(schema: SchemaRef, projection: Option<&[String]>) -> Result<SchemaRef> {
+    let Some(names) = projection else {
+        return Ok(schema);
+    };
+    let fields: Vec<Field> = names
+        .iter()
+        .map(|name| {
+            let idx = schema
+                .index_of(name)
+                .map_err(|_| Error::Plan(format!("projection column not in file: {name}")))?;
+            Ok(schema.field(idx).clone())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(Schema::new(fields)))
 }
 
 fn collect_reader<I>(reader: I, policy: &BatchPolicy) -> Result<Vec<Batch>>

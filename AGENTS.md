@@ -30,8 +30,8 @@ this file is canonical.
   [kako](https://github.com/Sannrox/kako) decides what runs, enforces the
   sandbox ([kekkai](https://github.com/Sannrox/kekkai)) and writes receipts.
   mizuchi exposes resource controls (memory limits, spill directory, threads,
-  cancellation) and plan introspection; it never opens network connections or
-  reads paths it was not given.
+  cancellation) and plan introspection; it opens network connections only
+  when the embedder grants them and reads only paths it was given.
 
 A change that needs a new upstream capability lands upstream first. Record
 cross-repository predecessors in the Issue's `## GitHub dependencies` section
@@ -289,8 +289,8 @@ immediately after the correction.
 ## Security & Configuration Tips
 
 Never commit secrets, tokens, credentials, datasets, spill files, logs, or
-local state. The engine never opens network connections on its own and reads
-only the inputs it is given. Report issues where crafted SQL or input reads
+local state. The engine opens network connections only when
+`SessionConfig.allow_network` is set and reads only the inputs it is given. Report issues where crafted SQL or input reads
 data it should not, escapes memory limits, or crashes the host privately
 (GitHub private vulnerability reporting or the maintainer), never in a public
 Issue. Never put hostnames, FQDNs, IP addresses, home directories, absolute

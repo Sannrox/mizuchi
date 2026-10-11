@@ -5,10 +5,11 @@
 //! SQL / DataFrame -> logical plan -> optimizer -> physical plan -> execution.
 //!
 //! Embedding runners pass [`SessionConfig`] (memory, threads, spill, allowed
-//! paths), register Arrow batches, files, or an Arrow C stream, and pull
-//! results as batches. [`Cluster`] sizes in-process workers with CPU, memory,
-//! and spill grants. The engine never opens network connections; denied
-//! paths and memory caps surface as [`Error::Io`] and [`Error::Memory`].
+//! paths, network grant), register Arrow batches, files, or an Arrow C stream,
+//! and pull results as batches. [`Cluster`] sizes in-process workers with CPU,
+//! memory, and spill grants. The engine opens TCP only when
+//! [`SessionConfig::allow_network`] is set; denied paths, denied network, and
+//! memory caps surface as [`Error::Io`] and [`Error::Memory`].
 //! [`VERSION`] and [`Session::explain`] are the strings a runner records.
 //! See `crates/mizuchi/examples/embed.rs`.
 
@@ -18,7 +19,9 @@ pub mod exec;
 pub mod expr;
 pub mod lake;
 pub mod opt;
+mod orc;
 pub mod plan;
+mod postgres;
 pub mod read;
 pub mod schema;
 pub mod sql;
@@ -44,16 +47,18 @@ pub use plan::{
     Catalog, ColumnStats, JoinType, LogicalPlan, MergeActionPlan, MergeClausePlan, MergeMatch,
     MergePlan, TableStats, bind_merge, merge_target_table, plan_sql, table_stats_from_batches,
 };
+pub use postgres::{PostgresReadOptions, PostgresSource, postgres_scan_sql, read_postgres};
 pub use read::{
-    ColumnRange, CsvReadOptions, ParquetReadOptions, RowGroupStats, read_csv, read_parquet,
+    AvroReadOptions, ColumnRange, CsvReadOptions, JsonReadOptions, OrcReadOptions,
+    ParquetReadOptions, RowGroupStats, read_avro, read_csv, read_json, read_orc, read_parquet,
     row_group_cannot_match,
 };
 pub use schema::{from_arrow_schema, is_supported_data_type, to_arrow_schema};
 pub use sql::parse_sql;
 pub use store::{read_parquet_store, read_parquet_store_reported, write_parquet_store};
 pub use write::{
-    ParquetWriteOptions, WriteMode, WriteStats, write_parquet, write_parquet_cancel,
-    write_parquet_stats,
+    ParquetWriteOptions, WriteMode, WriteStats, write_avro, write_json, write_orc, write_parquet,
+    write_parquet_cancel, write_parquet_stats,
 };
 
 pub use arrow::array::{ArrayRef, RecordBatch};
