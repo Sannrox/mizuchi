@@ -38,6 +38,7 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path python/Cargo.toml -- --check
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 
   clippy:
     name: Clippy
@@ -82,3 +83,21 @@ jobs:
           python -m pip install dist/*.whl
       - name: Run examples
         run: python python/examples/lazy_df.py
+
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+      - name: Run fuzz targets
+        run: |
+          cargo +nightly fuzz run parse -- -max_total_time=15 -len_control=0
+          cargo +nightly fuzz run plan -- -max_total_time=15 -len_control=0
+          cargo +nightly fuzz run execute -- -max_total_time=15 -len_control=0
+          cargo +nightly fuzz run grammar -- -max_total_time=20 -len_control=0

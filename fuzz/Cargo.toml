@@ -1,0 +1,45 @@
+[package]
+name = "mizuchi-fuzz"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Independent workspace so libFuzzer stays out of the stable Cargo workspace.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arrow = { version = "60.0.0", default-features = false }
+libfuzzer-sys = "0.4"
+mizuchi = { path = "../crates/mizuchi" }
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "plan"
+path = "fuzz_targets/plan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "execute"
+path = "fuzz_targets/execute.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grammar"
+path = "fuzz_targets/grammar.rs"
+test = false
+doc = false
+bench = false
