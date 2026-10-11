@@ -25,3 +25,4 @@ All notable changes to this project are documented here.
 - Per-query memory pool with reservations. Sort, join, and aggregate spill Arrow IPC runs to a caller-provided directory and fail closed when the limit cannot be honoured.
 - Morsel work queue across a bounded thread pool for scan/filter/project and combinable aggregates, plus cooperative cancellation checked between morsels.
 - SQLLogicTest runner and corpus under `tests/slt`. CI runs the adopted subset; known gaps are listed in `gaps.slt` behind `skipif mizuchi`.
+- TPC-H and TPC-DS style decision-support harness: a tiny in-memory generator, a fixed query set, and JSON with per-query time and memory. Larger scales stay out of the default `cargo test` run.
