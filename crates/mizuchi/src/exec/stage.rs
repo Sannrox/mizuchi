@@ -8,13 +8,18 @@
 //! round-robin to a bounded worker pool.
 
 use std::collections::HashMap;
+use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use arrow::array::BooleanArray;
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::SchemaRef;
+use arrow::ipc::reader::FileReader;
+use arrow::ipc::writer::FileWriter;
 
 use super::join::{self, JoinSpec};
 use super::key;
@@ -541,20 +546,63 @@ fn join_schema(left: &SchemaRef, right: &SchemaRef) -> arrow::datatypes::Schema 
     arrow::datatypes::Schema::new(fields)
 }
 
+static JOB_SEQ: AtomicU64 = AtomicU64::new(1);
+
 struct ShuffleStore {
-    inner: Mutex<HashMap<(usize, usize), Vec<Batch>>>,
+    memory: Mutex<HashMap<(usize, usize), Vec<Batch>>>,
+    dir: Option<PathBuf>,
+}
+
+struct ShuffleJob {
+    store: Arc<ShuffleStore>,
+    dir: Option<PathBuf>,
+}
+
+impl Drop for ShuffleJob {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.dir {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
 }
 
 impl ShuffleStore {
-    fn new() -> Self {
+    fn memory() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            memory: Mutex::new(HashMap::new()),
+            dir: None,
         }
     }
 
-    fn write(&self, shuffle_id: usize, reduce: usize, mut batches: Vec<Batch>) -> Result<()> {
+    fn files(dir: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&dir).map_err(|e| Error::Io(e.to_string()))?;
+        Ok(Self {
+            memory: Mutex::new(HashMap::new()),
+            dir: Some(dir),
+        })
+    }
+
+    fn block_path(&self, shuffle_id: usize, map: usize, reduce: usize) -> Option<PathBuf> {
+        self.dir.as_ref().map(|dir| {
+            dir.join(format!(
+                "shuffle-{shuffle_id}-map-{map}-reduce-{reduce}.arrow"
+            ))
+        })
+    }
+
+    fn write(
+        &self,
+        shuffle_id: usize,
+        map: usize,
+        reduce: usize,
+        schema: SchemaRef,
+        mut batches: Vec<Batch>,
+    ) -> Result<()> {
+        if let Some(path) = self.block_path(shuffle_id, map, reduce) {
+            return write_ipc(&path, schema, &batches);
+        }
         let mut g = self
-            .inner
+            .memory
             .lock()
             .map_err(|_| Error::Eval("shuffle lock poisoned".into()))?;
         g.entry((shuffle_id, reduce))
@@ -564,8 +612,11 @@ impl ShuffleStore {
     }
 
     fn read(&self, shuffle_id: usize, reduce: usize, schema: SchemaRef) -> Result<Vec<Batch>> {
+        if let Some(dir) = &self.dir {
+            return read_ipc_reduce(dir, shuffle_id, reduce, schema);
+        }
         let g = self
-            .inner
+            .memory
             .lock()
             .map_err(|_| Error::Eval("shuffle lock poisoned".into()))?;
         match g.get(&(shuffle_id, reduce)) {
@@ -573,6 +624,61 @@ impl ShuffleStore {
             None => Ok(vec![Batch::empty(schema)?]),
         }
     }
+}
+
+fn write_ipc(path: &Path, schema: SchemaRef, batches: &[Batch]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
+    }
+    let file = File::create(path).map_err(|e| Error::Io(e.to_string()))?;
+    let mut writer =
+        FileWriter::try_new(file, schema.as_ref()).map_err(|e| Error::Io(e.to_string()))?;
+    for batch in batches {
+        if batch.num_rows() > 0 {
+            writer
+                .write(batch.as_arrow())
+                .map_err(|e| Error::Io(e.to_string()))?;
+        }
+    }
+    writer.finish().map_err(|e| Error::Io(e.to_string()))?;
+    Ok(())
+}
+
+fn read_ipc_reduce(
+    dir: &Path,
+    shuffle_id: usize,
+    reduce: usize,
+    schema: SchemaRef,
+) -> Result<Vec<Batch>> {
+    let prefix = format!("shuffle-{shuffle_id}-map-");
+    let suffix = format!("-reduce-{reduce}.arrow");
+    let mut paths = Vec::new();
+    if dir.exists() {
+        for ent in fs::read_dir(dir).map_err(|e| Error::Io(e.to_string()))? {
+            let ent = ent.map_err(|e| Error::Io(e.to_string()))?;
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(&suffix) {
+                paths.push(ent.path());
+            }
+        }
+    }
+    paths.sort();
+    let mut out = Vec::new();
+    for path in paths {
+        let file = File::open(&path).map_err(|e| Error::Io(e.to_string()))?;
+        let reader = FileReader::try_new(file, None).map_err(|e| Error::Io(e.to_string()))?;
+        for batch in reader {
+            let batch = batch.map_err(|e| Error::Io(e.to_string()))?;
+            if batch.num_rows() > 0 {
+                out.push(Batch::from_arrow(batch)?);
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(Batch::empty(schema)?);
+    }
+    Ok(out)
 }
 
 struct TaskCtx {
@@ -585,10 +691,23 @@ struct TaskCtx {
 pub(super) fn execute_staged(logical: &LogicalPlan, session: &Session) -> Result<Vec<Batch>> {
     let workers = session.workers.max(1);
     let stages = plan_stages(logical, workers);
-    let shuffle = Arc::new(ShuffleStore::new());
+    let job = match &session.shuffle_dir {
+        Some(root) => {
+            let id = JOB_SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = root.join(format!("job-{id}"));
+            ShuffleJob {
+                store: Arc::new(ShuffleStore::files(dir.clone())?),
+                dir: Some(dir),
+            }
+        }
+        None => ShuffleJob {
+            store: Arc::new(ShuffleStore::memory()),
+            dir: None,
+        },
+    };
     let mut result = Vec::new();
     for stage in &stages {
-        let out = run_stage(stage, session, &shuffle, workers)?;
+        let out = run_stage(stage, session, &job.store, workers)?;
         if stage.kind == StageKind::Result {
             result = out;
         }
@@ -633,8 +752,9 @@ fn run_stage(
                 let batches = collect(execute_physical(&plan, &ctx)?)?;
                 if let Some(write) = &write {
                     let parts = partition_batches(&batches, &write.keys, write.partitions)?;
+                    let schema = plan.schema().clone();
                     for (r, part) in parts.into_iter().enumerate() {
-                        shuffle.write(write.shuffle_id, r, part)?;
+                        shuffle.write(write.shuffle_id, p, r, schema.clone(), part)?;
                     }
                 } else {
                     local.extend(batches);
@@ -957,5 +1077,58 @@ mod tests {
             sorted_pairs(&pull, "a", "a"),
             sorted_pairs(&staged, "a", "a")
         );
+    }
+
+    #[test]
+    fn ipc_shuffle_dir_matches_pull_and_cleans_up() {
+        let root = std::env::temp_dir().join(format!(
+            "mizuchi-shuffle-{}-{}",
+            std::process::id(),
+            JOB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let s = join_session()
+            .with_workers(2)
+            .unwrap()
+            .with_shuffle_dir(root.clone());
+        let sql = "SELECT t.a, u.id FROM t JOIN u ON t.a = u.id";
+        let pull = s.execute_sql(sql).unwrap();
+        let staged = s.execute_staged(sql).unwrap();
+        assert_eq!(
+            sorted_pairs(&pull, "a", "id"),
+            sorted_pairs(&staged, "a", "id")
+        );
+        let leftover: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert!(leftover.is_empty(), "{leftover:?}");
+    }
+
+    #[test]
+    fn shuffle_files_are_arrow_ipc() {
+        let root = std::env::temp_dir().join(format!(
+            "mizuchi-shuffle-ipc-{}-{}",
+            std::process::id(),
+            JOB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let store = ShuffleStore::files(root.clone()).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(1), Some(2)]))],
+        )
+        .unwrap();
+        store.write(0, 0, 1, schema.clone(), vec![batch]).unwrap();
+        let path = root.join("shuffle-0-map-0-reduce-1.arrow");
+        let file = File::open(&path).unwrap();
+        let reader = FileReader::try_new(file, None).unwrap();
+        let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(rows, 2);
+        let got = store.read(0, 1, schema).unwrap();
+        assert_eq!(got.iter().map(Batch::num_rows).sum::<usize>(), 2);
+        let _ = fs::remove_dir_all(&root);
     }
 }

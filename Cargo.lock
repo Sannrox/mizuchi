@@ -55,6 +55,7 @@ dependencies = [
  "arrow-cast",
  "arrow-csv",
  "arrow-data",
+ "arrow-ipc",
  "arrow-ord",
  "arrow-row",
  "arrow-schema",
