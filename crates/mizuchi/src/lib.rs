@@ -6,7 +6,8 @@
 //!
 //! Embedding runners pass [`SessionConfig`] (memory, threads, spill, allowed
 //! paths), register Arrow batches, files, or an Arrow C stream, and pull
-//! results as batches. The engine never opens network connections; denied
+//! results as batches. [`Cluster`] sizes in-process workers with CPU, memory,
+//! and spill grants. The engine never opens network connections; denied
 //! paths and memory caps surface as [`Error::Io`] and [`Error::Memory`].
 //! [`VERSION`] and [`Session::explain`] are the strings a runner records.
 //! See `crates/mizuchi/examples/embed.rs`.
@@ -26,8 +27,8 @@ pub mod write;
 pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
 pub use error::{Error, Result};
 pub use exec::{
-    CancelToken, Engine, InputScan, MicroBatchAgg, OperatorMetrics, OutputWrite, QueryReport,
-    QueryResult, Session, SessionConfig,
+    CancelToken, Cluster, ClusterConfig, Engine, InputScan, MicroBatchAgg, OperatorMetrics,
+    OutputWrite, QueryReport, QueryResult, Session, SessionConfig, WorkerResources,
 };
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use object_store::ObjectStore;

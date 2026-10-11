@@ -57,6 +57,8 @@ memory, and CPU limits; mizuchi honors `SessionConfig` and returns
 `Error::Io` or `Error::Memory` when a grant is denied. Optional Linux
 filesystem-limit tests use `--features sandbox` and
 `.github/workflows/sandbox.yml` (`workflow_dispatch` only).
+`Cluster` sizes in-process workers, scales them, and may run speculative
+task copies. Layouts for a runner to deploy are under `deploy/`.
 
 ## Releases
 

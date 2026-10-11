@@ -4,6 +4,7 @@
 
 mod agg;
 mod cache;
+mod cluster;
 mod config;
 mod engine;
 mod incremental;
@@ -34,6 +35,7 @@ use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::plan::{Catalog, LogicalPlan, NamedExpr, normalize_name};
 
+pub use cluster::{Cluster, ClusterConfig, WorkerResources};
 pub use config::SessionConfig;
 pub use engine::Engine;
 pub use incremental::MicroBatchAgg;
@@ -97,6 +99,8 @@ pub struct Session {
     lowering: op::LoweringArc,
     allowed_read_paths: Vec<PathBuf>,
     allowed_write_paths: Vec<PathBuf>,
+    /// When true, stage tasks may run a speculative copy; first commit wins.
+    speculate: bool,
 }
 
 impl Default for Session {
@@ -116,6 +120,7 @@ impl Default for Session {
             lowering: op::LoweringArc::default(),
             allowed_read_paths: Vec::new(),
             allowed_write_paths: Vec::new(),
+            speculate: false,
         }
     }
 }
@@ -139,6 +144,7 @@ impl Clone for Session {
             lowering: self.lowering.clone(),
             allowed_read_paths: self.allowed_read_paths.clone(),
             allowed_write_paths: self.allowed_write_paths.clone(),
+            speculate: self.speculate,
         }
     }
 }
@@ -206,6 +212,17 @@ impl Session {
         }
         self.workers = n;
         Ok(self)
+    }
+
+    /// Live worker thread count for this session.
+    pub fn workers(&self) -> usize {
+        self.workers
+    }
+
+    /// Run a second copy of each stage task; the first commit wins.
+    pub fn with_speculate(mut self, on: bool) -> Self {
+        self.speculate = on;
+        self
     }
 
     /// Cooperative cancellation token checked between morsels.

@@ -12,7 +12,7 @@
 //! times the median size and a byte threshold are split by grouping map
 //! outputs; the matching other-side partition is replicated for each split.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::panic::{self, AssertUnwindSafe};
@@ -571,6 +571,10 @@ static INJECT_TASK_FAILURES: AtomicU64 = AtomicU64::new(0);
 static INJECT_RESULT_ONLY: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static MAP_COMMITS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static INJECT_STRAGGLER: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static SPECULATIVE_DISCARDS: AtomicU64 = AtomicU64::new(0);
 
 struct ShuffleStore {
     /// In-memory blocks keyed by `(shuffle_id, map_partition, reduce_partition)`.
@@ -588,6 +592,13 @@ struct TaskSpec {
     output_map: usize,
     /// shuffle_id -> map ids to read. Empty means every map.
     maps: HashMap<usize, Vec<usize>>,
+}
+
+#[derive(Clone)]
+struct PendingTask {
+    spec: TaskSpec,
+    attempts: u32,
+    speculative: bool,
 }
 
 struct ShuffleJob {
@@ -1092,9 +1103,24 @@ fn run_stage(
     tasks: Vec<TaskSpec>,
 ) -> Result<Vec<Batch>> {
     let n = stage.partitions.max(1);
-    let workers = workers.min(tasks.len().max(1)).max(1);
-    let pending: Arc<Mutex<Vec<(TaskSpec, u32)>>> =
-        Arc::new(Mutex::new(tasks.into_iter().map(|t| (t, 0u32)).collect()));
+    let mut queued = Vec::new();
+    for t in tasks {
+        if session.speculate {
+            queued.push(PendingTask {
+                spec: t.clone(),
+                attempts: 0,
+                speculative: true,
+            });
+        }
+        queued.push(PendingTask {
+            spec: t,
+            attempts: 0,
+            speculative: false,
+        });
+    }
+    let workers = workers.min(queued.len().max(1)).max(1);
+    let pending: Arc<Mutex<Vec<PendingTask>>> = Arc::new(Mutex::new(queued));
+    let committed: Arc<Mutex<HashSet<(usize, usize)>>> = Arc::new(Mutex::new(HashSet::new()));
     let abort: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
     let mut out = Vec::new();
     loop {
@@ -1125,6 +1151,7 @@ fn run_stage(
             let write = stage.write.clone();
             let pool = pool.clone();
             let kind = stage.kind;
+            let committed = committed.clone();
             handles.push(thread::spawn(move || -> Result<Vec<Batch>> {
                 let mut local = Vec::new();
                 loop {
@@ -1142,18 +1169,21 @@ fn run_stage(
                             .map_err(|_| Error::Eval("task queue lock poisoned".into()))?;
                         g.pop()
                     };
-                    let Some((spec, attempts)) = job else {
+                    let Some(job) = job else {
                         break;
                     };
                     {
                         let mut g = in_flight
                             .lock()
                             .map_err(|_| Error::Eval("in-flight lock poisoned".into()))?;
-                        g[i] = Some((spec.clone(), attempts));
+                        g[i] = Some(job.clone());
                     }
                     let ran = panic::catch_unwind(AssertUnwindSafe(|| {
+                        if !job.speculative {
+                            inject_straggler();
+                        }
                         inject_failure(kind);
-                        run_one_task(&plan, &write, &session, &spec, n, &shuffle, &pool)
+                        run_one_task(&plan, &write, &session, &job.spec, n, &shuffle, &pool)
                     }));
                     {
                         let mut g = in_flight
@@ -1162,18 +1192,25 @@ fn run_stage(
                         g[i] = None;
                     }
                     match ran {
-                        Ok(Ok(batches)) => local.extend(batches),
+                        Ok(Ok(batches)) => {
+                            let mut g = committed
+                                .lock()
+                                .map_err(|_| Error::Eval("commit lock poisoned".into()))?;
+                            if g.insert((job.spec.partition, job.spec.output_map)) {
+                                local.extend(batches);
+                            } else {
+                                #[cfg(test)]
+                                SPECULATIVE_DISCARDS.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                         Ok(Err(e)) => {
-                            requeue_or_abort(
-                                &pending, &abort, spec, attempts, e, &write, &shuffle,
-                            )?;
+                            requeue_or_abort(&pending, &abort, job, e, &write, &shuffle)?;
                         }
                         Err(_) => {
                             requeue_or_abort(
                                 &pending,
                                 &abort,
-                                spec,
-                                attempts,
+                                job,
                                 Error::Eval("worker panicked".into()),
                                 &write,
                                 &shuffle,
@@ -1202,12 +1239,11 @@ fn run_stage(
                             .map_err(|_| Error::Eval("in-flight lock poisoned".into()))?;
                         g[i].take()
                     };
-                    if let Some((spec, attempts)) = job {
+                    if let Some(job) = job {
                         requeue_or_abort(
                             &pending,
                             &abort,
-                            spec,
-                            attempts,
+                            job,
                             Error::Eval("worker panicked".into()),
                             &stage.write,
                             shuffle,
@@ -1225,6 +1261,15 @@ fn run_stage(
         return Err(err);
     }
     Ok(out)
+}
+
+fn inject_straggler() {
+    #[cfg(test)]
+    {
+        if INJECT_STRAGGLER.swap(false, Ordering::SeqCst) {
+            thread::sleep(std::time::Duration::from_millis(150));
+        }
+    }
 }
 
 fn inject_failure(_kind: StageKind) {
@@ -1284,10 +1329,9 @@ fn run_one_task(
 }
 
 fn requeue_or_abort(
-    pending: &Mutex<Vec<(TaskSpec, u32)>>,
+    pending: &Mutex<Vec<PendingTask>>,
     abort: &Mutex<Option<Error>>,
-    spec: TaskSpec,
-    attempts: u32,
+    job: PendingTask,
     cause: Error,
     write: &Option<ShuffleWrite>,
     shuffle: &ShuffleStore,
@@ -1302,9 +1346,9 @@ fn requeue_or_abort(
         return Ok(());
     }
     if let Some(write) = write {
-        shuffle.abort_map(write.shuffle_id, spec.output_map, write.partitions)?;
+        shuffle.abort_map(write.shuffle_id, job.spec.output_map, write.partitions)?;
     }
-    let next = attempts.saturating_add(1);
+    let next = job.attempts.saturating_add(1);
     if next >= MAX_TASK_ATTEMPTS {
         let mut g = abort
             .lock()
@@ -1312,7 +1356,7 @@ fn requeue_or_abort(
         if g.is_none() {
             *g = Some(Error::Eval(format!(
                 "task partition {} failed after {MAX_TASK_ATTEMPTS} attempts: {cause}",
-                spec.partition
+                job.spec.partition
             )));
         }
         return Ok(());
@@ -1320,7 +1364,11 @@ fn requeue_or_abort(
     pending
         .lock()
         .map_err(|_| Error::Eval("task queue lock poisoned".into()))?
-        .push((spec, next));
+        .push(PendingTask {
+            spec: job.spec,
+            attempts: next,
+            speculative: job.speculative,
+        });
     Ok(())
 }
 
@@ -1702,6 +1750,8 @@ mod tests {
         INJECT_TASK_FAILURES.store(0, Ordering::SeqCst);
         INJECT_RESULT_ONLY.store(false, Ordering::SeqCst);
         MAP_COMMITS.store(0, Ordering::SeqCst);
+        INJECT_STRAGGLER.store(false, Ordering::SeqCst);
+        SPECULATIVE_DISCARDS.store(0, Ordering::SeqCst);
     }
 
     #[test]
@@ -1716,6 +1766,26 @@ mod tests {
         assert_eq!(
             sorted_pairs(&pull, "a", "id"),
             sorted_pairs(&staged, "a", "id")
+        );
+        reset_inject();
+    }
+
+    #[test]
+    fn speculative_straggler_keeps_one_commit() {
+        let _g = lock_stage_tests();
+        reset_inject();
+        INJECT_STRAGGLER.store(true, Ordering::SeqCst);
+        let s = join_session().with_workers(2).unwrap().with_speculate(true);
+        let sql = "SELECT t.a, u.id FROM t JOIN u ON t.a = u.id";
+        let pull = s.execute_sql(sql).unwrap();
+        let staged = s.execute_staged(sql).unwrap();
+        assert_eq!(
+            sorted_pairs(&pull, "a", "id"),
+            sorted_pairs(&staged, "a", "id")
+        );
+        assert!(
+            SPECULATIVE_DISCARDS.load(Ordering::SeqCst) >= 1,
+            "expected a discarded speculative copy"
         );
         reset_inject();
     }
