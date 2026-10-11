@@ -18,8 +18,9 @@ distributed later.
   thread limits that an embedding sandbox can rely on.
 - **Explainable.** Plans and executed operators are inspectable, so a runner can
   record what ran (lineage).
-- **Measured.** Correctness via sqllogictest and benchmark comparisons against
-  DuckDB and DataFusion.
+- **Measured.** Correctness via sqllogictest
+  ([coverage](docs/sql-coverage.md)) and benchmark comparisons against DuckDB
+  and DataFusion.
 
 ## Architecture (planned)
 

@@ -1,0 +1,46 @@
+# Set operators. UNION DISTINCT and UNION ALL bind, then fail at physical union.
+# INTERSECT and EXCEPT fail in the binder.
+
+skipif mizuchi
+query I
+SELECT 1 UNION SELECT 2
+----
+1
+2
+
+skipif mizuchi
+query I
+SELECT 1 UNION ALL SELECT 1
+----
+1
+1
+
+skipif mizuchi
+query I
+SELECT 1 UNION DISTINCT SELECT 1
+----
+1
+
+skipif mizuchi
+query I
+SELECT 1 INTERSECT SELECT 1
+----
+1
+
+skipif mizuchi
+query I
+SELECT 1 INTERSECT ALL SELECT 1
+----
+1
+
+skipif mizuchi
+query I
+SELECT 1 EXCEPT SELECT 2
+----
+1
+
+skipif mizuchi
+query I
+SELECT 1 EXCEPT ALL SELECT 2
+----
+1
