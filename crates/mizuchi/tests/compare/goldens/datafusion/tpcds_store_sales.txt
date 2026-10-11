@@ -1,0 +1,3 @@
+Books|147
+Home|21
+Electronics|5
