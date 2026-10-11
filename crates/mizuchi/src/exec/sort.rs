@@ -9,6 +9,7 @@ use arrow::array::{Array, RecordBatch};
 use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::SchemaRef;
 
+use super::CancelToken;
 use super::Exec;
 use super::memory::{self, MemoryPool, batch_bytes};
 use crate::batch::{Batch, BatchPolicy};
@@ -16,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::plan::SortExpr;
 
 /// Sort `child` by `order`, then apply `skip` / `fetch` (top-k when `fetch` is set).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn ordered(
     mut child: Exec,
     schema: SchemaRef,
@@ -24,17 +26,18 @@ pub(super) fn ordered(
     fetch: Option<u64>,
     policy: &BatchPolicy,
     pool: &MemoryPool,
+    cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
     if matches!(fetch, Some(0)) {
         return Ok(Vec::new());
     }
     if !pool.has_limit() {
-        return sort_concat(&mut child, schema, order, skip, fetch, policy);
+        return sort_concat(&mut child, schema, order, skip, fetch, policy, cancel);
     }
     let mut run: Vec<Batch> = Vec::new();
     let mut held: Vec<memory::Reservation<'_>> = Vec::new();
     let mut spills = Vec::new();
-    while let Some(batch) = child.next_batch()? {
+    while let Some(batch) = child.next_batch(cancel)? {
         if batch.num_rows() == 0 {
             continue;
         }
@@ -53,7 +56,7 @@ pub(super) fn ordered(
                         "a single sort batch exceeds the memory limit".into(),
                     ));
                 }
-                spills.push(spill_sorted_run(&run, schema.clone(), order, pool)?);
+                spills.push(spill_sorted_run(&run, schema.clone(), order, pool, cancel)?);
                 held.clear();
                 run.clear();
                 let r = pool.try_reserve(sz).map_err(|_| {
@@ -67,15 +70,15 @@ pub(super) fn ordered(
     if spills.is_empty() {
         drop(held);
         let mut concat = batches_to_exec(run, schema.clone());
-        return sort_concat(&mut concat, schema, order, skip, fetch, policy);
+        return sort_concat(&mut concat, schema, order, skip, fetch, policy, cancel);
     }
     if !run.is_empty() {
-        spills.push(spill_sorted_run(&run, schema.clone(), order, pool)?);
+        spills.push(spill_sorted_run(&run, schema.clone(), order, pool, cancel)?);
         held.clear();
         run.clear();
     }
-    let merged = merge_spilled(spills, schema.clone(), order, pool)?;
-    apply_skip_fetch(merged, schema, skip, fetch, policy)
+    let merged = merge_spilled(spills, schema.clone(), order, pool, cancel)?;
+    apply_skip_fetch(merged, schema, skip, fetch, policy, cancel)
 }
 
 fn sort_concat(
@@ -85,8 +88,9 @@ fn sort_concat(
     skip: u64,
     fetch: Option<u64>,
     policy: &BatchPolicy,
+    cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
-    let batch = concat_exec(child, schema.clone())?;
+    let batch = concat_exec(child, schema.clone(), cancel)?;
     sort_batch(&batch, order, skip, fetch, policy)
 }
 
@@ -128,6 +132,7 @@ fn spill_sorted_run(
     schema: SchemaRef,
     order: &[SortExpr],
     pool: &MemoryPool,
+    cancel: &CancelToken,
 ) -> Result<std::path::PathBuf> {
     let mut child = batches_to_exec(run.to_vec(), schema.clone());
     let sorted = sort_concat(
@@ -137,6 +142,7 @@ fn spill_sorted_run(
         0,
         None,
         &BatchPolicy::unlimited(),
+        cancel,
     )?;
     let path = pool.spill_path()?;
     memory::write_spill(&path, schema, &sorted)?;
@@ -152,13 +158,14 @@ fn merge_spilled(
     schema: SchemaRef,
     order: &[SortExpr],
     pool: &MemoryPool,
+    cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
     while runs.len() > 1 {
         let a = runs.remove(0);
         let b = runs.remove(0);
         let left = memory::read_spill(&a, schema.clone())?;
         let right = memory::read_spill(&b, schema.clone())?;
-        let merged = merge_sorted_batches(left, right, schema.clone(), order)?;
+        let merged = merge_sorted_batches(left, right, schema.clone(), order, cancel)?;
         let path = pool.spill_path()?;
         memory::write_spill(&path, schema.clone(), &merged)?;
         runs.push(path);
@@ -174,6 +181,7 @@ fn merge_sorted_batches(
     right: Vec<Batch>,
     schema: SchemaRef,
     order: &[SortExpr],
+    cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
     let mut child = batches_to_exec(left.into_iter().chain(right).collect(), schema.clone());
     sort_concat(
@@ -183,6 +191,7 @@ fn merge_sorted_batches(
         0,
         None,
         &BatchPolicy::unlimited(),
+        cancel,
     )
 }
 
@@ -192,9 +201,10 @@ fn apply_skip_fetch(
     skip: u64,
     fetch: Option<u64>,
     policy: &BatchPolicy,
+    cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
     let mut child = batches_to_exec(batches, schema.clone());
-    let batch = concat_exec(&mut child, schema)?;
+    let batch = concat_exec(&mut child, schema, cancel)?;
     let n = batch.num_rows();
     let skip = clamp_rows(skip, n);
     if skip >= n || n == 0 {
@@ -211,9 +221,9 @@ fn apply_skip_fetch(
         .collect())
 }
 
-fn concat_exec(exec: &mut Exec, schema: SchemaRef) -> Result<Batch> {
+fn concat_exec(exec: &mut Exec, schema: SchemaRef, cancel: &CancelToken) -> Result<Batch> {
     let mut batches = Vec::new();
-    while let Some(batch) = exec.next_batch()? {
+    while let Some(batch) = exec.next_batch(cancel)? {
         if batch.num_rows() > 0 {
             batches.push(batch);
         }

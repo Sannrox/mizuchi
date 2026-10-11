@@ -741,6 +741,7 @@ fn run_stage(
         handles.push(thread::spawn(move || -> Result<Vec<Batch>> {
             let mut local = Vec::new();
             loop {
+                session.cancel.check()?;
                 let p = {
                     let mut g = jobs
                         .lock()
@@ -757,7 +758,7 @@ fn run_stage(
                     shuffle: shuffle.clone(),
                     pool: pool.clone(),
                 };
-                let batches = collect(execute_physical(&plan, &ctx)?)?;
+                let batches = collect(execute_physical(&plan, &ctx)?, &session.cancel)?;
                 if let Some(write) = &write {
                     let parts = partition_batches(&batches, &write.keys, write.partitions)?;
                     let schema = plan.schema().clone();
@@ -801,7 +802,10 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
                 filters: filters.clone(),
                 stats: None,
             };
-            let batches = collect(physical(&logical, &ctx.session, ctx.pool.as_ref())?)?;
+            let batches = collect(
+                physical(&logical, &ctx.session, ctx.pool.as_ref())?,
+                &ctx.session.cancel,
+            )?;
             Ok(Exec::Scan {
                 batches: slice_partition(
                     batches,
@@ -847,6 +851,7 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
                 schema.clone(),
                 &ctx.session.policy,
                 ctx.pool.as_ref(),
+                &ctx.session.cancel,
             )?;
             Ok(Exec::Scan { batches, index: 0 })
         }
@@ -869,6 +874,7 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
                 },
                 &ctx.session.policy,
                 ctx.pool.as_ref(),
+                &ctx.session.cancel,
             )?;
             Ok(Exec::Scan { batches, index: 0 })
         }
@@ -881,6 +887,7 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
                 None,
                 &ctx.session.policy,
                 ctx.pool.as_ref(),
+                &ctx.session.cancel,
             )?;
             Ok(Exec::Scan { batches, index: 0 })
         }
@@ -897,6 +904,7 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
                     *fetch,
                     &ctx.session.policy,
                     ctx.pool.as_ref(),
+                    &ctx.session.cancel,
                 )?;
                 Ok(Exec::Scan { batches, index: 0 })
             }

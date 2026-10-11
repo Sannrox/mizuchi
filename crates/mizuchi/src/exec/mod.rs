@@ -6,11 +6,14 @@ mod agg;
 mod join;
 mod key;
 mod memory;
+mod schedule;
 mod sort;
 mod stage;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::{Array, BooleanArray, RecordBatch, RecordBatchOptions};
 use arrow::compute::filter_record_batch;
@@ -22,17 +25,49 @@ use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::plan::{Catalog, LogicalPlan, NamedExpr, normalize_name};
 
+/// Cooperative cancellation flag. Operators check it between morsels.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    /// A token that is not cancelled.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request that the running query stop at the next morsel boundary.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::cancel`] has been called.
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            Err(Error::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// In-memory tables plus a batch-size policy.
 #[derive(Clone, Debug)]
 pub struct Session {
     tables: BTreeMap<String, MemTable>,
     policy: BatchPolicy,
-    /// Parallel tasks per stage. Default 1 keeps the pull iterator path.
+    /// Parallel morsel workers. Default 1 keeps the pull iterator path.
     workers: usize,
     /// Caller-provided directory for Arrow IPC shuffle files.
     shuffle_dir: Option<PathBuf>,
     memory_limit: Option<u64>,
     spill_dir: Option<PathBuf>,
+    cancel: CancelToken,
 }
 
 impl Default for Session {
@@ -44,6 +79,7 @@ impl Default for Session {
             shuffle_dir: None,
             memory_limit: None,
             spill_dir: None,
+            cancel: CancelToken::new(),
         }
     }
 }
@@ -61,13 +97,20 @@ impl Session {
         Self::default()
     }
 
-    /// Number of worker threads used by staged execution. `n` must be at least 1.
+    /// Number of worker threads for morsel scheduling and staged execution.
+    /// `n` must be at least 1.
     pub fn with_workers(mut self, n: usize) -> Result<Self> {
         if n == 0 {
             return Err(Error::Plan("workers must be greater than zero".into()));
         }
         self.workers = n;
         Ok(self)
+    }
+
+    /// Cooperative cancellation token checked between morsels.
+    pub fn with_cancel(mut self, token: CancelToken) -> Self {
+        self.cancel = token;
+        self
     }
 
     /// Directory for shuffle files written as Arrow IPC. The engine never
@@ -119,8 +162,15 @@ impl Session {
 
     /// Plan and run `sql` against registered tables.
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<Batch>> {
+        self.cancel.check()?;
+        let plan = self.bind_optimized(sql)?;
         let pool = memory::MemoryPool::new(self.memory_limit, self.spill_dir.clone())?;
-        collect(physical(&self.bind_optimized(sql)?, self, &pool)?)
+        if self.workers > 1
+            && let Some(out) = schedule::try_parallel(&plan, self, &pool)?
+        {
+            return Ok(out);
+        }
+        collect(physical(&plan, self, &pool)?, &self.cancel)
     }
 
     /// Split the optimized plan into stages at hash-partition exchanges.
@@ -131,6 +181,18 @@ impl Session {
     /// Run `sql` as shuffle-map and result stages on `workers` threads.
     pub fn execute_staged(&self, sql: &str) -> Result<Vec<Batch>> {
         stage::execute_staged(&self.bind_optimized(sql)?, self)
+    }
+
+    pub(super) fn table_morsels(&self, table: &str) -> Result<Vec<Batch>> {
+        let table = self
+            .tables
+            .get(&normalize_name(table))
+            .ok_or_else(|| Error::Plan(format!("table not found at execution: {table}")))?;
+        let mut morsels = Vec::new();
+        for batch in &table.batches {
+            morsels.extend(batch.split_by_policy(&self.policy));
+        }
+        Ok(morsels)
     }
 
     fn bind_optimized(&self, sql: &str) -> Result<LogicalPlan> {
@@ -171,7 +233,8 @@ pub(super) enum Exec {
 }
 
 impl Exec {
-    fn next_batch(&mut self) -> Result<Option<Batch>> {
+    fn next_batch(&mut self, cancel: &CancelToken) -> Result<Option<Batch>> {
+        cancel.check()?;
         match self {
             Self::Empty { schema, done } => {
                 if *done {
@@ -189,7 +252,7 @@ impl Exec {
                 Ok(Some(batch))
             }
             Self::Filter { input, predicate } => loop {
-                let Some(batch) = input.next_batch()? else {
+                let Some(batch) = input.next_batch(cancel)? else {
                     return Ok(None);
                 };
                 if let Some(out) = filter_batch(&batch, predicate)? {
@@ -201,22 +264,27 @@ impl Exec {
                 exprs,
                 schema,
             } => {
-                let Some(batch) = input.next_batch()? else {
+                let Some(batch) = input.next_batch(cancel)? else {
                     return Ok(None);
                 };
                 Ok(Some(project_batch(&batch, exprs, schema.clone())?))
             }
-            Self::Limit { input, skip, fetch } => limit_next(input, skip, fetch),
+            Self::Limit { input, skip, fetch } => limit_next(input, skip, fetch, cancel),
         }
     }
 }
 
-fn limit_next(input: &mut Exec, skip: &mut u64, fetch: &mut Option<u64>) -> Result<Option<Batch>> {
+fn limit_next(
+    input: &mut Exec,
+    skip: &mut u64,
+    fetch: &mut Option<u64>,
+    cancel: &CancelToken,
+) -> Result<Option<Batch>> {
     if matches!(fetch, Some(0)) {
         return Ok(None);
     }
     loop {
-        let Some(batch) = input.next_batch()? else {
+        let Some(batch) = input.next_batch(cancel)? else {
             return Ok(None);
         };
         let n = batch.num_rows() as u64;
@@ -311,7 +379,15 @@ pub(super) fn physical(
             schema,
         } => {
             let child = physical(input, session, pool)?;
-            let batches = agg::run(child, group, aggs, schema.clone(), &session.policy, pool)?;
+            let batches = agg::run(
+                child,
+                group,
+                aggs,
+                schema.clone(),
+                &session.policy,
+                pool,
+                &session.cancel,
+            )?;
             Ok(Exec::Scan { batches, index: 0 })
         }
         LogicalPlan::Join {
@@ -333,6 +409,7 @@ pub(super) fn physical(
                 },
                 &session.policy,
                 pool,
+                &session.cancel,
             )?;
             Ok(Exec::Scan { batches, index: 0 })
         }
@@ -345,6 +422,7 @@ pub(super) fn physical(
                 None,
                 &session.policy,
                 pool,
+                &session.cancel,
             )?;
             Ok(Exec::Scan { batches, index: 0 })
         }
@@ -361,6 +439,7 @@ pub(super) fn physical(
                     *fetch,
                     &session.policy,
                     pool,
+                    &session.cancel,
                 )?;
                 Ok(Exec::Scan { batches, index: 0 })
             }
@@ -374,9 +453,9 @@ pub(super) fn physical(
     }
 }
 
-pub(super) fn collect(mut exec: Exec) -> Result<Vec<Batch>> {
+pub(super) fn collect(mut exec: Exec, cancel: &CancelToken) -> Result<Vec<Batch>> {
     let mut out = Vec::new();
-    while let Some(batch) = exec.next_batch()? {
+    while let Some(batch) = exec.next_batch(cancel)? {
         if batch.num_rows() > 0 {
             out.push(batch);
         }
@@ -400,7 +479,11 @@ pub(super) fn filter_batch(batch: &Batch, predicate: &Expr) -> Result<Option<Bat
     Ok(Some(Batch::from_arrow(filtered)?))
 }
 
-fn project_batch(batch: &Batch, exprs: &[NamedExpr], schema: SchemaRef) -> Result<Batch> {
+pub(super) fn project_batch(
+    batch: &Batch,
+    exprs: &[NamedExpr],
+    schema: SchemaRef,
+) -> Result<Batch> {
     let mut columns = Vec::with_capacity(exprs.len());
     for named in exprs {
         columns.push(named.expr.eval(batch)?);
@@ -1475,5 +1558,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert!(matches!(err, Err(Error::Memory(_))), "{err:?}");
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn two_workers_match_one_on_scan_and_agg() {
+        let (schema, batches) = numbered_batches(16, 64, 0);
+        let mut s = Session::new();
+        s.register("t", schema, batches).unwrap();
+        let one = s.clone();
+        let many = s.with_workers(4).unwrap();
+        let scan_sql = "SELECT a FROM t WHERE a > 10";
+        assert_eq!(
+            col_i64(&one.execute_sql(scan_sql).unwrap(), "a"),
+            col_i64(&many.execute_sql(scan_sql).unwrap(), "a")
+        );
+        let agg_sql = "SELECT g, COUNT(*) AS c, SUM(a) AS s FROM t GROUP BY g";
+        let want = one.execute_sql(agg_sql).unwrap();
+        let got = many.execute_sql(agg_sql).unwrap();
+        let mut want_rows: Vec<_> = col_i64(&want, "g")
+            .into_iter()
+            .zip(col_i64(&want, "c"))
+            .zip(col_i64(&want, "s"))
+            .collect();
+        let mut got_rows: Vec<_> = col_i64(&got, "g")
+            .into_iter()
+            .zip(col_i64(&got, "c"))
+            .zip(col_i64(&got, "s"))
+            .collect();
+        want_rows.sort();
+        got_rows.sort();
+        assert_eq!(got_rows, want_rows);
+    }
+
+    #[test]
+    fn cancel_before_execute_fails_closed() {
+        let token = CancelToken::new();
+        token.cancel();
+        let (s, _) = register_numbered(8, 32);
+        let err = s
+            .with_cancel(token)
+            .execute_sql("SELECT a FROM t WHERE a >= 0");
+        assert!(matches!(err, Err(Error::Cancelled)), "{err:?}");
+    }
+
+    #[test]
+    fn cancel_stops_a_running_query() {
+        let token = CancelToken::new();
+        let (schema, batches) = numbered_batches(64, 256, 0);
+        let mut s = Session::new();
+        s.register("t", schema, batches).unwrap();
+        let s = s.with_cancel(token.clone()).with_workers(2).unwrap();
+        let started = std::time::Instant::now();
+        let handle = std::thread::spawn(move || {
+            s.execute_sql("SELECT g, COUNT(*) AS c, SUM(a) AS s FROM t GROUP BY g")
+        });
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        token.cancel();
+        let result = handle.join().expect("worker");
+        let elapsed = started.elapsed();
+        match result {
+            Err(Error::Cancelled) => {}
+            Ok(_) => {
+                let err = Session::new()
+                    .with_cancel(token)
+                    .execute_sql("SELECT 1 AS x");
+                assert!(matches!(err, Err(Error::Cancelled)), "{err:?}");
+            }
+            Err(other) => panic!("{other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "cancel took {elapsed:?}"
+        );
     }
 }
