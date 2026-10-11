@@ -71,6 +71,18 @@ cargo +nightly fuzz run parse -- -max_total_time=30
 
 Crashes under `fuzz/artifacts/` become regression cases in `crates/mizuchi/tests/fuzz_sql.rs`.
 
+Gigabyte-scale comparison (not part of default `cargo test`):
+
+```sh
+bash scripts/bench-gb.sh 1    # SF1
+bash scripts/bench-gb.sh 10   # SF10
+```
+
+Method and committed results: [docs/bench/methodology.md](docs/bench/methodology.md),
+[docs/bench/results.md](docs/bench/results.md). Data lands in `bench-data/` (gitignored).
+CI may smoke `scripts/bench-gb.sh tiny` from `.github/workflows/bench-gb.yml` on
+manual dispatch; pull-request CI does not run it.
+
 Contributor and agent policy: [AGENTS.md](AGENTS.md). Decisions:
 [docs/decisions/](docs/decisions/README.md).
 

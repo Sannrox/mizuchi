@@ -1,0 +1,88 @@
+//! Default-test contract for the gigabyte-scale bench docs and harness.
+//!
+//! Does not generate Parquet or time SF1/SF10. Those runs live in
+//! `scripts/bench-gb.sh` and the optional `bench-gb` workflow.
+
+use std::fs;
+use std::path::PathBuf;
+
+fn root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn read(rel: &str) -> String {
+    fs::read_to_string(root().join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+}
+
+#[test]
+fn methodology_records_hardware_and_method() {
+    let text = read("docs/bench/methodology.md");
+    for needle in [
+        "single-node workstation",
+        "32 GiB",
+        "release",
+        "median",
+        "warmup",
+        "Snappy",
+        "6_000_000",
+        "60_000_000",
+        "DuckDB",
+        "DataFusion",
+        "scripts/bench-gb.sh",
+    ] {
+        assert!(text.contains(needle), "methodology missing {needle}");
+    }
+    assert!(
+        !text.contains("pull_request"),
+        "methodology must not imply the default PR CI runs SF1"
+    );
+}
+
+#[test]
+fn results_table_covers_sf1_and_sf10() {
+    let text = read("docs/bench/results.md");
+    for needle in ["sf1", "sf10", "mizuchi", "DuckDB", "DataFusion"] {
+        assert!(text.contains(needle), "results missing {needle}");
+    }
+    for q in ["tpch_q1", "tpch_q3", "tpch_q6", "tpcds_store_sales"] {
+        let hits = text.matches(q).count();
+        assert!(
+            hits >= 2,
+            "{q} should appear for both SF1 and SF10, got {hits}"
+        );
+    }
+    assert!(text.contains("ratio"), "results missing ratio column");
+    // Published times are milliseconds with at least one decimal.
+    let has_ms = text.lines().any(|line| {
+        line.contains("|")
+            && line
+                .split('|')
+                .any(|cell| cell.trim().parse::<f64>().is_ok() && cell.contains('.'))
+    });
+    assert!(
+        has_ms,
+        "results table should include measured millisecond values"
+    );
+}
+
+#[test]
+fn harness_and_optional_workflow_exist() {
+    let root = root();
+    for rel in [
+        "scripts/bench-gb.sh",
+        "scripts/bench_gb_ref.py",
+        "crates/mizuchi/examples/gb_bench.rs",
+        ".github/workflows/bench-gb.yml",
+    ] {
+        assert!(root.join(rel).is_file(), "missing {rel}");
+    }
+    let yml = read(".github/workflows/bench-gb.yml");
+    assert!(yml.contains("workflow_dispatch"));
+    assert!(
+        !yml.contains("pull_request"),
+        "GB bench workflow must not run on pull_request"
+    );
+    let script = read("scripts/bench-gb.sh");
+    assert!(script.contains("gb_bench"));
+    assert!(script.contains("bench_gb_ref.py"));
+}

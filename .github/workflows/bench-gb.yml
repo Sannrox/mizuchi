@@ -1,0 +1,30 @@
+name: GB bench smoke
+
+# Optional job. Never on pull requests. Default cargo test stays offline and tiny.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke-tiny:
+    name: Tiny scale smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install reference engines
+        run: python -m pip install duckdb datafusion pyarrow
+      - name: Run tiny suite
+        run: bash scripts/bench-gb.sh tiny
