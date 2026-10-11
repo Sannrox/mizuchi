@@ -252,12 +252,73 @@ fn exec_statement(db: &mut Db, sql: &str) -> Result<(), String> {
         create_table(db, trimmed)
     } else if upper.starts_with("INSERT INTO") {
         insert_into(db, trimmed)
+    } else if upper.starts_with("MERGE") {
+        merge_into(db, trimmed)
     } else {
         db.session()
             .execute_sql(trimmed)
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
+}
+
+fn merge_into(db: &mut Db, sql: &str) -> Result<(), String> {
+    let mut session = db.session();
+    let stats = session.merge_sql(sql).map_err(|e| e.to_string())?;
+    let (schema, batches) = session
+        .table_data(&stats.table)
+        .map_err(|e| e.to_string())?;
+    let key = db
+        .tables
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(&stats.table))
+        .cloned()
+        .unwrap_or_else(|| stats.table.clone());
+    let rows = batches_to_rows(&schema, &batches)?;
+    db.tables.insert(key, (schema, rows));
+    Ok(())
+}
+
+fn batches_to_rows(schema: &SchemaRef, batches: &[Batch]) -> Result<Vec<Vec<Cell>>, String> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        for r in 0..batch.num_rows() {
+            let mut row = Vec::with_capacity(schema.fields().len());
+            for c in 0..schema.fields().len() {
+                let arr = batch.column(c);
+                if arr.is_null(r) {
+                    row.push(Cell::Null);
+                    continue;
+                }
+                row.push(match schema.field(c).data_type() {
+                    DataType::Int64 => {
+                        let a = arr
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .ok_or_else(|| "expected int64".to_string())?;
+                        Cell::I64(a.value(r))
+                    }
+                    DataType::Float64 => {
+                        let a = arr
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .ok_or_else(|| "expected float64".to_string())?;
+                        Cell::F64(a.value(r))
+                    }
+                    DataType::Utf8 => {
+                        let a = arr
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .ok_or_else(|| "expected utf8".to_string())?;
+                        Cell::Utf8(a.value(r).to_string())
+                    }
+                    other => return Err(format!("unsupported merge result type {other}")),
+                });
+            }
+            rows.push(row);
+        }
+    }
+    Ok(rows)
 }
 
 fn create_table(db: &mut Db, sql: &str) -> Result<(), String> {

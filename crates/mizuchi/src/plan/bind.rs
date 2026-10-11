@@ -4,16 +4,18 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use sqlparser::ast::{
-    BinaryOperator, CastKind, Distinct, DuplicateTreatment, Expr as SqlExpr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
-    LimitClause, ObjectName, ObjectNamePart, Offset, OrderByKind, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
-    TableWithJoins, UnaryOperator, Value, WildcardAdditionalOptions,
+    Assignment, AssignmentTarget, BinaryOperator, CastKind, Distinct, DuplicateTreatment,
+    Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
+    JoinConstraint, JoinOperator, LimitClause, Merge as SqlMerge, MergeAction, MergeClauseKind,
+    MergeInsertKind, MergeUpdateKind, ObjectName, ObjectNamePart, Offset, OrderByKind, Query,
+    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier,
+    Statement, TableFactor, TableWithJoins, UnaryOperator, Value, WildcardAdditionalOptions,
 };
 
 use super::{
-    AggCall, Catalog, JoinType, LogicalPlan, NamedExpr, SortExpr, expr_type, join_schema,
-    parse_statements, require_boolean, schema_from_fields,
+    AggCall, Catalog, JoinType, LogicalPlan, MergeActionPlan, MergeClausePlan, MergeMatch,
+    MergePlan, NamedExpr, SortExpr, expr_type, join_schema, parse_statements, require_boolean,
+    schema_from_fields,
 };
 use crate::error::{Error, Result};
 use crate::expr::{BinaryOp, Expr, UnaryOp};
@@ -70,9 +72,309 @@ pub fn plan_sql(sql: &str, catalog: &Catalog) -> Result<LogicalPlan> {
 fn statement_kind(stmt: &Statement) -> &'static str {
     match stmt {
         Statement::Insert(_) => "INSERT",
+        Statement::Merge(_) => "MERGE",
         Statement::Query(_) => "query",
         _ => "statement",
     }
+}
+
+/// Target table name of a `MERGE` statement, before catalog binding.
+pub fn merge_target_table(sql: &str) -> Result<String> {
+    let stmt = parse_statements(sql)?;
+    match stmt {
+        Statement::Merge(merge) => match &merge.table {
+            TableFactor::Table { name, .. } => object_name(name),
+            _ => Err(Error::NotImplemented("MERGE target subquery")),
+        },
+        other => Err(Error::Plan(format!(
+            "expected MERGE, got {}",
+            statement_kind(&other)
+        ))),
+    }
+}
+
+/// Bind a `MERGE` statement against `catalog`.
+pub fn bind_merge(sql: &str, catalog: &Catalog) -> Result<MergePlan> {
+    let stmt = parse_statements(sql)?;
+    match stmt {
+        Statement::Merge(merge) => bind_merge_stmt(&merge, catalog),
+        other => Err(Error::Plan(format!(
+            "expected MERGE, got {}",
+            statement_kind(&other)
+        ))),
+    }
+}
+
+fn bind_merge_stmt(merge: &SqlMerge, catalog: &Catalog) -> Result<MergePlan> {
+    if !merge.optimizer_hints.is_empty() {
+        return Err(Error::NotImplemented("MERGE hints"));
+    }
+    if merge.output.is_some() {
+        return Err(Error::NotImplemented("MERGE OUTPUT"));
+    }
+    let (target, target_alias) = merge_target(&merge.table, catalog)?;
+    let target_schema = catalog.table(&target)?.clone();
+    let source = bind_table_factor(&merge.source, catalog)?;
+    let source_schema = source.plan.schema().clone();
+    let target_qual = target_alias.unwrap_or_else(|| target.clone());
+    let target_scope = Scope::from_schema(Some(target_qual), target_schema.clone());
+    let ts_scope = Scope::join(target_scope.clone(), source.scope.clone());
+    let st_scope = Scope::join(source.scope.clone(), target_scope.clone());
+    let on_ts = bind_scalar(&merge.on, &ts_scope)?;
+    require_boolean(expr_type(&on_ts, &ts_scope.schema)?, "MERGE ON")?;
+    let on_st = bind_scalar(&merge.on, &st_scope)?;
+    require_boolean(expr_type(&on_st, &st_scope.schema)?, "MERGE ON")?;
+    if merge.clauses.is_empty() {
+        return Err(Error::Plan("MERGE needs at least one WHEN clause".into()));
+    }
+    let mut clauses = Vec::with_capacity(merge.clauses.len());
+    for clause in &merge.clauses {
+        clauses.push(bind_merge_clause(
+            clause,
+            &target_scope,
+            &source.scope,
+            &ts_scope,
+        )?);
+    }
+    Ok(MergePlan {
+        target,
+        source: source.plan,
+        on_ts,
+        on_st,
+        clauses,
+        target_schema,
+        source_schema,
+    })
+}
+
+fn merge_target(factor: &TableFactor, catalog: &Catalog) -> Result<(String, Option<String>)> {
+    match factor {
+        TableFactor::Table {
+            name,
+            alias,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
+            ..
+        } => {
+            if args.is_some()
+                || !with_hints.is_empty()
+                || version.is_some()
+                || *with_ordinality
+                || !partitions.is_empty()
+                || json_path.is_some()
+                || sample.is_some()
+                || !index_hints.is_empty()
+            {
+                return Err(Error::NotImplemented("MERGE target hints"));
+            }
+            let table = object_name(name)?;
+            let _ = catalog.table(&table)?;
+            if let Some(alias) = alias
+                && !alias.columns.is_empty()
+            {
+                return Err(Error::NotImplemented("column aliases on MERGE target"));
+            }
+            let alias_name = alias.as_ref().map(|a| ident_key(&a.name));
+            Ok((table, alias_name))
+        }
+        _ => Err(Error::NotImplemented("MERGE target subquery")),
+    }
+}
+
+fn bind_merge_clause(
+    clause: &sqlparser::ast::MergeClause,
+    target: &Scope,
+    source: &Scope,
+    joined: &Scope,
+) -> Result<MergeClausePlan> {
+    let kind = match clause.clause_kind {
+        MergeClauseKind::Matched => MergeMatch::Matched,
+        MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget => MergeMatch::NotMatched,
+        MergeClauseKind::NotMatchedBySource => MergeMatch::NotMatchedBySource,
+    };
+    let pred_scope = match kind {
+        MergeMatch::Matched => joined,
+        MergeMatch::NotMatched => source,
+        MergeMatch::NotMatchedBySource => target,
+    };
+    let predicate = match &clause.predicate {
+        Some(expr) => {
+            let bound = bind_scalar(expr, pred_scope)?;
+            require_boolean(expr_type(&bound, &pred_scope.schema)?, "MERGE WHEN")?;
+            Some(bound)
+        }
+        None => None,
+    };
+    let action = match (&clause.action, kind) {
+        (MergeAction::Delete { .. }, MergeMatch::NotMatched) => {
+            return Err(Error::Plan("WHEN NOT MATCHED cannot THEN DELETE".into()));
+        }
+        (MergeAction::Delete { .. }, _) => MergeActionPlan::Delete,
+        (MergeAction::DoNothing { .. }, _) => {
+            return Err(Error::NotImplemented("MERGE DO NOTHING"));
+        }
+        (MergeAction::Update(_), MergeMatch::NotMatched) => {
+            return Err(Error::Plan("WHEN NOT MATCHED cannot THEN UPDATE".into()));
+        }
+        (MergeAction::Update(update), _) => {
+            if update.update_predicate.is_some() || update.delete_predicate.is_some() {
+                return Err(Error::NotImplemented("MERGE UPDATE WHERE"));
+            }
+            bind_merge_update(update, target, source, joined, kind)?
+        }
+        (MergeAction::Insert(_), MergeMatch::Matched | MergeMatch::NotMatchedBySource) => {
+            return Err(Error::Plan(
+                "INSERT is only valid on WHEN NOT MATCHED".into(),
+            ));
+        }
+        (MergeAction::Insert(insert), _) => {
+            if insert.insert_predicate.is_some() {
+                return Err(Error::NotImplemented("MERGE INSERT WHERE"));
+            }
+            bind_merge_insert(insert, target, source)?
+        }
+    };
+    Ok(MergeClausePlan {
+        kind,
+        predicate,
+        action,
+    })
+}
+
+fn bind_merge_update(
+    update: &sqlparser::ast::MergeUpdateExpr,
+    target: &Scope,
+    source: &Scope,
+    joined: &Scope,
+    kind: MergeMatch,
+) -> Result<MergeActionPlan> {
+    let value_scope = match kind {
+        MergeMatch::Matched => joined,
+        MergeMatch::NotMatchedBySource => target,
+        MergeMatch::NotMatched => joined,
+    };
+    match &update.kind {
+        MergeUpdateKind::Wildcard => {
+            let mut assignments = Vec::new();
+            for (idx, field) in target.schema.fields().iter().enumerate() {
+                let expr = match kind {
+                    MergeMatch::Matched => {
+                        let qual = source.columns.iter().find_map(|c| c.qualifier.clone());
+                        match resolve_name(qual.as_deref(), field.name(), source)? {
+                            Expr::Nth(i) => Expr::nth(i + target.schema.fields().len()),
+                            _ => {
+                                return Err(Error::Plan(
+                                    "UPDATE * expected a source column".into(),
+                                ));
+                            }
+                        }
+                    }
+                    MergeMatch::NotMatchedBySource => {
+                        let qual = target.columns.iter().find_map(|c| c.qualifier.clone());
+                        resolve_name(qual.as_deref(), field.name(), target)?
+                    }
+                    MergeMatch::NotMatched => {
+                        let qual = source.columns.iter().find_map(|c| c.qualifier.clone());
+                        resolve_name(qual.as_deref(), field.name(), source)?
+                    }
+                };
+                assignments.push((idx, expr));
+            }
+            Ok(MergeActionPlan::Update { assignments })
+        }
+        MergeUpdateKind::Set(assigns) => {
+            let mut assignments = Vec::new();
+            for assign in assigns {
+                assignments.push(bind_assignment(assign, target, value_scope)?);
+            }
+            Ok(MergeActionPlan::Update { assignments })
+        }
+    }
+}
+
+fn bind_assignment(assign: &Assignment, target: &Scope, values: &Scope) -> Result<(usize, Expr)> {
+    let name = match &assign.target {
+        AssignmentTarget::ColumnName(name) => assignment_column(name)?,
+        AssignmentTarget::Tuple(_) => return Err(Error::NotImplemented("tuple UPDATE SET")),
+    };
+    let idx = target
+        .schema
+        .fields()
+        .iter()
+        .position(|f| f.name().eq_ignore_ascii_case(&name))
+        .ok_or_else(|| Error::Plan(format!("UPDATE column not found: {name}")))?;
+    let expr = bind_scalar(&assign.value, values)?;
+    Ok((idx, expr))
+}
+
+fn assignment_column(name: &ObjectName) -> Result<String> {
+    match name.0.last() {
+        Some(ObjectNamePart::Identifier(id)) => Ok(ident_key(id)),
+        _ => Err(Error::Plan("UPDATE SET target must be a column".into())),
+    }
+}
+
+fn bind_merge_insert(
+    insert: &sqlparser::ast::MergeInsertExpr,
+    target: &Scope,
+    source: &Scope,
+) -> Result<MergeActionPlan> {
+    let n = target.schema.fields().len();
+    let mut values: Vec<Option<Expr>> = vec![None; n];
+    match &insert.kind {
+        MergeInsertKind::Wildcard | MergeInsertKind::Row => {
+            if !insert.columns.is_empty() {
+                return Err(Error::Plan("INSERT * does not take a column list".into()));
+            }
+            for (idx, field) in target.schema.fields().iter().enumerate() {
+                if let Ok(expr) = resolve_name(None, field.name(), source) {
+                    values[idx] = Some(expr);
+                }
+            }
+        }
+        MergeInsertKind::Values(vals) => {
+            if vals.rows.len() != 1 {
+                return Err(Error::Plan(
+                    "MERGE INSERT VALUES must be a single row".into(),
+                ));
+            }
+            let row = &vals.rows[0];
+            let cols: Vec<usize> = if insert.columns.is_empty() {
+                (0..n).collect()
+            } else {
+                insert
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        let name = assignment_column(c)?;
+                        target
+                            .schema
+                            .fields()
+                            .iter()
+                            .position(|f| f.name().eq_ignore_ascii_case(&name))
+                            .ok_or_else(|| Error::Plan(format!("INSERT column not found: {name}")))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            if cols.len() != row.len() {
+                return Err(Error::Plan(format!(
+                    "INSERT column count {} does not match VALUES {}",
+                    cols.len(),
+                    row.len()
+                )));
+            }
+            for (idx, expr) in cols.into_iter().zip(row.iter()) {
+                values[idx] = Some(bind_scalar(expr, source)?);
+            }
+        }
+    }
+    Ok(MergeActionPlan::Insert { values })
 }
 
 fn bind_query(query: &Query, catalog: &Catalog) -> Result<LogicalPlan> {

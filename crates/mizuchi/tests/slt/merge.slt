@@ -1,0 +1,53 @@
+# MERGE INTO: match, update, insert, and delete unmatched target rows.
+
+statement ok
+CREATE TABLE t (id INT, v INT)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (4, 40)
+
+statement ok
+CREATE TABLE s (id INT, v INT)
+
+statement ok
+INSERT INTO s VALUES (2, 99), (3, 30)
+
+statement ok
+MERGE INTO t USING s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = s.v
+WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)
+
+query II rowsort
+SELECT id, v FROM t
+----
+1
+10
+2
+99
+3
+30
+4
+40
+
+statement ok
+CREATE TABLE t2 (id INT, v INT)
+
+statement ok
+INSERT INTO t2 VALUES (1, 10), (2, 20)
+
+statement ok
+CREATE TABLE s2 (id INT, v INT)
+
+statement ok
+INSERT INTO s2 VALUES (2, 99)
+
+statement ok
+MERGE INTO t2 USING s2 ON t2.id = s2.id
+WHEN MATCHED THEN UPDATE SET v = s2.v
+WHEN NOT MATCHED BY SOURCE THEN DELETE
+
+query II rowsort
+SELECT id, v FROM t2
+----
+2
+99

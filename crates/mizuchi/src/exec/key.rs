@@ -11,7 +11,7 @@ use arrow::datatypes::{
 use crate::error::{Error, Result};
 
 #[derive(Clone)]
-pub(super) enum Scalar {
+pub(crate) enum Scalar {
     Null,
     Bool(bool),
     I8(i8),
@@ -94,7 +94,7 @@ fn canonical_f64(bits: u64) -> u64 {
     }
 }
 
-pub(super) fn extract_key(cols: &[ArrayRef], row: usize) -> Result<Vec<Scalar>> {
+pub(crate) fn extract_key(cols: &[ArrayRef], row: usize) -> Result<Vec<Scalar>> {
     cols.iter().map(|c| scalar_at(c.as_ref(), row)).collect()
 }
 

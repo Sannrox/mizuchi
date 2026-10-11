@@ -17,8 +17,68 @@ use crate::expr::Expr;
 use crate::schema::from_arrow_schema;
 use crate::sql::parse_sql;
 
-pub use bind::plan_sql;
+pub use bind::{bind_merge, merge_target_table, plan_sql};
 pub use stats::{ColumnStats, TableStats, inner_equi_rows, table_stats_from_batches};
+
+/// Which `WHEN` arm a bound MERGE clause applies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeMatch {
+    /// `WHEN MATCHED`
+    Matched,
+    /// `WHEN NOT MATCHED` / `WHEN NOT MATCHED BY TARGET`
+    NotMatched,
+    /// `WHEN NOT MATCHED BY SOURCE`
+    NotMatchedBySource,
+}
+
+/// Action for one MERGE clause.
+#[derive(Clone, Debug)]
+pub enum MergeActionPlan {
+    /// Drop the row.
+    Delete,
+    /// Replace target columns. Each pair is `(target_ordinal, expr on the
+    /// clause's input schema)`.
+    Update {
+        /// Assignments in clause order.
+        assignments: Vec<(usize, Expr)>,
+    },
+    /// Build a target row. `values[i]` is the expression for target column
+    /// `i`, or `None` for null.
+    Insert {
+        /// Per-column expressions, aligned with the target schema.
+        values: Vec<Option<Expr>>,
+    },
+}
+
+/// One bound `WHEN` clause.
+#[derive(Clone, Debug)]
+pub struct MergeClausePlan {
+    /// Match kind.
+    pub kind: MergeMatch,
+    /// Extra predicate; `None` matches every row of `kind`.
+    pub predicate: Option<Expr>,
+    /// Action when the predicate holds.
+    pub action: MergeActionPlan,
+}
+
+/// Bound `MERGE` statement. Executed by [`crate::exec::Session::merge_sql`].
+#[derive(Clone, Debug)]
+pub struct MergePlan {
+    /// Target table name (normalized).
+    pub target: String,
+    /// Source relation.
+    pub source: LogicalPlan,
+    /// Join condition with the target on the left and the source on the right.
+    pub on_ts: Expr,
+    /// Join condition with the source on the left and the target on the right.
+    pub on_st: Expr,
+    /// Clauses in source order; the first match wins.
+    pub clauses: Vec<MergeClausePlan>,
+    /// Target schema after the merge.
+    pub target_schema: SchemaRef,
+    /// Source output schema.
+    pub source_schema: SchemaRef,
+}
 
 /// Registered table schemas used to bind SQL.
 #[derive(Clone, Debug, Default)]
