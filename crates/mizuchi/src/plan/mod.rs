@@ -13,7 +13,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::{Error, Result};
-use crate::expr::Expr;
+use crate::expr::{Expr, numeric_arith_type, widen_decimal};
 use crate::schema::from_arrow_schema;
 use crate::sql::parse_sql;
 use crate::udaf::CombineAgg;
@@ -177,12 +177,12 @@ impl AggCall {
         match self {
             Self::CountStar | Self::Count(_) | Self::CountDistinct(_) => Ok(DataType::Int64),
             Self::Avg(expr) => {
-                require_numeric(expr_type(expr, input)?, "AVG")?;
+                require_int_or_float(expr_type(expr, input)?, "AVG")?;
                 Ok(DataType::Float64)
             }
             Self::Sum(expr) => {
                 let dt = expr_type(expr, input)?;
-                require_numeric(dt.clone(), "SUM")?;
+                require_int_or_float(dt.clone(), "SUM")?;
                 Ok(dt)
             }
             Self::Min(expr) | Self::Max(expr) => Ok(expr_type(expr, input)?),
@@ -798,7 +798,7 @@ fn binary_type(op: crate::expr::BinaryOp, l: DataType, r: DataType) -> Result<Da
         Add | Sub | Mul | Div => {
             require_numeric(l.clone(), "arithmetic")?;
             require_numeric(r.clone(), "arithmetic")?;
-            widen(l, r)
+            numeric_arith_type(op, l, r)
         }
         Eq | NotEq | Lt | LtEq | Gt | GtEq => Ok(DataType::Boolean),
         And | Or => {
@@ -860,23 +860,20 @@ fn require_list(dt: DataType, what: &str) -> Result<()> {
 }
 
 pub(crate) fn require_numeric(dt: DataType, what: &str) -> Result<()> {
-    if matches!(
-        dt,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float16
-            | DataType::Float32
-            | DataType::Float64
-    ) {
+    if dt.is_numeric() {
         Ok(())
     } else {
         Err(Error::Plan(format!("{what} requires numeric, got {dt}")))
+    }
+}
+
+fn require_int_or_float(dt: DataType, what: &str) -> Result<()> {
+    if dt.is_integer() || dt.is_floating() {
+        Ok(())
+    } else {
+        Err(Error::Plan(format!(
+            "{what} requires integer or float, got {dt}"
+        )))
     }
 }
 
@@ -892,6 +889,9 @@ pub(crate) fn widen(l: DataType, r: DataType) -> Result<DataType> {
     }
     if is_float(&l) || is_float(&r) {
         return Ok(DataType::Float64);
+    }
+    if let Some(dt) = widen_decimal(&l, &r) {
+        return dt;
     }
     if is_int(&l) && is_int(&r) {
         return Ok(DataType::Int64);
@@ -1134,5 +1134,49 @@ mod tests {
             plan_sql("SELECT FROM", &Catalog::new()),
             Err(Error::Parse(_))
         ));
+    }
+
+    #[test]
+    fn decimal_sql_maps_and_arithmetic_types() {
+        let plan = plan_sql("SELECT CAST(1 AS DECIMAL(10, 2))", &Catalog::new()).unwrap();
+        assert_eq!(
+            plan.schema().field(0).data_type(),
+            &DataType::Decimal64(10, 2)
+        );
+        let plan = plan_sql("SELECT CAST(1 AS NUMERIC)", &Catalog::new()).unwrap();
+        assert_eq!(
+            plan.schema().field(0).data_type(),
+            &DataType::Decimal64(10, 0)
+        );
+        let plan = plan_sql(
+            "SELECT CAST('1.50' AS DECIMAL(10, 2)) + CAST('2.25' AS DECIMAL(10, 2))",
+            &Catalog::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.schema().field(0).data_type(),
+            &DataType::Decimal64(11, 2)
+        );
+        let plan = plan_sql(
+            "SELECT CAST(1 AS DECIMAL(4, 1)) * CAST(2 AS DECIMAL(4, 1))",
+            &Catalog::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.schema().field(0).data_type(),
+            &DataType::Decimal32(9, 2)
+        );
+        let err = plan_sql("SELECT CAST(1 AS DECIMAL(39, 0))", &Catalog::new()).unwrap_err();
+        assert!(matches!(err, Error::Plan(_)), "{err:?}");
+        let err = plan_sql("SELECT CAST(1 AS DECIMAL(10, 11))", &Catalog::new()).unwrap_err();
+        assert!(matches!(err, Error::Plan(_)), "{err:?}");
+        let err = plan_sql(
+            "SELECT CAST(1 AS DECIMAL(10, 2)) * CAST(1 AS DECIMAL(30, 2))",
+            &Catalog::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Plan(_)), "{err:?}");
+        let err = plan_sql("SELECT SUM(CAST(1 AS DECIMAL(10, 2)))", &Catalog::new()).unwrap_err();
+        assert!(matches!(err, Error::Plan(_)), "{err:?}");
     }
 }

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::util::display::{ArrayFormatter, FormatOptions};
 use mizuchi::{Batch, Session};
 
 const ENGINE: &str = "mizuchi";
@@ -548,11 +549,15 @@ fn format_cell(batch: &Batch, col: usize, row: usize, ty: char) -> Result<String
             Ok(a.value(row).to_string())
         }
         'R' => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "expected float64".to_string())?;
-            Ok(format!("{}", a.value(row)))
+            if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+                return Ok(format!("{}", a.value(row)));
+            }
+            if arr.data_type().is_decimal() {
+                let fmt = ArrayFormatter::try_new(arr.as_ref(), &FormatOptions::default())
+                    .map_err(|e| e.to_string())?;
+                return Ok(fmt.value(row).to_string());
+            }
+            Err("expected float64 or decimal".into())
         }
         other => Err(format!("unknown result type {other}")),
     }

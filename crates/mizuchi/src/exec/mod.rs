@@ -2813,6 +2813,67 @@ mod tests {
     }
 
     #[test]
+    fn decimal_cast_and_arithmetic() {
+        let out = Session::new()
+            .execute_sql("SELECT CAST(1 AS DECIMAL(10, 2)) AS x")
+            .unwrap();
+        assert_eq!(
+            out[0].schema().field(0).data_type(),
+            &DataType::Decimal64(10, 2)
+        );
+        let col = out[0].column(0);
+        assert_eq!(
+            col.as_any()
+                .downcast_ref::<arrow::array::Decimal64Array>()
+                .unwrap()
+                .value(0),
+            100
+        );
+        let out = Session::new()
+            .execute_sql(
+                "SELECT CAST('1.50' AS DECIMAL(10, 2)) + CAST('2.25' AS DECIMAL(10, 2)) AS x",
+            )
+            .unwrap();
+        assert_eq!(
+            out[0].schema().field(0).data_type(),
+            &DataType::Decimal64(11, 2)
+        );
+        let col = out[0].column(0);
+        assert_eq!(
+            col.as_any()
+                .downcast_ref::<arrow::array::Decimal64Array>()
+                .unwrap()
+                .value(0),
+            375
+        );
+        let out = Session::new()
+            .execute_sql("SELECT CAST(CAST(3 AS DECIMAL(10, 2)) AS DOUBLE PRECISION) AS x")
+            .unwrap();
+        assert_eq!(col_f64(&out, "x"), vec![Some(3.0)]);
+        let err = Session::new().execute_sql("SELECT CAST(1000 AS DECIMAL(3, 2))");
+        assert!(matches!(err, Err(Error::Eval(_))), "{err:?}");
+        let out = Session::new()
+            .execute_sql(
+                "SELECT CAST('999.9' AS DECIMAL(4, 1)) * CAST('999.9' AS DECIMAL(4, 1)) AS x",
+            )
+            .unwrap();
+        assert_eq!(
+            out[0].schema().field(0).data_type(),
+            &DataType::Decimal32(9, 2)
+        );
+        let col = out[0].column(0);
+        assert_eq!(
+            col.as_any()
+                .downcast_ref::<arrow::array::Decimal32Array>()
+                .unwrap()
+                .value(0),
+            99_980_001
+        );
+        let err = Session::new().execute_sql("SELECT SUM(CAST(1 AS DECIMAL(10, 2)))");
+        assert!(matches!(err, Err(Error::Plan(_))), "{err:?}");
+    }
+
+    #[test]
     fn setops_fails_closed_without_spill() {
         let (s, cap) = register_numbered(12, 32);
         let err = s

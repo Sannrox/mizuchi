@@ -53,7 +53,7 @@ fn per_feature_slt_files_exist_with_skipif_gaps() {
         ("cte.slt", false),
         ("subquery.slt", false),
         ("setops.slt", false),
-        ("decimal.slt", true),
+        ("decimal.slt", false),
         ("datetime.slt", true),
         ("select.slt", false),
         ("agg.slt", false),

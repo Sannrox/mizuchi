@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Int64Array, ListArray, StringArray, UInt32Array,
-    new_null_array,
+    Array, ArrayRef, ArrowNativeTypeOp, AsArray, BooleanArray, Int64Array, ListArray, StringArray,
+    UInt32Array, new_null_array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::kernels::boolean::{and_kleene, is_not_null, is_null, not, or_kleene};
@@ -20,11 +20,12 @@ use arrow::compute::kernels::numeric::{add, div, mul, neg, sub};
 use arrow::compute::kernels::substring::substring;
 use arrow::compute::kernels::temporal::{DatePart, date_part};
 use arrow::compute::kernels::zip::zip;
-use arrow::compute::{cast, take};
+use arrow::compute::{CastOptions, cast, cast_with_options, take};
 use arrow::datatypes::{
-    DataType, Date32Type, Date64Type, Field, Float32Type, Float64Type, Int8Type, Int16Type,
-    Int32Type, Int64Type, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
-    TimestampNanosecondType, TimestampSecondType,
+    DataType, Date32Type, Date64Type, Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type,
+    Field, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, TimeUnit,
+    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    TimestampSecondType, i256,
 };
 use arrow::error::ArrowError;
 
@@ -145,6 +146,107 @@ impl Expr {
     }
 }
 
+/// Largest DECIMAL precision the SQL path accepts. Wider Arrow decimals remain
+/// valid at the schema boundary; arithmetic and CAST fail closed above this.
+const DECIMAL_MAX_PRECISION: i32 = 38;
+
+/// Smallest Arrow decimal width that can hold `precision`.
+pub(crate) fn decimal_arrow(precision: i32, scale: i32) -> Result<DataType> {
+    if !(1..=DECIMAL_MAX_PRECISION).contains(&precision) {
+        return Err(Error::Plan(format!(
+            "DECIMAL precision {precision} is out of range 1..=38"
+        )));
+    }
+    if scale < 0 || scale > precision {
+        return Err(Error::Plan(format!(
+            "DECIMAL scale {scale} is out of range 0..={precision}"
+        )));
+    }
+    let p = precision as u8;
+    let s = scale as i8;
+    Ok(if precision <= 9 {
+        DataType::Decimal32(p, s)
+    } else if precision <= 18 {
+        DataType::Decimal64(p, s)
+    } else {
+        DataType::Decimal128(p, s)
+    })
+}
+
+pub(crate) fn decimal_parts(dt: &DataType) -> Option<(i32, i32)> {
+    match *dt {
+        DataType::Decimal32(p, s)
+        | DataType::Decimal64(p, s)
+        | DataType::Decimal128(p, s)
+        | DataType::Decimal256(p, s) => Some((i32::from(p), i32::from(s))),
+        _ => None,
+    }
+}
+
+fn int_as_decimal(dt: &DataType) -> Option<(i32, i32)> {
+    match dt {
+        DataType::Int8 | DataType::UInt8 => Some((3, 0)),
+        DataType::Int16 | DataType::UInt16 => Some((5, 0)),
+        DataType::Int32 | DataType::UInt32 => Some((10, 0)),
+        DataType::Int64 | DataType::UInt64 => Some((20, 0)),
+        _ => None,
+    }
+}
+
+/// Result type of `+` `-` `*` `/` after both sides are known numeric.
+pub(crate) fn numeric_arith_type(op: BinaryOp, l: DataType, r: DataType) -> Result<DataType> {
+    if l.is_floating() || r.is_floating() {
+        if l == r {
+            return Ok(l);
+        }
+        return Ok(DataType::Float64);
+    }
+    if l.is_decimal() || r.is_decimal() {
+        return decimal_arith_type(op, &l, &r);
+    }
+    if l == r {
+        return Ok(l);
+    }
+    if l.is_integer() && r.is_integer() {
+        return Ok(DataType::Int64);
+    }
+    Err(Error::Plan(format!("incompatible types {l} and {r}")))
+}
+
+fn decimal_arith_type(op: BinaryOp, l: &DataType, r: &DataType) -> Result<DataType> {
+    let (p1, s1) = decimal_parts(l)
+        .or_else(|| int_as_decimal(l))
+        .ok_or_else(|| Error::Plan(format!("arithmetic requires numeric, got {l}")))?;
+    let (p2, s2) = decimal_parts(r)
+        .or_else(|| int_as_decimal(r))
+        .ok_or_else(|| Error::Plan(format!("arithmetic requires numeric, got {r}")))?;
+    let (precision, scale) = match op {
+        BinaryOp::Add | BinaryOp::Sub => {
+            let scale = s1.max(s2);
+            ((p1 - s1).max(p2 - s2) + scale + 1, scale)
+        }
+        BinaryOp::Mul => (p1 + p2 + 1, s1 + s2),
+        BinaryOp::Div => {
+            let scale = 6.max(s1 + p2 + 1);
+            (p1 - s1 + s2 + scale, scale)
+        }
+        _ => return Err(Error::Plan("not arithmetic".into())),
+    };
+    decimal_arrow(precision, scale)
+}
+
+/// Common DECIMAL type for CASE / coalesce / set-op widening.
+pub(crate) fn widen_decimal(l: &DataType, r: &DataType) -> Option<Result<DataType>> {
+    if !l.is_decimal() && !r.is_decimal() {
+        return None;
+    }
+    let (p1, s1) = decimal_parts(l).or_else(|| int_as_decimal(l))?;
+    let (p2, s2) = decimal_parts(r).or_else(|| int_as_decimal(r))?;
+    let scale = s1.max(s2);
+    let precision = (p1 - s1).max(p2 - s2) + scale;
+    Some(decimal_arrow(precision, scale))
+}
+
 fn eval_expr(expr: &Expr, batch: &Batch) -> Result<ArrayRef> {
     match expr {
         Expr::Column(name) => batch
@@ -169,7 +271,7 @@ fn eval_expr(expr: &Expr, batch: &Batch) -> Result<ArrayRef> {
         }
         Expr::Cast { expr, data_type } => {
             let child = eval_expr(expr, batch)?;
-            cast(child.as_ref(), data_type).map_err(eval_err)
+            cast_strict(child.as_ref(), data_type)
         }
         Expr::Case {
             operand,
@@ -193,16 +295,26 @@ fn eval_expr(expr: &Expr, batch: &Batch) -> Result<ArrayRef> {
 
 fn eval_binary(op: BinaryOp, left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef> {
     match op {
-        BinaryOp::Add => add(&left, &right).map_err(eval_err),
-        BinaryOp::Sub => sub(&left, &right).map_err(eval_err),
-        BinaryOp::Mul => mul(&left, &right).map_err(eval_err),
-        BinaryOp::Div => div(&left, &right).map_err(eval_err),
-        BinaryOp::Eq => cmp_array(eq(left, right)),
-        BinaryOp::NotEq => cmp_array(neq(left, right)),
-        BinaryOp::Lt => cmp_array(lt(left, right)),
-        BinaryOp::LtEq => cmp_array(lt_eq(left, right)),
-        BinaryOp::Gt => cmp_array(gt(left, right)),
-        BinaryOp::GtEq => cmp_array(gt_eq(left, right)),
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+            eval_arith(op, left, right)
+        }
+        BinaryOp::Eq
+        | BinaryOp::NotEq
+        | BinaryOp::Lt
+        | BinaryOp::LtEq
+        | BinaryOp::Gt
+        | BinaryOp::GtEq => {
+            let (left, right) = align_cmp(left, right)?;
+            match op {
+                BinaryOp::Eq => cmp_array(eq(&left, &right)),
+                BinaryOp::NotEq => cmp_array(neq(&left, &right)),
+                BinaryOp::Lt => cmp_array(lt(&left, &right)),
+                BinaryOp::LtEq => cmp_array(lt_eq(&left, &right)),
+                BinaryOp::Gt => cmp_array(gt(&left, &right)),
+                BinaryOp::GtEq => cmp_array(gt_eq(&left, &right)),
+                _ => unreachable!("comparison ops only"),
+            }
+        }
         BinaryOp::And => {
             let out = and_kleene(as_bool(left)?, as_bool(right)?).map_err(eval_err)?;
             Ok(Arc::new(out))
@@ -212,6 +324,106 @@ fn eval_binary(op: BinaryOp, left: &ArrayRef, right: &ArrayRef) -> Result<ArrayR
             Ok(Arc::new(out))
         }
     }
+}
+
+fn eval_arith(op: BinaryOp, left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef> {
+    let out_ty = numeric_arith_type(op, left.data_type().clone(), right.data_type().clone())?;
+    let left = align_arith_operand(left, &out_ty)?;
+    let right = align_arith_operand(right, &out_ty)?;
+    let raw = match op {
+        BinaryOp::Add => add(&left, &right),
+        BinaryOp::Sub => sub(&left, &right),
+        BinaryOp::Mul => mul(&left, &right),
+        BinaryOp::Div => div(&left, &right),
+        _ => unreachable!("eval_arith is only called for arithmetic"),
+    }
+    .map_err(eval_err)?;
+    if raw.data_type() == &out_ty {
+        Ok(raw)
+    } else {
+        cast_strict(raw.as_ref(), &out_ty)
+    }
+}
+
+/// Promote to the result physical decimal width while keeping the operand's own
+/// precision and scale, so kernels apply scale rules once.
+fn align_arith_operand(array: &ArrayRef, result: &DataType) -> Result<ArrayRef> {
+    if array.data_type() == result {
+        return Ok(array.clone());
+    }
+    if !result.is_decimal() {
+        return align_numeric(array, result);
+    }
+    let Some((p, s)) =
+        decimal_parts(array.data_type()).or_else(|| int_as_decimal(array.data_type()))
+    else {
+        return align_numeric(array, result);
+    };
+    let aligned = decimal_same_width(p, s, result)?;
+    align_numeric(array, &aligned)
+}
+
+fn decimal_same_width(precision: i32, scale: i32, result: &DataType) -> Result<DataType> {
+    if scale < 0 || scale > precision {
+        return decimal_arrow(precision, scale);
+    }
+    let max = match result {
+        DataType::Decimal32(_, _) => 9,
+        DataType::Decimal64(_, _) => 18,
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => DECIMAL_MAX_PRECISION,
+        _ => return decimal_arrow(precision, scale),
+    };
+    if precision < 1 || precision > max {
+        return decimal_arrow(precision, scale);
+    }
+    let p = precision as u8;
+    let s = scale as i8;
+    Ok(match result {
+        DataType::Decimal32(_, _) => DataType::Decimal32(p, s),
+        DataType::Decimal64(_, _) => DataType::Decimal64(p, s),
+        DataType::Decimal128(_, _) => DataType::Decimal128(p, s),
+        DataType::Decimal256(_, _) => DataType::Decimal256(p, s),
+        _ => decimal_arrow(precision, scale)?,
+    })
+}
+
+fn align_numeric(array: &ArrayRef, dt: &DataType) -> Result<ArrayRef> {
+    if array.data_type() == dt {
+        Ok(array.clone())
+    } else {
+        cast_strict(array.as_ref(), dt)
+    }
+}
+
+fn align_cmp(left: &ArrayRef, right: &ArrayRef) -> Result<(ArrayRef, ArrayRef)> {
+    let l = left.data_type();
+    let r = right.data_type();
+    if l == r {
+        return Ok((left.clone(), right.clone()));
+    }
+    let common = if l.is_floating() || r.is_floating() {
+        DataType::Float64
+    } else if let Some(dt) = widen_decimal(l, r) {
+        dt?
+    } else {
+        return Ok((left.clone(), right.clone()));
+    };
+    Ok((
+        align_numeric(left, &common)?,
+        align_numeric(right, &common)?,
+    ))
+}
+
+fn cast_strict(array: &dyn Array, dt: &DataType) -> Result<ArrayRef> {
+    cast_with_options(
+        array,
+        dt,
+        &CastOptions {
+            safe: false,
+            ..CastOptions::default()
+        },
+    )
+    .map_err(eval_err)
 }
 
 fn eval_unary(op: UnaryOp, child: &ArrayRef) -> Result<ArrayRef> {
@@ -348,6 +560,36 @@ fn map_utf8_i64(array: &ArrayRef, f: impl Fn(&str) -> i64) -> Result<ArrayRef> {
 
 fn eval_abs(child: &ArrayRef) -> Result<ArrayRef> {
     Ok(match child.data_type() {
+        DataType::Decimal32(p, s) => {
+            let out = child
+                .as_primitive::<Decimal32Type>()
+                .unary::<_, Decimal32Type>(|v| v.saturating_abs());
+            Arc::new(out.with_precision_and_scale(*p, *s).map_err(eval_err)?)
+        }
+        DataType::Decimal64(p, s) => {
+            let out = child
+                .as_primitive::<Decimal64Type>()
+                .unary::<_, Decimal64Type>(|v| v.saturating_abs());
+            Arc::new(out.with_precision_and_scale(*p, *s).map_err(eval_err)?)
+        }
+        DataType::Decimal128(p, s) => {
+            let out = child
+                .as_primitive::<Decimal128Type>()
+                .unary::<_, Decimal128Type>(|v| v.saturating_abs());
+            Arc::new(out.with_precision_and_scale(*p, *s).map_err(eval_err)?)
+        }
+        DataType::Decimal256(p, s) => {
+            let out = child
+                .as_primitive::<Decimal256Type>()
+                .unary::<_, Decimal256Type>(|v| {
+                    if v < i256::from_i128(0) {
+                        v.neg_wrapping()
+                    } else {
+                        v
+                    }
+                });
+            Arc::new(out.with_precision_and_scale(*p, *s).map_err(eval_err)?)
+        }
         DataType::Int8 => Arc::new(
             child
                 .as_primitive::<Int8Type>()
@@ -688,6 +930,85 @@ mod tests {
         assert_eq!(
             i64_values(&coalesced.eval(&batch).unwrap()),
             vec![Some(1), Some(99), Some(3)]
+        );
+    }
+
+    #[test]
+    fn decimal_cast_and_add() {
+        let batch = batch_i64_utf8(vec![Some(1), None, Some(3)], vec![None, None, None]);
+        let as_dec = Expr::Cast {
+            expr: Box::new(Expr::column("id")),
+            data_type: DataType::Decimal64(10, 2),
+        };
+        let out = as_dec.eval(&batch).unwrap();
+        assert_eq!(out.data_type(), &DataType::Decimal64(10, 2));
+        let vals: Vec<Option<i64>> = out
+            .as_primitive::<arrow::datatypes::Decimal64Type>()
+            .iter()
+            .collect();
+        assert_eq!(vals, vec![Some(100), None, Some(300)]);
+
+        let add = Expr::Binary(
+            BinaryOp::Add,
+            Box::new(Expr::Cast {
+                expr: Box::new(Expr::lit_utf8("1.50")),
+                data_type: DataType::Decimal64(10, 2),
+            }),
+            Box::new(Expr::Cast {
+                expr: Box::new(Expr::lit_utf8("2.25")),
+                data_type: DataType::Decimal64(10, 2),
+            }),
+        );
+        let out = add.eval(&batch).unwrap();
+        assert_eq!(out.data_type(), &DataType::Decimal64(11, 2));
+        let vals: Vec<Option<i64>> = out
+            .as_primitive::<arrow::datatypes::Decimal64Type>()
+            .iter()
+            .collect();
+        assert_eq!(vals, vec![Some(375), Some(375), Some(375)]);
+
+        let overflow = Expr::Cast {
+            expr: Box::new(Expr::lit_i64(1000)),
+            data_type: DataType::Decimal32(3, 2),
+        };
+        assert!(overflow.eval(&batch).is_err());
+
+        let mul = Expr::Binary(
+            BinaryOp::Mul,
+            Box::new(Expr::Cast {
+                expr: Box::new(Expr::lit_utf8("999.9")),
+                data_type: DataType::Decimal32(4, 1),
+            }),
+            Box::new(Expr::Cast {
+                expr: Box::new(Expr::lit_utf8("999.9")),
+                data_type: DataType::Decimal32(4, 1),
+            }),
+        );
+        let out = mul.eval(&batch).unwrap();
+        assert_eq!(out.data_type(), &DataType::Decimal32(9, 2));
+        let vals: Vec<Option<i32>> = out
+            .as_primitive::<arrow::datatypes::Decimal32Type>()
+            .iter()
+            .collect();
+        assert_eq!(
+            vals,
+            vec![Some(99_980_001), Some(99_980_001), Some(99_980_001)]
+        );
+
+        let eq = Expr::Binary(
+            BinaryOp::Eq,
+            Box::new(Expr::Cast {
+                expr: Box::new(Expr::lit_i64(1)),
+                data_type: DataType::Decimal64(10, 2),
+            }),
+            Box::new(Expr::Cast {
+                expr: Box::new(Expr::lit_i64(1)),
+                data_type: DataType::Decimal64(10, 1),
+            }),
+        );
+        assert_eq!(
+            bool_values(&eq.eval(&batch).unwrap()),
+            vec![Some(true), Some(true), Some(true)]
         );
     }
 

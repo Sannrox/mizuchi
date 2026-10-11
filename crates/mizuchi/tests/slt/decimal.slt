@@ -1,6 +1,5 @@
-# DECIMAL. CAST of integer/float/text executes. DECIMAL SQL types and
-# arithmetic fail closed (NotImplemented SQL type). Arrow Decimal* is accepted
-# at the schema boundary (see schema unit tests).
+# DECIMAL. CAST of integer/float/text and DECIMAL/NUMERIC (Arrow Decimal*)
+# execute. Overflow and precision above 38 fail closed.
 
 query T
 SELECT CAST(1 AS TEXT)
@@ -17,20 +16,22 @@ SELECT CAST(1.5 AS DOUBLE PRECISION)
 ----
 1.5
 
-skipif mizuchi
 query R
 SELECT CAST(1 AS DECIMAL(10, 2))
 ----
 1.00
 
-skipif mizuchi
 query R
 SELECT CAST('1.50' AS DECIMAL(10, 2)) + CAST('2.25' AS DECIMAL(10, 2))
 ----
 3.75
 
-skipif mizuchi
 query R
 SELECT CAST(CAST(3 AS DECIMAL(10, 2)) AS DOUBLE PRECISION)
 ----
 3
+
+query R
+SELECT CAST('999.9' AS DECIMAL(4, 1)) * CAST('999.9' AS DECIMAL(4, 1))
+----
+999800.01
