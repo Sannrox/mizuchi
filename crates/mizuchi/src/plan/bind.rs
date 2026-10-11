@@ -327,6 +327,7 @@ fn bind_table_factor(factor: &TableFactor, catalog: &Catalog) -> Result<BoundFro
                     alias: alias_name,
                     projection: None,
                     filters: Vec::new(),
+                    stats: catalog.stats(&table).cloned(),
                 },
                 scope: Scope::from_schema(Some(qualifier), schema),
             })

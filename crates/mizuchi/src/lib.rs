@@ -18,8 +18,10 @@ pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
 pub use error::Error;
 pub use exec::Session;
 pub use expr::{BinaryOp, Expr, UnaryOp};
-pub use opt::optimize;
-pub use plan::{Catalog, JoinType, LogicalPlan, plan_sql};
+pub use opt::{estimate_rows, optimize};
+pub use plan::{
+    Catalog, ColumnStats, JoinType, LogicalPlan, TableStats, plan_sql, table_stats_from_batches,
+};
 pub use read::{
     ColumnRange, CsvReadOptions, ParquetReadOptions, RowGroupStats, read_csv, read_parquet,
     row_group_cannot_match,
