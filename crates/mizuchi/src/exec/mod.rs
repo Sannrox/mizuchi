@@ -18,6 +18,7 @@ mod report;
 mod schedule;
 mod sort;
 mod stage;
+mod stream;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -44,6 +45,7 @@ pub use merge::MergeStats;
 pub use metrics::OperatorMetrics;
 pub use op::{CpuLowering, Lowering, Operator};
 pub use report::{InputScan, OutputWrite, QueryReport, QueryResult};
+pub use stream::{EventWindow, StreamOutput, StreamQuery, StreamQueryConfig, StreamTrigger};
 
 /// Cooperative cancellation flag. Operators check it between morsels.
 #[derive(Clone, Debug, Default)]
@@ -448,6 +450,16 @@ impl Session {
             batches.push(Batch::from_arrow(batch)?);
         }
         self.register(name, schema, batches)
+    }
+
+    /// Open a continuous query. Recovers from `cfg.checkpoint` when metadata
+    /// from a previous run is present. Checkpoint and sink paths must pass
+    /// the write allow-list (and the read allow-list, for recovery).
+    pub fn stream_query(&self, schema: SchemaRef, cfg: StreamQueryConfig) -> Result<StreamQuery> {
+        config::assert_allowed(&cfg.checkpoint, &self.allowed_write_paths)?;
+        config::assert_allowed(&cfg.checkpoint, &self.allowed_read_paths)?;
+        config::assert_allowed(&cfg.sink, &self.allowed_write_paths)?;
+        stream::StreamQuery::open_or_new(schema, cfg, self.cancel.clone())
     }
 
     /// Write batches as Parquet after the write allow-list check.
