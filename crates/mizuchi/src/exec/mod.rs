@@ -9,6 +9,7 @@ mod sort;
 mod stage;
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use arrow::array::{Array, BooleanArray, RecordBatch, RecordBatchOptions};
 use arrow::compute::filter_record_batch;
@@ -27,6 +28,8 @@ pub struct Session {
     policy: BatchPolicy,
     /// Parallel tasks per stage. Default 1 keeps the pull iterator path.
     workers: usize,
+    /// Caller-provided directory for Arrow IPC shuffle files.
+    shuffle_dir: Option<PathBuf>,
 }
 
 impl Default for Session {
@@ -35,6 +38,7 @@ impl Default for Session {
             tables: BTreeMap::new(),
             policy: BatchPolicy::default(),
             workers: 1,
+            shuffle_dir: None,
         }
     }
 }
@@ -59,6 +63,13 @@ impl Session {
         }
         self.workers = n;
         Ok(self)
+    }
+
+    /// Directory for shuffle files written as Arrow IPC. The engine never
+    /// opens network paths; the caller supplies the directory.
+    pub fn with_shuffle_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.shuffle_dir = Some(dir.into());
+        self
     }
 
     /// Register an in-memory table. All batches must share `schema`.
