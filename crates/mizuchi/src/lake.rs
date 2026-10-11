@@ -2,11 +2,15 @@
 //!
 //! Writes use the published log formats: Delta `_delta_log` JSON commits and
 //! Iceberg `metadata/vN.metadata.json` snapshots. Data files are Parquet.
-//! The next log/metadata file is created with `create_new`; if it already
+//! The next log/metadata file is created exclusively (`create_new` on a
+//! path, [`object_store::PutMode::Create`] on an object store); if it already
 //! exists the writer returns [`Error::Io`] instead of replacing a commit.
 //! Time travel replays the log to a version or timestamp. Schema evolution
 //! records add, rename, and widen in the format metadata and projects old
 //! files onto the current schema on read.
+//!
+//! Local paths and caller-supplied [`ObjectStore`] handles share one FileIO
+//! seam. The engine never constructs an object store or opens credentials.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -19,13 +23,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arrow::array::{ArrayRef, new_null_array};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use bytes::Bytes;
+use futures::TryStreamExt;
+use futures::executor::block_on;
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::{Value, json};
 
 use crate::batch::Batch;
 use crate::error::{Error, Result};
-use crate::read::{ParquetReadOptions, read_parquet};
 use crate::write::WriteMode;
 
 /// Snapshot identity returned after a commit or read.
@@ -82,6 +90,253 @@ pub enum SchemaEvolution {
 
 static FILE_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// FileIO for lake commits: local paths or a caller-supplied object store.
+trait LakeIo {
+    fn label(&self) -> String;
+    fn put_create(&self, rel: &str, bytes: &[u8]) -> Result<()>;
+    fn put(&self, rel: &str, bytes: &[u8]) -> Result<()>;
+    fn get(&self, rel: &str) -> Result<Vec<u8>>;
+    fn list(&self, prefix: &str) -> Result<Vec<String>>;
+    fn write_parquet(
+        &self,
+        rel: &str,
+        batches: &[Batch],
+        schema: &Schema,
+        physical: &BTreeMap<String, String>,
+    ) -> Result<u64> {
+        let file_schema = physical_schema(schema, physical);
+        let mut buf = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, file_schema.clone(), None)
+                .map_err(|e| Error::Io(e.to_string()))?;
+            for batch in batches {
+                let projected = to_physical_batch(batch, schema, physical)?;
+                if projected.num_rows() > 0 {
+                    writer
+                        .write(projected.as_arrow())
+                        .map_err(|e| Error::Io(e.to_string()))?;
+                }
+            }
+            writer.close().map_err(|e| Error::Io(e.to_string()))?;
+        }
+        let size = buf.len() as u64;
+        self.put_create(rel, &buf)?;
+        Ok(size)
+    }
+    fn read_parquet(&self, rel: &str) -> Result<Vec<Batch>> {
+        read_parquet_bytes(rel, &self.get(rel)?)
+    }
+}
+
+struct PathIo {
+    root: PathBuf,
+}
+
+impl PathIo {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+}
+
+impl LakeIo for PathIo {
+    fn label(&self) -> String {
+        self.root.display().to_string()
+    }
+
+    fn put_create(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        exclusive_create(&confined(&self.root, rel)?, bytes)
+    }
+
+    fn put(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        let path = confined(&self.root, rel)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+        }
+        fs::write(&path, bytes).map_err(|e| io_err(&path, e))
+    }
+
+    fn get(&self, rel: &str) -> Result<Vec<u8>> {
+        let path = confined(&self.root, rel)?;
+        fs::read(&path).map_err(|e| io_err(&path, e))
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        let base = if prefix.is_empty() {
+            self.root.clone()
+        } else {
+            confined(&self.root, prefix)?
+        };
+        walk_files(&base, &self.root, &mut out)?;
+        out.sort();
+        Ok(out)
+    }
+
+    fn write_parquet(
+        &self,
+        rel: &str,
+        batches: &[Batch],
+        schema: &Schema,
+        physical: &BTreeMap<String, String>,
+    ) -> Result<u64> {
+        let path = confined(&self.root, rel)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+        }
+        let file_schema = physical_schema(schema, physical);
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        let file = match opts.open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(Error::Io(format!(
+                    "concurrent writer conflict: {}",
+                    path.display()
+                )));
+            }
+            Err(e) => return Err(io_err(&path, e)),
+        };
+        let mut writer = ArrowWriter::try_new(file, file_schema.clone(), None)
+            .map_err(|e| Error::Io(e.to_string()))?;
+        for batch in batches {
+            let projected = to_physical_batch(batch, schema, physical)?;
+            if projected.num_rows() > 0 {
+                writer
+                    .write(projected.as_arrow())
+                    .map_err(|e| Error::Io(e.to_string()))?;
+            }
+        }
+        writer.close().map_err(|e| Error::Io(e.to_string()))?;
+        Ok(fs::metadata(&path).map(|m| m.len()).unwrap_or(0))
+    }
+
+    fn read_parquet(&self, rel: &str) -> Result<Vec<Batch>> {
+        let path = confined(&self.root, rel)?;
+        let file = File::open(&path).map_err(|e| io_err(&path, e))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+        let reader = builder
+            .with_batch_size(crate::batch::DEFAULT_MAX_ROWS)
+            .build()
+            .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+        let mut out = Vec::new();
+        for item in reader {
+            let batch = item.map_err(|e| Error::Io(e.to_string()))?;
+            out.push(Batch::from_arrow(batch)?);
+        }
+        Ok(out)
+    }
+}
+
+struct StoreIo<'a> {
+    store: &'a dyn ObjectStore,
+    prefix: String,
+}
+
+impl<'a> StoreIo<'a> {
+    fn new(store: &'a dyn ObjectStore, prefix: &str) -> Self {
+        Self {
+            store,
+            prefix: prefix.trim_matches('/').to_string(),
+        }
+    }
+
+    fn loc(&self, rel: &str) -> Result<ObjectPath> {
+        check_rel(rel)?;
+        let root = crate::store::object_path(&self.prefix)?;
+        crate::store::join_path(&root, rel)
+    }
+}
+
+impl LakeIo for StoreIo<'_> {
+    fn label(&self) -> String {
+        self.prefix.clone()
+    }
+
+    fn put_create(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        let loc = self.loc(rel)?;
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        match block_on(
+            self.store
+                .put_opts(&loc, PutPayload::from(bytes.to_vec()), opts),
+        ) {
+            Ok(_) => Ok(()),
+            Err(object_store::Error::AlreadyExists { path, .. }) => {
+                Err(Error::Io(format!("concurrent writer conflict: {path}")))
+            }
+            Err(e) => Err(crate::store::store_err(e)),
+        }
+    }
+
+    fn put(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        let loc = self.loc(rel)?;
+        block_on(self.store.put(&loc, PutPayload::from(bytes.to_vec())))
+            .map(|_| ())
+            .map_err(crate::store::store_err)
+    }
+
+    fn get(&self, rel: &str) -> Result<Vec<u8>> {
+        let loc = self.loc(rel)?;
+        let get = block_on(self.store.get(&loc)).map_err(crate::store::store_err)?;
+        let bytes = block_on(get.bytes()).map_err(crate::store::store_err)?;
+        Ok(bytes.to_vec())
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        check_rel(prefix)?;
+        let loc = self.loc(prefix)?;
+        let metas: Vec<object_store::ObjectMeta> =
+            block_on(self.store.list(Some(&loc)).try_collect()).map_err(crate::store::store_err)?;
+        let mut out: Vec<String> = metas
+            .into_iter()
+            .map(|m| crate::store::relative_to(&m.location, &self.prefix))
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+}
+
+fn walk_files(dir: &Path, root: &Path, out: &mut Vec<String>) -> Result<()> {
+    let ents = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io_err(dir, e)),
+    };
+    for ent in ents {
+        let ent = ent.map_err(|e| io_err(dir, e))?;
+        let path = ent.path();
+        if path.is_dir() {
+            walk_files(&path, root, out)?;
+        } else {
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(())
+}
+
+fn check_rel(rel: &str) -> Result<()> {
+    if rel.is_empty() {
+        return Ok(());
+    }
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return Err(Error::Io(format!("path escapes table root: {rel}")));
+    }
+    for c in rel_path.components() {
+        match c {
+            Component::Normal(_) | Component::CurDir => {}
+            _ => return Err(Error::Io(format!("path escapes table root: {rel}"))),
+        }
+    }
+    Ok(())
+}
+
 /// Write `batches` as a Delta table at `dest`. An existing table gets a new
 /// commit: [`WriteMode::Overwrite`] removes prior data files, [`WriteMode::Append`]
 /// adds files beside them.
@@ -100,24 +355,24 @@ pub fn write_delta_at(
     mode: WriteMode,
     expected: Option<i64>,
 ) -> Result<LakeSnapshot> {
-    write_delta_inner(dest.as_ref(), batches, mode, expected)
+    write_delta_io(&PathIo::new(dest.as_ref()), batches, mode, expected)
 }
 
 /// Read a Delta table, optionally at a past version or timestamp.
 pub fn read_delta(dest: impl AsRef<Path>, travel: TimeTravel) -> Result<Vec<Batch>> {
-    let snap = delta_snapshot(dest.as_ref(), travel)?;
-    read_files(dest.as_ref(), &snap.files, &snap.schema, &snap.physical)
+    let io = PathIo::new(dest.as_ref());
+    let snap = delta_replay(&io, travel)?;
+    read_files(&io, &snap.files, &snap.schema, &snap.physical)
 }
 
 /// Current Delta snapshot metadata.
 pub fn delta_head(dest: impl AsRef<Path>) -> Result<LakeSnapshot> {
-    let snap = delta_snapshot(dest.as_ref(), TimeTravel::Latest)?;
-    Ok(snap.meta)
+    Ok(delta_replay(&PathIo::new(dest.as_ref()), TimeTravel::Latest)?.meta)
 }
 
 /// Commit a schema change to a Delta table.
 pub fn evolve_delta(dest: impl AsRef<Path>, change: SchemaEvolution) -> Result<LakeSnapshot> {
-    evolve_delta_inner(dest.as_ref(), change)
+    evolve_delta_io(&PathIo::new(dest.as_ref()), change)
 }
 
 /// Write `batches` as an Iceberg table at `dest`.
@@ -136,24 +391,116 @@ pub fn write_iceberg_at(
     mode: WriteMode,
     expected: Option<i64>,
 ) -> Result<LakeSnapshot> {
-    write_iceberg_inner(dest.as_ref(), batches, mode, expected)
+    write_iceberg_io(&PathIo::new(dest.as_ref()), batches, mode, expected)
 }
 
 /// Read an Iceberg table, optionally at a past snapshot.
 pub fn read_iceberg(dest: impl AsRef<Path>, travel: TimeTravel) -> Result<Vec<Batch>> {
-    let snap = iceberg_snapshot(dest.as_ref(), travel)?;
-    read_files(dest.as_ref(), &snap.files, &snap.schema, &snap.physical)
+    let io = PathIo::new(dest.as_ref());
+    let snap = iceberg_replay(&io, travel)?;
+    read_files(&io, &snap.files, &snap.schema, &snap.physical)
 }
 
 /// Current Iceberg snapshot metadata.
 pub fn iceberg_head(dest: impl AsRef<Path>) -> Result<LakeSnapshot> {
-    let snap = iceberg_snapshot(dest.as_ref(), TimeTravel::Latest)?;
-    Ok(snap.meta)
+    Ok(iceberg_replay(&PathIo::new(dest.as_ref()), TimeTravel::Latest)?.meta)
 }
 
 /// Commit a schema change to an Iceberg table.
 pub fn evolve_iceberg(dest: impl AsRef<Path>, change: SchemaEvolution) -> Result<LakeSnapshot> {
-    evolve_iceberg_inner(dest.as_ref(), change)
+    evolve_iceberg_io(&PathIo::new(dest.as_ref()), change)
+}
+
+/// [`write_delta`] against a caller-supplied object store prefix.
+pub fn write_delta_store(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    batches: &[Batch],
+    mode: WriteMode,
+) -> Result<LakeSnapshot> {
+    write_delta_store_at(store, prefix, batches, mode, None)
+}
+
+/// [`write_delta_store`] that fails if the current version is not `expected`.
+pub fn write_delta_store_at(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    batches: &[Batch],
+    mode: WriteMode,
+    expected: Option<i64>,
+) -> Result<LakeSnapshot> {
+    write_delta_io(&StoreIo::new(store, prefix), batches, mode, expected)
+}
+
+/// Read a Delta table from an object store prefix.
+pub fn read_delta_store(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    travel: TimeTravel,
+) -> Result<Vec<Batch>> {
+    let io = StoreIo::new(store, prefix);
+    let snap = delta_replay(&io, travel)?;
+    read_files(&io, &snap.files, &snap.schema, &snap.physical)
+}
+
+/// Current Delta snapshot on an object store prefix.
+pub fn delta_head_store(store: &dyn ObjectStore, prefix: &str) -> Result<LakeSnapshot> {
+    Ok(delta_replay(&StoreIo::new(store, prefix), TimeTravel::Latest)?.meta)
+}
+
+/// Commit a schema change to a Delta table on an object store prefix.
+pub fn evolve_delta_store(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    change: SchemaEvolution,
+) -> Result<LakeSnapshot> {
+    evolve_delta_io(&StoreIo::new(store, prefix), change)
+}
+
+/// [`write_iceberg`] against a caller-supplied object store prefix.
+pub fn write_iceberg_store(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    batches: &[Batch],
+    mode: WriteMode,
+) -> Result<LakeSnapshot> {
+    write_iceberg_store_at(store, prefix, batches, mode, None)
+}
+
+/// [`write_iceberg_store`] that fails if the current version is not `expected`.
+pub fn write_iceberg_store_at(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    batches: &[Batch],
+    mode: WriteMode,
+    expected: Option<i64>,
+) -> Result<LakeSnapshot> {
+    write_iceberg_io(&StoreIo::new(store, prefix), batches, mode, expected)
+}
+
+/// Read an Iceberg table from an object store prefix.
+pub fn read_iceberg_store(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    travel: TimeTravel,
+) -> Result<Vec<Batch>> {
+    let io = StoreIo::new(store, prefix);
+    let snap = iceberg_replay(&io, travel)?;
+    read_files(&io, &snap.files, &snap.schema, &snap.physical)
+}
+
+/// Current Iceberg snapshot on an object store prefix.
+pub fn iceberg_head_store(store: &dyn ObjectStore, prefix: &str) -> Result<LakeSnapshot> {
+    Ok(iceberg_replay(&StoreIo::new(store, prefix), TimeTravel::Latest)?.meta)
+}
+
+/// Commit a schema change to an Iceberg table on an object store prefix.
+pub fn evolve_iceberg_store(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    change: SchemaEvolution,
+) -> Result<LakeSnapshot> {
+    evolve_iceberg_io(&StoreIo::new(store, prefix), change)
 }
 
 struct Resolved {
@@ -163,18 +510,15 @@ struct Resolved {
     physical: BTreeMap<String, String>,
 }
 
-fn write_delta_inner(
-    dest: &Path,
+fn write_delta_io(
+    io: &dyn LakeIo,
     batches: &[Batch],
     mode: WriteMode,
     expected: Option<i64>,
 ) -> Result<LakeSnapshot> {
     let schema = schema_of(batches)?;
-    fs::create_dir_all(dest).map_err(|e| io_err(dest, e))?;
-    let log_dir = dest.join("_delta_log");
-    fs::create_dir_all(&log_dir).map_err(|e| io_err(&log_dir, e))?;
     let now = now_ms();
-    let current = existing_delta(dest)?;
+    let current = existing_delta(io)?;
     if let Some(exp) = expected {
         let got = current.as_ref().map(|c| c.meta.version);
         if got != Some(exp) {
@@ -193,8 +537,7 @@ fn write_delta_inner(
         _ => schema,
     };
     let data_rel = unique_data_rel(next_ver, "");
-    let data_path = confined(dest, &data_rel)?;
-    let size = write_parquet_file(&data_path, batches, &schema, &physical)?;
+    let size = io.write_parquet(&data_rel, batches, &schema, &physical)?;
 
     let mut actions = Vec::new();
     actions.push(json!({"commitInfo": {"timestamp": now, "operation": "WRITE"}}));
@@ -207,7 +550,7 @@ fn write_delta_inner(
         }
         actions.push(json!({
             "metaData": {
-                "id": table_id(dest, now),
+                "id": table_id(&io.label(), now),
                 "format": {"provider": "parquet", "options": {}},
                 "schemaString": schema_string,
                 "partitionColumns": [],
@@ -238,7 +581,7 @@ fn write_delta_inner(
             "dataChange": true
         }
     }));
-    commit_delta_log(&log_dir, next_ver, &actions)?;
+    commit_delta_log(io, next_ver, &actions)?;
     let mut files = match (mode, current) {
         (WriteMode::Append, Some(cur)) => cur.files,
         _ => Vec::new(),
@@ -253,8 +596,8 @@ fn write_delta_inner(
     })
 }
 
-fn evolve_delta_inner(dest: &Path, change: SchemaEvolution) -> Result<LakeSnapshot> {
-    let cur = delta_replay(dest, TimeTravel::Latest)?;
+fn evolve_delta_io(io: &dyn LakeIo, change: SchemaEvolution) -> Result<LakeSnapshot> {
+    let cur = delta_replay(io, TimeTravel::Latest)?;
     let (schema, physical) = apply_evolution(cur.schema, cur.physical, change)?;
     let now = now_ms();
     let next_ver = cur.meta.version + 1;
@@ -263,7 +606,7 @@ fn evolve_delta_inner(dest: &Path, change: SchemaEvolution) -> Result<LakeSnapsh
         json!({"commitInfo": {"timestamp": now, "operation": "CHANGE COLUMN"}}),
         json!({
             "metaData": {
-                "id": table_id(dest, now),
+                "id": table_id(&io.label(), now),
                 "format": {"provider": "parquet", "options": {}},
                 "schemaString": schema_string,
                 "partitionColumns": [],
@@ -272,7 +615,7 @@ fn evolve_delta_inner(dest: &Path, change: SchemaEvolution) -> Result<LakeSnapsh
             }
         }),
     ];
-    commit_delta_log(&dest.join("_delta_log"), next_ver, &actions)?;
+    commit_delta_log(io, next_ver, &actions)?;
     Ok(LakeSnapshot {
         format: "delta".into(),
         version: next_ver,
@@ -282,24 +625,10 @@ fn evolve_delta_inner(dest: &Path, change: SchemaEvolution) -> Result<LakeSnapsh
     })
 }
 
-fn delta_snapshot(dest: &Path, travel: TimeTravel) -> Result<Resolved> {
-    delta_replay(dest, travel)
-}
-
-fn delta_replay(dest: &Path, travel: TimeTravel) -> Result<Resolved> {
-    let log_dir = dest.join("_delta_log");
-    if !log_dir.is_dir() {
-        return Err(Error::Io(format!(
-            "{} is not a Delta table",
-            dest.display()
-        )));
-    }
-    let mut versions = list_delta_versions(&log_dir)?;
+fn delta_replay(io: &dyn LakeIo, travel: TimeTravel) -> Result<Resolved> {
+    let mut versions = list_delta_versions(io)?;
     if versions.is_empty() {
-        return Err(Error::Io(format!(
-            "{} has no Delta commits",
-            dest.display()
-        )));
+        return Err(Error::Io(format!("{} is not a Delta table", io.label())));
     }
     versions.sort_unstable();
     let mut files: Vec<String> = Vec::new();
@@ -314,8 +643,9 @@ fn delta_replay(dest: &Path, travel: TimeTravel) -> Result<Resolved> {
     }
     let mut applied_any = false;
     for ver in &versions {
-        let path = log_dir.join(format!("{ver:020}.json"));
-        let text = fs::read_to_string(&path).map_err(|e| io_err(&path, e))?;
+        let rel = format!("_delta_log/{ver:020}.json");
+        let text =
+            String::from_utf8(io.get(&rel)?).map_err(|e| Error::Io(format!("delta log: {e}")))?;
         let mut ts = last_ts;
         let mut actions: Vec<Value> = Vec::new();
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -377,14 +707,11 @@ fn delta_replay(dest: &Path, travel: TimeTravel) -> Result<Resolved> {
     })
 }
 
-fn list_delta_versions(log_dir: &Path) -> Result<Vec<i64>> {
+fn list_delta_versions(io: &dyn LakeIo) -> Result<Vec<i64>> {
     let mut out = Vec::new();
-    let ents = fs::read_dir(log_dir).map_err(|e| io_err(log_dir, e))?;
-    for ent in ents {
-        let ent = ent.map_err(|e| io_err(log_dir, e))?;
-        let name = ent.file_name();
-        let name = name.to_string_lossy();
-        if let Some(stem) = name.strip_suffix(".json")
+    for name in io.list("_delta_log")? {
+        let file = name.rsplit('/').next().unwrap_or(&name);
+        if let Some(stem) = file.strip_suffix(".json")
             && let Ok(v) = stem.parse::<i64>()
         {
             out.push(v);
@@ -393,29 +720,24 @@ fn list_delta_versions(log_dir: &Path) -> Result<Vec<i64>> {
     Ok(out)
 }
 
-fn commit_delta_log(log_dir: &Path, version: i64, actions: &[Value]) -> Result<()> {
-    let path = log_dir.join(format!("{version:020}.json"));
+fn commit_delta_log(io: &dyn LakeIo, version: i64, actions: &[Value]) -> Result<()> {
     let mut body = String::new();
     for action in actions {
         body.push_str(&serde_json::to_string(action).map_err(|e| Error::Io(e.to_string()))?);
         body.push('\n');
     }
-    exclusive_create(&path, body.as_bytes())
+    io.put_create(&format!("_delta_log/{version:020}.json"), body.as_bytes())
 }
 
-fn write_iceberg_inner(
-    dest: &Path,
+fn write_iceberg_io(
+    io: &dyn LakeIo,
     batches: &[Batch],
     mode: WriteMode,
     expected: Option<i64>,
 ) -> Result<LakeSnapshot> {
     let schema = schema_of(batches)?;
-    let meta_dir = dest.join("metadata");
-    let data_dir = dest.join("data");
-    fs::create_dir_all(&meta_dir).map_err(|e| io_err(&meta_dir, e))?;
-    fs::create_dir_all(&data_dir).map_err(|e| io_err(&data_dir, e))?;
     let now = now_ms();
-    let current = existing_iceberg(dest)?;
+    let current = existing_iceberg(io)?;
     if let Some(exp) = expected {
         let got = current.as_ref().map(|c| c.meta.version);
         if got != Some(exp) {
@@ -435,7 +757,7 @@ fn write_iceberg_inner(
         _ => schema,
     };
     let data_rel = unique_data_rel(next_ver, "data/");
-    let size = write_parquet_file(&confined(dest, &data_rel)?, batches, &schema, &physical)?;
+    let size = io.write_parquet(&data_rel, batches, &schema, &physical)?;
     let mut files = match (mode, &current) {
         (WriteMode::Append, Some(cur)) => cur.files.clone(),
         _ => Vec::new(),
@@ -450,15 +772,15 @@ fn write_iceberg_inner(
             "file-size-in-bytes": if f == &data_rel { size } else { 0 },
         })).collect::<Vec<_>>(),
     });
-    exclusive_create(
-        &confined(dest, &manifest_rel)?,
+    io.put_create(
+        &manifest_rel,
         serde_json::to_string_pretty(&manifest)
             .map_err(|e| Error::Io(e.to_string()))?
             .as_bytes(),
     )?;
     let field_ids = field_ids_of(&schema, current.as_ref().map(|c| c.schema.as_ref()));
     let metadata = iceberg_metadata(
-        dest,
+        io,
         next_ver,
         snapshot_id,
         now,
@@ -468,15 +790,16 @@ fn write_iceberg_inner(
         &manifest_rel,
         current.as_ref(),
     )?;
-    let meta_path = meta_dir.join(format!("v{next_ver}.metadata.json"));
-    exclusive_create(
-        &meta_path,
+    io.put_create(
+        &format!("metadata/v{next_ver}.metadata.json"),
         serde_json::to_string_pretty(&metadata)
             .map_err(|e| Error::Io(e.to_string()))?
             .as_bytes(),
     )?;
-    fs::write(meta_dir.join("version-hint.text"), format!("{next_ver}"))
-        .map_err(|e| io_err(&meta_dir.join("version-hint.text"), e))?;
+    io.put(
+        "metadata/version-hint.text",
+        format!("{next_ver}").as_bytes(),
+    )?;
     Ok(LakeSnapshot {
         format: "iceberg".into(),
         version: next_ver,
@@ -486,8 +809,8 @@ fn write_iceberg_inner(
     })
 }
 
-fn evolve_iceberg_inner(dest: &Path, change: SchemaEvolution) -> Result<LakeSnapshot> {
-    let cur = iceberg_replay(dest, TimeTravel::Latest)?;
+fn evolve_iceberg_io(io: &dyn LakeIo, change: SchemaEvolution) -> Result<LakeSnapshot> {
+    let cur = iceberg_replay(io, TimeTravel::Latest)?;
     let (schema, physical) = apply_evolution(cur.schema.clone(), cur.physical.clone(), change)?;
     let now = now_ms();
     let next_ver = cur.meta.version + 1;
@@ -495,7 +818,7 @@ fn evolve_iceberg_inner(dest: &Path, change: SchemaEvolution) -> Result<LakeSnap
     let manifest_rel = format!("metadata/snap-{snapshot_id}.json");
     let field_ids = field_ids_of(&schema, Some(cur.schema.as_ref()));
     let metadata = iceberg_metadata(
-        dest,
+        io,
         next_ver,
         snapshot_id,
         now,
@@ -505,20 +828,16 @@ fn evolve_iceberg_inner(dest: &Path, change: SchemaEvolution) -> Result<LakeSnap
         &manifest_rel,
         Some(&cur),
     )?;
-    let meta_path = dest
-        .join("metadata")
-        .join(format!("v{next_ver}.metadata.json"));
-    exclusive_create(
-        &meta_path,
+    io.put_create(
+        &format!("metadata/v{next_ver}.metadata.json"),
         serde_json::to_string_pretty(&metadata)
             .map_err(|e| Error::Io(e.to_string()))?
             .as_bytes(),
     )?;
-    fs::write(
-        dest.join("metadata").join("version-hint.text"),
-        format!("{next_ver}"),
-    )
-    .map_err(|e| Error::Io(e.to_string()))?;
+    io.put(
+        "metadata/version-hint.text",
+        format!("{next_ver}").as_bytes(),
+    )?;
     Ok(LakeSnapshot {
         format: "iceberg".into(),
         version: next_ver,
@@ -528,20 +847,9 @@ fn evolve_iceberg_inner(dest: &Path, change: SchemaEvolution) -> Result<LakeSnap
     })
 }
 
-fn iceberg_snapshot(dest: &Path, travel: TimeTravel) -> Result<Resolved> {
-    iceberg_replay(dest, travel)
-}
-
-fn iceberg_replay(dest: &Path, travel: TimeTravel) -> Result<Resolved> {
-    let meta_dir = dest.join("metadata");
-    if !meta_dir.is_dir() {
-        return Err(Error::Io(format!(
-            "{} is not an Iceberg table",
-            dest.display()
-        )));
-    }
-    let latest = iceberg_latest_version(&meta_dir)?
-        .ok_or_else(|| Error::Io(format!("{} has no Iceberg metadata", dest.display())))?;
+fn iceberg_replay(io: &dyn LakeIo, travel: TimeTravel) -> Result<Resolved> {
+    let latest = iceberg_latest_version(io)?
+        .ok_or_else(|| Error::Io(format!("{} is not an Iceberg table", io.label())))?;
     let chosen = match travel {
         TimeTravel::Latest => latest,
         TimeTravel::Version(v) => {
@@ -553,7 +861,7 @@ fn iceberg_replay(dest: &Path, travel: TimeTravel) -> Result<Resolved> {
         TimeTravel::TimestampMs(want) => {
             let mut pick = None;
             for v in 1..=latest {
-                let md = read_json(&meta_dir.join(format!("v{v}.metadata.json")))?;
+                let md = read_json_io(io, &format!("metadata/v{v}.metadata.json"))?;
                 let ts = md
                     .get("last-updated-ms")
                     .and_then(Value::as_i64)
@@ -565,8 +873,7 @@ fn iceberg_replay(dest: &Path, travel: TimeTravel) -> Result<Resolved> {
             pick.ok_or_else(|| Error::Io(format!("no Iceberg snapshot at timestamp {want}")))?
         }
     };
-    let path = meta_dir.join(format!("v{chosen}.metadata.json"));
-    let md = read_json(&path)?;
+    let md = read_json_io(io, &format!("metadata/v{chosen}.metadata.json"))?;
     let schema = parse_iceberg_schema(&md)?;
     let physical = iceberg_physical(&md);
     let snap_id = md
@@ -577,7 +884,7 @@ fn iceberg_replay(dest: &Path, travel: TimeTravel) -> Result<Resolved> {
         .get("last-updated-ms")
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    let files = iceberg_files(dest, &md)?;
+    let files = iceberg_files(io, &md)?;
     Ok(Resolved {
         meta: LakeSnapshot {
             format: "iceberg".into(),
@@ -592,7 +899,7 @@ fn iceberg_replay(dest: &Path, travel: TimeTravel) -> Result<Resolved> {
     })
 }
 
-fn iceberg_files(dest: &Path, md: &Value) -> Result<Vec<String>> {
+fn iceberg_files(io: &dyn LakeIo, md: &Value) -> Result<Vec<String>> {
     let snaps = md
         .get("snapshots")
         .and_then(Value::as_array)
@@ -613,14 +920,9 @@ fn iceberg_files(dest: &Path, md: &Value) -> Result<Vec<String>> {
         .get("manifest-list")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Io("Iceberg snapshot missing manifest-list".into()))?;
-    let path = confined(dest, list)?;
-    if !path.is_file() {
-        return Err(Error::Io(format!(
-            "Iceberg manifest is missing: {}",
-            path.display()
-        )));
-    }
-    let man = read_json(&path)?;
+    check_rel(list)?;
+    let man = read_json_io(io, list)
+        .map_err(|e| Error::Io(format!("Iceberg manifest is missing: {list} ({e})")))?;
     let files = man
         .get("files")
         .and_then(Value::as_array)
@@ -631,7 +933,7 @@ fn iceberg_files(dest: &Path, md: &Value) -> Result<Vec<String>> {
             .get("file-path")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Io("Iceberg manifest missing file-path".into()))?;
-        let _ = confined(dest, rel)?;
+        check_rel(rel)?;
         out.push(rel.to_string());
     }
     Ok(out)
@@ -639,7 +941,7 @@ fn iceberg_files(dest: &Path, md: &Value) -> Result<Vec<String>> {
 
 #[allow(clippy::too_many_arguments)]
 fn iceberg_metadata(
-    dest: &Path,
+    io: &dyn LakeIo,
     version: i64,
     snapshot_id: i64,
     now: i64,
@@ -651,13 +953,9 @@ fn iceberg_metadata(
 ) -> Result<Value> {
     let mut snapshots = previous
         .and_then(|p| {
-            read_json(
-                &dest
-                    .join("metadata")
-                    .join(format!("v{}.metadata.json", p.meta.version)),
-            )
-            .ok()
-            .and_then(|m| m.get("snapshots").cloned())
+            read_json_io(io, &format!("metadata/v{}.metadata.json", p.meta.version))
+                .ok()
+                .and_then(|m| m.get("snapshots").cloned())
         })
         .unwrap_or(json!([]));
     let snap_entry = json!({
@@ -689,8 +987,8 @@ fn iceberg_metadata(
     }
     Ok(json!({
         "format-version": 2,
-        "table-uuid": table_id(dest, now),
-        "location": dest.display().to_string(),
+        "table-uuid": table_id(&io.label(), now),
+        "location": io.label(),
         "last-sequence-number": version,
         "last-updated-ms": now,
         "last-column-id": field_ids.values().copied().max().unwrap_or(0),
@@ -879,42 +1177,6 @@ fn is_widen(from: &DataType, to: &DataType) -> bool {
     )
 }
 
-fn write_parquet_file(
-    path: &Path,
-    batches: &[Batch],
-    schema: &Schema,
-    physical: &BTreeMap<String, String>,
-) -> Result<u64> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-    }
-    let file_schema = physical_schema(schema, physical);
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    let file = match opts.open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(Error::Io(format!(
-                "concurrent writer conflict: {}",
-                path.display()
-            )));
-        }
-        Err(e) => return Err(io_err(path, e)),
-    };
-    let mut writer = ArrowWriter::try_new(file, file_schema.clone(), None)
-        .map_err(|e| Error::Io(e.to_string()))?;
-    for batch in batches {
-        let projected = to_physical_batch(batch, schema, physical)?;
-        if projected.num_rows() > 0 {
-            writer
-                .write(projected.as_arrow())
-                .map_err(|e| Error::Io(e.to_string()))?;
-        }
-    }
-    writer.close().map_err(|e| Error::Io(e.to_string()))?;
-    Ok(fs::metadata(path).map(|m| m.len()).unwrap_or(0))
-}
-
 fn physical_schema(schema: &Schema, physical: &BTreeMap<String, String>) -> SchemaRef {
     let fields: Vec<Field> = schema
         .fields()
@@ -949,7 +1211,7 @@ fn to_physical_batch(
 }
 
 fn read_files(
-    dest: &Path,
+    io: &dyn LakeIo,
     files: &[String],
     schema: &SchemaRef,
     physical: &BTreeMap<String, String>,
@@ -959,8 +1221,8 @@ fn read_files(
     }
     let mut out = Vec::new();
     for rel in files {
-        let path = confined(dest, rel)?;
-        let batches = read_parquet_any(&path)?;
+        check_rel(rel)?;
+        let batches = io.read_parquet(rel)?;
         for batch in batches {
             out.push(project_logical(&batch, schema, physical)?);
         }
@@ -971,22 +1233,17 @@ fn read_files(
     Ok(out)
 }
 
-fn read_parquet_any(path: &Path) -> Result<Vec<Batch>> {
-    let file = File::open(path).map_err(|e| io_err(path, e))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+fn read_parquet_bytes(rel: &str, bytes: &[u8]) -> Result<Vec<Batch>> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
+        .map_err(|e| Error::Io(format!("{rel}: {e}")))?;
     let reader = builder
         .with_batch_size(crate::batch::DEFAULT_MAX_ROWS)
         .build()
-        .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+        .map_err(|e| Error::Io(format!("{rel}: {e}")))?;
     let mut out = Vec::new();
     for item in reader {
         let batch = item.map_err(|e| Error::Io(e.to_string()))?;
         out.push(Batch::from_arrow(batch)?);
-    }
-    if out.is_empty() {
-        // fall back to the public reader
-        return read_parquet(path, ParquetReadOptions::default());
     }
     Ok(out)
 }
@@ -1134,40 +1391,25 @@ fn from_iceberg_type(ty: &str) -> Result<DataType> {
     })
 }
 
-fn existing_delta(dest: &Path) -> Result<Option<Resolved>> {
-    let log_dir = dest.join("_delta_log");
-    if !log_dir.is_dir() {
+fn existing_delta(io: &dyn LakeIo) -> Result<Option<Resolved>> {
+    if list_delta_versions(io)?.is_empty() {
         return Ok(None);
     }
-    if list_delta_versions(&log_dir)?.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(delta_replay(dest, TimeTravel::Latest)?))
+    Ok(Some(delta_replay(io, TimeTravel::Latest)?))
 }
 
-fn existing_iceberg(dest: &Path) -> Result<Option<Resolved>> {
-    let meta_dir = dest.join("metadata");
-    if !meta_dir.is_dir() {
+fn existing_iceberg(io: &dyn LakeIo) -> Result<Option<Resolved>> {
+    if iceberg_latest_version(io)?.is_none() {
         return Ok(None);
     }
-    if iceberg_latest_version(&meta_dir)?.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(iceberg_replay(dest, TimeTravel::Latest)?))
+    Ok(Some(iceberg_replay(io, TimeTravel::Latest)?))
 }
 
-fn iceberg_latest_version(meta_dir: &Path) -> Result<Option<i64>> {
+fn iceberg_latest_version(io: &dyn LakeIo) -> Result<Option<i64>> {
     let mut max = None;
-    let ents = match fs::read_dir(meta_dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(io_err(meta_dir, e)),
-    };
-    for ent in ents {
-        let ent = ent.map_err(|e| io_err(meta_dir, e))?;
-        let name = ent.file_name();
-        let name = name.to_string_lossy();
-        if let Some(stem) = name.strip_prefix('v')
+    for name in io.list("metadata")? {
+        let file = name.rsplit('/').next().unwrap_or(&name);
+        if let Some(stem) = file.strip_prefix('v')
             && let Some(num) = stem.strip_suffix(".metadata.json")
             && let Ok(v) = num.parse::<i64>()
         {
@@ -1233,13 +1475,13 @@ fn exclusive_create(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 }
 
-fn read_json(path: &Path) -> Result<Value> {
-    let text = fs::read_to_string(path).map_err(|e| io_err(path, e))?;
-    serde_json::from_str(&text).map_err(|e| Error::Io(format!("{}: {e}", path.display())))
+fn read_json_io(io: &dyn LakeIo, rel: &str) -> Result<Value> {
+    let text = String::from_utf8(io.get(rel)?).map_err(|e| Error::Io(format!("{rel}: {e}")))?;
+    serde_json::from_str(&text).map_err(|e| Error::Io(format!("{rel}: {e}")))
 }
 
-fn table_id(dest: &Path, now: i64) -> String {
-    format!("{:016x}{:08x}", now, dest.as_os_str().len() as u32)
+fn table_id(label: &str, now: i64) -> String {
+    format!("{:016x}{:08x}", now, label.len() as u32)
 }
 
 fn now_ms() -> i64 {
@@ -1540,5 +1782,60 @@ mod tests {
         let extra = got[0].column_by_name("extra").unwrap();
         assert!(extra.is_null(0));
         let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn store_delta_and_iceberg_round_trip() {
+        let store = object_store::memory::InMemory::new();
+        let first =
+            write_delta_store(&store, "delta/t", &[batch_i64()], WriteMode::Overwrite).unwrap();
+        assert_eq!(first.version, 0);
+        assert_eq!(
+            ids(&read_delta_store(&store, "delta/t", TimeTravel::Latest).unwrap()),
+            vec![1, 2]
+        );
+        let more = Batch::try_new(
+            batch_i64().schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(3)])),
+                Arc::new(StringArray::from(vec![Some("c")])),
+            ],
+        )
+        .unwrap();
+        write_delta_store(&store, "delta/t", &[more], WriteMode::Append).unwrap();
+        assert_eq!(
+            ids(&read_delta_store(&store, "delta/t", TimeTravel::Latest).unwrap()),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            ids(&read_delta_store(&store, "delta/t", TimeTravel::Version(0)).unwrap()),
+            vec![1, 2]
+        );
+        let err = write_delta_store_at(
+            &store,
+            "delta/t",
+            &[batch_i64()],
+            WriteMode::Append,
+            Some(0),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("concurrent writer conflict"));
+
+        write_iceberg_store(&store, "ice/t", &[batch_i64()], WriteMode::Overwrite).unwrap();
+        assert_eq!(
+            ids(&read_iceberg_store(&store, "ice/t", TimeTravel::Latest).unwrap()),
+            vec![1, 2]
+        );
+        evolve_iceberg_store(
+            &store,
+            "ice/t",
+            SchemaEvolution::AddColumn {
+                name: "extra".into(),
+                data_type: DataType::Int64,
+            },
+        )
+        .unwrap();
+        let got = read_iceberg_store(&store, "ice/t", TimeTravel::Latest).unwrap();
+        assert!(got[0].schema().field_with_name("extra").is_ok());
     }
 }

@@ -17,6 +17,7 @@ parquet = { workspace = true }
 sqlparser = { workspace = true }
 object_store = { workspace = true }
 futures = { workspace = true }
+bytes = { workspace = true }
 serde_json = { workspace = true }
 postgres = { workspace = true, optional = true }
 postgres-native-tls = { workspace = true, optional = true }

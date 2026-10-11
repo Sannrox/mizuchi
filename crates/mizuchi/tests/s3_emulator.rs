@@ -57,3 +57,75 @@ fn s3_emulator_round_trip_and_prune() {
         read_parquet_store(store.as_ref(), "mizuchi-emu", ParquetReadOptions::default()).unwrap();
     assert!(!out.is_empty());
 }
+
+#[test]
+#[ignore = "needs a local S3-compatible emulator; not default cargo test"]
+fn s3_emulator_delta_iceberg_and_rest() {
+    use mizuchi::{
+        CatalogProvider, IcebergRestCatalog, TableIdent, TableMeta, TimeTravel, read_delta_store,
+        read_iceberg_store, write_delta_store, write_iceberg_store,
+    };
+
+    let endpoint = std::env::var("MIZUCHI_S3_ENDPOINT").expect("MIZUCHI_S3_ENDPOINT");
+    let bucket = std::env::var("MIZUCHI_S3_BUCKET").expect("MIZUCHI_S3_BUCKET");
+    let key = std::env::var("MIZUCHI_S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let secret = std::env::var("MIZUCHI_S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let store = AmazonS3Builder::new()
+        .with_endpoint(endpoint)
+        .with_bucket_name(bucket)
+        .with_access_key_id(key)
+        .with_secret_access_key(secret)
+        .with_allow_http(true)
+        .build()
+        .expect("s3 store");
+    let store: Arc<dyn mizuchi::ObjectStore> = Arc::new(store);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = Batch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(arrow::array::Int64Array::from(vec![Some(1), Some(2)])),
+            Arc::new(arrow::array::StringArray::from(vec![Some("a"), Some("b")])),
+        ],
+    )
+    .unwrap();
+    write_delta_store(
+        store.as_ref(),
+        "emu-delta",
+        &[batch.clone()],
+        WriteMode::Overwrite,
+    )
+    .unwrap();
+    let got = read_delta_store(store.as_ref(), "emu-delta", TimeTravel::Latest).unwrap();
+    assert!(!got.is_empty());
+    write_iceberg_store(store.as_ref(), "emu-ice", &[batch], WriteMode::Overwrite).unwrap();
+    let got = read_iceberg_store(store.as_ref(), "emu-ice", TimeTravel::Latest).unwrap();
+    assert!(!got.is_empty());
+
+    let rest = std::env::var("MIZUCHI_ICEBERG_REST").ok();
+    if let Some(base) = rest {
+        let mut cat = IcebergRestCatalog::connect(&base, true).expect("rest catalog");
+        cat.create_table(TableMeta {
+            ident: TableIdent::parse("emu").unwrap(),
+            schema,
+            stats: mizuchi::TableStats::default(),
+        })
+        .unwrap();
+        assert!(CatalogProvider::get_table(&cat, &TableIdent::parse("emu").unwrap()).is_ok());
+    } else {
+        let (port, _h) = mizuchi::plan::spawn_memory_server().expect("rest listener");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let mut cat =
+            IcebergRestCatalog::connect(&format!("http://127.0.0.1:{port}"), true).unwrap();
+        cat.create_table(TableMeta {
+            ident: TableIdent::parse("emu").unwrap(),
+            schema,
+            stats: mizuchi::TableStats::default(),
+        })
+        .unwrap();
+        assert!(CatalogProvider::get_table(&cat, &TableIdent::parse("emu").unwrap()).is_ok());
+    }
+}
