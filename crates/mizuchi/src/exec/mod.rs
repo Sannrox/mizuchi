@@ -9,6 +9,7 @@ mod incremental;
 mod join;
 mod key;
 mod memory;
+mod op;
 mod schedule;
 mod sort;
 mod stage;
@@ -31,6 +32,7 @@ use crate::plan::{Catalog, LogicalPlan, NamedExpr, normalize_name};
 
 pub use engine::Engine;
 pub use incremental::MicroBatchAgg;
+pub use op::{CpuLowering, Lowering, Operator};
 
 /// Cooperative cancellation flag. Operators check it between morsels.
 #[derive(Clone, Debug, Default)]
@@ -84,6 +86,8 @@ pub struct Session {
     advisory_partition_size: u64,
     /// Results of executed plans, keyed by plan text and table generations.
     cache: Mutex<cache::QueryCache>,
+    /// Selects a physical implementation per operator. CPU by default.
+    lowering: op::LoweringArc,
 }
 
 impl Default for Session {
@@ -100,6 +104,7 @@ impl Default for Session {
             skew_threshold: 256 * 1024 * 1024,
             advisory_partition_size: 64 * 1024 * 1024,
             cache: Mutex::new(cache::QueryCache::default()),
+            lowering: op::LoweringArc::default(),
         }
     }
 }
@@ -120,6 +125,7 @@ impl Clone for Session {
             // A clone is a new session copy (forked worker counts, tests).
             // It does not inherit cached results.
             cache: Mutex::new(cache::QueryCache::default()),
+            lowering: self.lowering.clone(),
         }
     }
 }
@@ -198,6 +204,12 @@ impl Session {
     /// Target size in bytes when splitting a skewed shuffle partition.
     pub fn with_advisory_partition_size(mut self, bytes: u64) -> Self {
         self.advisory_partition_size = bytes.max(1);
+        self
+    }
+
+    /// Replace the physical-operator lowering. CPU operators remain the default.
+    pub fn with_lowering(mut self, lowering: std::sync::Arc<dyn Lowering>) -> Self {
+        self.lowering = op::LoweringArc(lowering);
         self
     }
 
@@ -337,7 +349,7 @@ impl Session {
     }
 }
 
-/// Pull iterator of morsels.
+/// Pull iterator of morsels. CPU default selected by [`CpuLowering`].
 pub(super) enum Exec {
     Empty {
         schema: SchemaRef,
@@ -348,22 +360,91 @@ pub(super) enum Exec {
         index: usize,
     },
     Filter {
-        input: Box<Exec>,
+        input: Box<dyn Operator>,
         predicate: Expr,
     },
     Project {
-        input: Box<Exec>,
+        input: Box<dyn Operator>,
         exprs: Vec<NamedExpr>,
         schema: SchemaRef,
     },
     Limit {
-        input: Box<Exec>,
+        input: Box<dyn Operator>,
         skip: u64,
         fetch: Option<u64>,
     },
 }
 
-impl Exec {
+impl CpuLowering {
+    pub(crate) fn empty(schema: SchemaRef) -> Result<Box<dyn Operator>> {
+        Ok(Box::new(Exec::Empty {
+            schema,
+            done: false,
+        }))
+    }
+
+    pub(crate) fn scan(batches: Vec<Batch>) -> Result<Box<dyn Operator>> {
+        Ok(Box::new(Exec::Scan { batches, index: 0 }))
+    }
+
+    pub(crate) fn filter(input: Box<dyn Operator>, predicate: Expr) -> Result<Box<dyn Operator>> {
+        Ok(Box::new(Exec::Filter { input, predicate }))
+    }
+
+    pub(crate) fn project(
+        input: Box<dyn Operator>,
+        exprs: Vec<NamedExpr>,
+        schema: SchemaRef,
+    ) -> Result<Box<dyn Operator>> {
+        Ok(Box::new(Exec::Project {
+            input,
+            exprs,
+            schema,
+        }))
+    }
+
+    pub(crate) fn limit(
+        input: Box<dyn Operator>,
+        skip: u64,
+        fetch: Option<u64>,
+    ) -> Result<Box<dyn Operator>> {
+        Ok(Box::new(Exec::Limit { input, skip, fetch }))
+    }
+}
+
+impl Lowering for CpuLowering {
+    fn empty(&self, schema: SchemaRef) -> Result<Box<dyn Operator>> {
+        Self::empty(schema)
+    }
+
+    fn scan(&self, batches: Vec<Batch>) -> Result<Box<dyn Operator>> {
+        Self::scan(batches)
+    }
+
+    fn filter(&self, input: Box<dyn Operator>, predicate: Expr) -> Result<Box<dyn Operator>> {
+        Self::filter(input, predicate)
+    }
+
+    fn project(
+        &self,
+        input: Box<dyn Operator>,
+        exprs: Vec<NamedExpr>,
+        schema: SchemaRef,
+    ) -> Result<Box<dyn Operator>> {
+        Self::project(input, exprs, schema)
+    }
+
+    fn limit(
+        &self,
+        input: Box<dyn Operator>,
+        skip: u64,
+        fetch: Option<u64>,
+    ) -> Result<Box<dyn Operator>> {
+        Self::limit(input, skip, fetch)
+    }
+}
+
+impl Operator for Exec {
     fn next_batch(&mut self, cancel: &CancelToken) -> Result<Option<Batch>> {
         cancel.check()?;
         match self {
@@ -400,13 +481,13 @@ impl Exec {
                 };
                 Ok(Some(project_batch(&batch, exprs, schema.clone())?))
             }
-            Self::Limit { input, skip, fetch } => limit_next(input, skip, fetch, cancel),
+            Self::Limit { input, skip, fetch } => limit_next(input.as_mut(), skip, fetch, cancel),
         }
     }
 }
 
 fn limit_next(
-    input: &mut Exec,
+    input: &mut dyn Operator,
     skip: &mut u64,
     fetch: &mut Option<u64>,
     cancel: &CancelToken,
@@ -444,12 +525,10 @@ pub(super) fn physical(
     plan: &LogicalPlan,
     session: &Session,
     pool: &memory::MemoryPool,
-) -> Result<Exec> {
+) -> Result<Box<dyn Operator>> {
+    let lowering = session.lowering.0.as_ref();
     match plan {
-        LogicalPlan::Empty { schema } => Ok(Exec::Empty {
-            schema: schema.clone(),
-            done: false,
-        }),
+        LogicalPlan::Empty { schema } => lowering.empty(schema.clone()),
         LogicalPlan::Scan {
             table,
             projection,
@@ -485,24 +564,20 @@ pub(super) fn physical(
                 }
                 morsels.extend(batch.split_by_policy(&session.policy));
             }
-            Ok(Exec::Scan {
-                batches: morsels,
-                index: 0,
-            })
+            lowering.scan(morsels)
         }
-        LogicalPlan::Filter { input, predicate } => Ok(Exec::Filter {
-            input: Box::new(physical(input, session, pool)?),
-            predicate: predicate.clone(),
-        }),
+        LogicalPlan::Filter { input, predicate } => {
+            lowering.filter(physical(input, session, pool)?, predicate.clone())
+        }
         LogicalPlan::Project {
             input,
             exprs,
             schema,
-        } => Ok(Exec::Project {
-            input: Box::new(physical(input, session, pool)?),
-            exprs: exprs.clone(),
-            schema: schema.clone(),
-        }),
+        } => lowering.project(
+            physical(input, session, pool)?,
+            exprs.clone(),
+            schema.clone(),
+        ),
         LogicalPlan::Aggregate {
             input,
             group,
@@ -519,7 +594,7 @@ pub(super) fn physical(
                 pool,
                 &session.cancel,
             )?;
-            Ok(Exec::Scan { batches, index: 0 })
+            lowering.scan(batches)
         }
         LogicalPlan::Join {
             left,
@@ -542,7 +617,7 @@ pub(super) fn physical(
                 pool,
                 &session.cancel,
             )?;
-            Ok(Exec::Scan { batches, index: 0 })
+            lowering.scan(batches)
         }
         LogicalPlan::Sort { input, order } => {
             let batches = sort::ordered(
@@ -555,7 +630,7 @@ pub(super) fn physical(
                 pool,
                 &session.cancel,
             )?;
-            Ok(Exec::Scan { batches, index: 0 })
+            lowering.scan(batches)
         }
         LogicalPlan::Limit { input, skip, fetch } => match input.as_ref() {
             LogicalPlan::Sort {
@@ -572,19 +647,15 @@ pub(super) fn physical(
                     pool,
                     &session.cancel,
                 )?;
-                Ok(Exec::Scan { batches, index: 0 })
+                lowering.scan(batches)
             }
-            _ => Ok(Exec::Limit {
-                input: Box::new(physical(input, session, pool)?),
-                skip: *skip,
-                fetch: *fetch,
-            }),
+            _ => lowering.limit(physical(input, session, pool)?, *skip, *fetch),
         },
         LogicalPlan::Union { .. } => Err(Error::NotImplemented("physical union")),
     }
 }
 
-pub(super) fn collect(mut exec: Exec, cancel: &CancelToken) -> Result<Vec<Batch>> {
+pub(super) fn collect(mut exec: Box<dyn Operator>, cancel: &CancelToken) -> Result<Vec<Batch>> {
     let mut out = Vec::new();
     while let Some(batch) = exec.next_batch(cancel)? {
         if batch.num_rows() > 0 {
@@ -1761,5 +1832,38 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "cancel took {elapsed:?}"
         );
+    }
+
+    struct DropAll;
+
+    impl Operator for DropAll {
+        fn next_batch(&mut self, cancel: &CancelToken) -> Result<Option<Batch>> {
+            cancel.check()?;
+            Ok(None)
+        }
+    }
+
+    struct DropScanLowering;
+
+    impl Lowering for DropScanLowering {
+        fn scan(&self, _batches: Vec<Batch>) -> Result<Box<dyn Operator>> {
+            Ok(Box::new(DropAll))
+        }
+    }
+
+    #[test]
+    fn custom_scan_lowering_is_selected() {
+        let default_rows: usize = session()
+            .execute_sql("SELECT a FROM t")
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(default_rows, 4);
+
+        let session = session().with_lowering(Arc::new(DropScanLowering));
+        let out = session.execute_sql("SELECT a FROM t").unwrap();
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 0, "custom scan lowering must run instead of CPU scan");
     }
 }

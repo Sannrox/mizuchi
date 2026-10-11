@@ -23,7 +23,7 @@ use arrow::datatypes::{
 };
 
 use super::CancelToken;
-use super::Exec;
+use super::Operator;
 use super::key::{Scalar, eval_all, extract_key, scalar_at};
 use super::memory::{self, MemoryPool, batch_bytes};
 use crate::batch::{Batch, BatchPolicy};
@@ -32,7 +32,7 @@ use crate::expr::Expr;
 use crate::plan::{AggCall, NamedExpr};
 
 pub(super) fn run(
-    mut input: Exec,
+    mut input: Box<dyn Operator>,
     group: &[NamedExpr],
     aggs: &[(String, AggCall)],
     schema: SchemaRef,
