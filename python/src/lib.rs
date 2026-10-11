@@ -9,11 +9,11 @@ mod arrow_c;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use ::mizuchi::{ArrayRef, Batch, Error as EngineError, Session, VERSION};
+use ::mizuchi::{ArrayRef, Batch, CombineAgg, Error as EngineError, Session, VERSION};
 use arrow::array::{
-    Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Array, BinaryArray, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeListArray, LargeStringArray, ListArray, StringArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -91,6 +91,170 @@ impl PySession {
             .register(name, schema, batches)
             .map_err(py_err)
     }
+
+    /// Register a combinable SQL aggregate. `update(state, value)` folds one
+    /// input; `merge(left, right)` folds two buffers. `identity` is the
+    /// empty-group buffer (None is a typed null Int64).
+    fn register_udaf(
+        &self,
+        name: &str,
+        update: Bound<'_, PyAny>,
+        merge: Bound<'_, PyAny>,
+        identity: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let (identity, result_type) = py_identity(&identity)?;
+        let agg = PyCombineAgg {
+            name: name.to_string(),
+            update: update.unbind(),
+            merge: merge.unbind(),
+            identity,
+            result_type,
+        };
+        lock_session(&self.inner)?
+            .register_udaf(Arc::new(agg))
+            .map_err(py_err)
+    }
+}
+
+struct PyCombineAgg {
+    name: String,
+    update: Py<PyAny>,
+    merge: Py<PyAny>,
+    identity: ArrayRef,
+    result_type: DataType,
+}
+
+impl std::fmt::Debug for PyCombineAgg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PyCombineAgg")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl CombineAgg for PyCombineAgg {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn result_type(&self) -> DataType {
+        self.result_type.clone()
+    }
+
+    fn identity(&self) -> ArrayRef {
+        self.identity.clone()
+    }
+
+    fn update(&self, state: &dyn Array, value: &dyn Array) -> std::result::Result<ArrayRef, EngineError> {
+        self.call(&self.update, state, value)
+    }
+
+    fn merge(&self, left: &dyn Array, right: &dyn Array) -> std::result::Result<ArrayRef, EngineError> {
+        self.call(&self.merge, left, right)
+    }
+}
+
+impl PyCombineAgg {
+    fn call(
+        &self,
+        func: &Py<PyAny>,
+        left: &dyn Array,
+        right: &dyn Array,
+    ) -> std::result::Result<ArrayRef, EngineError> {
+        Python::with_gil(|py| {
+            let l = array0_to_py(py, left).map_err(|e| EngineError::Eval(e.to_string()))?;
+            let r = array0_to_py(py, right).map_err(|e| EngineError::Eval(e.to_string()))?;
+            let out = func
+                .call1(py, (l, r))
+                .map_err(|e| EngineError::Eval(e.to_string()))?;
+            py_to_array0(py, out.bind(py), &self.result_type)
+                .map_err(|e| EngineError::Eval(e.to_string()))
+        })
+    }
+}
+
+fn py_identity(value: &Bound<'_, PyAny>) -> PyResult<(ArrayRef, DataType)> {
+    if value.is_none() {
+        let dt = DataType::Int64;
+        return Ok((Arc::new(Int64Array::from(vec![None::<i64>])), dt));
+    }
+    if value.is_instance_of::<PyBool>() {
+        let v: bool = value.extract()?;
+        return Ok((
+            Arc::new(BooleanArray::from(vec![Some(v)])),
+            DataType::Boolean,
+        ));
+    }
+    if value.is_instance_of::<PyInt>() {
+        let v: i64 = value.extract()?;
+        return Ok((Arc::new(Int64Array::from(vec![Some(v)])), DataType::Int64));
+    }
+    if let Ok(v) = value.extract::<f64>() {
+        return Ok((
+            Arc::new(Float64Array::from(vec![Some(v)])),
+            DataType::Float64,
+        ));
+    }
+    if let Ok(v) = value.extract::<String>() {
+        return Ok((
+            Arc::new(StringArray::from(vec![Some(v)])),
+            DataType::Utf8,
+        ));
+    }
+    Err(PyValueError::new_err(
+        "udaf identity must be None, bool, int, float, or str",
+    ))
+}
+
+fn array0_to_py(py: Python<'_>, array: &dyn Array) -> PyResult<Py<PyAny>> {
+    if array.len() != 1 {
+        return Err(PyValueError::new_err("UDAF buffer must have length 1"));
+    }
+    let owned: ArrayRef = array.slice(0, 1);
+    cell_to_py(py, &owned, 0)
+}
+
+fn py_to_array0(
+    _py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    dt: &DataType,
+) -> PyResult<ArrayRef> {
+    if value.is_none() {
+        return Ok(match dt {
+            DataType::Boolean => Arc::new(BooleanArray::from(vec![None::<bool>])),
+            DataType::Int64 => Arc::new(Int64Array::from(vec![None::<i64>])),
+            DataType::Float64 => Arc::new(Float64Array::from(vec![None::<f64>])),
+            DataType::Utf8 => Arc::new(StringArray::from(vec![None::<&str>])),
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unsupported UDAF type {other}"
+                )));
+            }
+        });
+    }
+    Ok(match dt {
+        DataType::Boolean => {
+            let v: bool = value.extract()?;
+            Arc::new(BooleanArray::from(vec![Some(v)]))
+        }
+        DataType::Int64 => {
+            let v: i64 = value.extract()?;
+            Arc::new(Int64Array::from(vec![Some(v)]))
+        }
+        DataType::Float64 => {
+            let v: f64 = value.extract()?;
+            Arc::new(Float64Array::from(vec![Some(v)]))
+        }
+        DataType::Utf8 => {
+            let v: String = value.extract()?;
+            Arc::new(StringArray::from(vec![Some(v)]))
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unsupported UDAF type {other}"
+            )));
+        }
+    })
 }
 
 #[pyclass(name = "DataFrame")]
@@ -887,10 +1051,26 @@ fn cell_to_py(py: Python<'_>, arr: &ArrayRef, row: usize) -> PyResult<Py<PyAny>>
             downcast::<LargeStringArray>(arr, "LargeUtf8")?.value(row),
         ),
         DataType::Binary => to_py(py, downcast::<BinaryArray>(arr, "Binary")?.value(row)),
+        DataType::List(_) => list_values_to_py(py, downcast::<ListArray>(arr, "List")?.value(row)),
+        DataType::LargeList(_) => {
+            list_values_to_py(py, downcast::<LargeListArray>(arr, "LargeList")?.value(row))
+        }
+        DataType::FixedSizeList(_, _) => list_values_to_py(
+            py,
+            downcast::<FixedSizeListArray>(arr, "FixedSizeList")?.value(row),
+        ),
         other => Err(PyValueError::new_err(format!(
             "unsupported result type {other}"
         ))),
     }
+}
+
+fn list_values_to_py(py: Python<'_>, values: ArrayRef) -> PyResult<Py<PyAny>> {
+    let out = PyList::empty(py);
+    for i in 0..values.len() {
+        out.append(cell_to_py(py, &values, i)?)?;
+    }
+    Ok(out.into_any().unbind())
 }
 
 fn to_py<'py, T>(py: Python<'py>, v: T) -> PyResult<Py<PyAny>>

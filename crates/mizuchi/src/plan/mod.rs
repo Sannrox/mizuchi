@@ -16,8 +16,9 @@ use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::schema::from_arrow_schema;
 use crate::sql::parse_sql;
+use crate::udaf::CombineAgg;
 
-pub use bind::{bind_ddl, bind_merge, merge_target_table, plan_sql};
+pub use bind::{bind_ddl, bind_merge, merge_target_table, plan_sql, plan_sql_with_udafs};
 pub(crate) use catalog::normalize_name;
 pub use catalog::{
     AlterTable, Catalog, CatalogProvider, DEFAULT_CATALOG, DEFAULT_NAMESPACE, Ddl, NamespaceIdent,
@@ -121,7 +122,7 @@ pub struct NamedExpr {
 }
 
 /// Aggregate call. Scalar [`Expr`] does not include aggregates.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum AggCall {
     /// `COUNT(*)`.
     CountStar,
@@ -137,6 +138,34 @@ pub enum AggCall {
     Min(Expr),
     /// `MAX(expr)`.
     Max(Expr),
+    /// Registered combinable aggregate. Buffer type equals result type.
+    User {
+        /// SQL name.
+        name: String,
+        /// Input expression.
+        arg: Expr,
+        /// Combiner used at execution, including spill merge.
+        agg: Arc<dyn CombineAgg>,
+    },
+}
+
+impl fmt::Debug for AggCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CountStar => f.write_str("CountStar"),
+            Self::Count(e) => f.debug_tuple("Count").field(e).finish(),
+            Self::CountDistinct(e) => f.debug_tuple("CountDistinct").field(e).finish(),
+            Self::Sum(e) => f.debug_tuple("Sum").field(e).finish(),
+            Self::Avg(e) => f.debug_tuple("Avg").field(e).finish(),
+            Self::Min(e) => f.debug_tuple("Min").field(e).finish(),
+            Self::Max(e) => f.debug_tuple("Max").field(e).finish(),
+            Self::User { name, arg, .. } => f
+                .debug_struct("User")
+                .field("name", name)
+                .field("arg", arg)
+                .finish(),
+        }
+    }
 }
 
 impl AggCall {
@@ -153,6 +182,10 @@ impl AggCall {
                 Ok(dt)
             }
             Self::Min(expr) | Self::Max(expr) => Ok(expr_type(expr, input)?),
+            Self::User { agg, arg, .. } => {
+                let _ = expr_type(arg, input)?;
+                Ok(agg.result_type())
+            }
         }
     }
 }
@@ -167,6 +200,7 @@ impl fmt::Display for AggCall {
             Self::Avg(e) => write!(f, "avg({e:?})"),
             Self::Min(e) => write!(f, "min({e:?})"),
             Self::Max(e) => write!(f, "max({e:?})"),
+            Self::User { name, arg, .. } => write!(f, "{name}({arg:?})"),
         }
     }
 }
@@ -483,6 +517,14 @@ pub(crate) fn fmt_expr(expr: &Expr, schema: &Schema) -> String {
             Some(len) => format!("substring({}, {start}, {len})", fmt_expr(expr, schema)),
             None => format!("substring({}, {start})", fmt_expr(expr, schema)),
         },
+        Expr::Array(args) => {
+            let inner = args
+                .iter()
+                .map(|e| fmt_expr(e, schema))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("ARRAY[{inner}]")
+        }
     }
 }
 
@@ -532,6 +574,19 @@ pub(crate) fn expr_type(expr: &Expr, schema: &Schema) -> Result<DataType> {
         }
         Expr::Concat(_) => Ok(DataType::Utf8),
         Expr::Substring { .. } => Ok(DataType::Utf8),
+        Expr::Array(args) => {
+            if args.is_empty() {
+                return Err(Error::Plan("ARRAY requires at least one element".into()));
+            }
+            let dt = expr_type(&args[0], schema)?;
+            for arg in &args[1..] {
+                let next = expr_type(arg, schema)?;
+                if next != dt {
+                    return Err(Error::Plan("ARRAY elements must share a type".into()));
+                }
+            }
+            Ok(DataType::List(Arc::new(Field::new("item", dt, true))))
+        }
     }
 }
 
@@ -564,7 +619,22 @@ fn unary_type(op: crate::expr::UnaryOp, dt: DataType) -> Result<DataType> {
             Ok(dt)
         }
         IsNull | IsNotNull => Ok(DataType::Boolean),
-        Upper | Lower => Ok(DataType::Utf8),
+        Upper | Lower | Trim | Ltrim | Rtrim => Ok(DataType::Utf8),
+        Abs => {
+            require_numeric(dt.clone(), "abs")?;
+            Ok(dt)
+        }
+        Ceil | Floor | Sqrt | Round => {
+            require_numeric(dt, "numeric function")?;
+            Ok(DataType::Float64)
+        }
+        CharLength => Ok(DataType::Int64),
+        ExtractYear | ExtractMonth | ExtractDay => Ok(DataType::Int64),
+        ArrayLength => {
+            require_list(dt, "array_length")?;
+            Ok(DataType::Int64)
+        }
+        ExtractEpoch => Ok(DataType::Float64),
     }
 }
 
@@ -573,6 +643,17 @@ pub(crate) fn require_boolean(dt: DataType, what: &str) -> Result<()> {
         Ok(())
     } else {
         Err(Error::Plan(format!("{what} requires boolean, got {dt}")))
+    }
+}
+
+fn require_list(dt: DataType, what: &str) -> Result<()> {
+    if matches!(
+        dt,
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+    ) {
+        Ok(())
+    } else {
+        Err(Error::Plan(format!("{what} requires list, got {dt}")))
     }
 }
 

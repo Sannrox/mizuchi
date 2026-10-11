@@ -37,6 +37,10 @@ impl QueryCache {
         self.entries
             .retain(|key, _| !key.versions.contains_key(table));
     }
+
+    pub(super) fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 pub(super) fn key(plan: &LogicalPlan, generations: &BTreeMap<String, u64>) -> CacheKey {

@@ -1,0 +1,88 @@
+# Scalar function families: string, math, conditional, array.
+
+statement ok
+CREATE TABLE t (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (-4, ' Ab '), (9, 'xy'), (NULL, NULL)
+
+query I
+SELECT abs(a) FROM t WHERE a IS NOT NULL ORDER BY 1
+----
+4
+9
+
+query R
+SELECT ceil(1.1)
+----
+2
+
+query R
+SELECT floor(1.9)
+----
+1
+
+query R
+SELECT round(1.5)
+----
+2
+
+query R
+SELECT sqrt(9)
+----
+3
+
+query I
+SELECT length('é')
+----
+1
+
+query T
+SELECT trim('  x ')
+----
+x
+
+query T
+SELECT ltrim('  x')
+----
+x
+
+query T
+SELECT rtrim('x  ')
+----
+x
+
+query T
+SELECT upper(b) FROM t WHERE a = 9
+----
+XY
+
+query T
+SELECT concat(b, '!') FROM t WHERE a = 9
+----
+xy!
+
+query I
+SELECT nullif(1, 1)
+----
+NULL
+
+query I
+SELECT nullif(1, 2)
+----
+1
+
+query I
+SELECT coalesce(a, 7) FROM t WHERE a IS NULL
+----
+7
+
+query I
+SELECT array_length(ARRAY[1, 2, 3], 1)
+----
+3
+
+query I
+SELECT abs(a) FROM t WHERE a IS NULL
+----
+NULL

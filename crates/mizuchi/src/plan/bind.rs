@@ -1,15 +1,18 @@
 //! Bind parsed SQL to a resolved [`LogicalPlan`].
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, CastKind, Distinct, DuplicateTreatment,
-    Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
-    JoinConstraint, JoinOperator, LimitClause, Merge as SqlMerge, MergeAction, MergeClauseKind,
-    MergeInsertKind, MergeUpdateKind, ObjectName, ObjectNamePart, Offset, OrderByKind, Query,
-    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier,
-    Statement, TableFactor, TableWithJoins, UnaryOperator, Value, WildcardAdditionalOptions,
+    Array as SqlArray, Assignment, AssignmentTarget, BinaryOperator, CastKind, CeilFloorKind,
+    DateTimeField, Distinct, DuplicateTreatment, Expr as SqlExpr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
+    LimitClause, Merge as SqlMerge, MergeAction, MergeClauseKind, MergeInsertKind, MergeUpdateKind,
+    ObjectName, ObjectNamePart, Offset, OrderByKind, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
+    TableWithJoins, TrimWhereField, UnaryOperator, Value, WildcardAdditionalOptions,
 };
 
 use super::{
@@ -19,6 +22,12 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::expr::{BinaryOp, Expr, UnaryOp};
+use crate::udaf::CombineAgg;
+
+struct BindCtx<'a> {
+    catalog: &'a Catalog,
+    udafs: &'a BTreeMap<String, Arc<dyn CombineAgg>>,
+}
 
 #[derive(Clone)]
 struct ScopeCol {
@@ -31,10 +40,19 @@ struct ScopeCol {
 struct Scope {
     columns: Vec<ScopeCol>,
     schema: SchemaRef,
+    udafs: BTreeMap<String, Arc<dyn CombineAgg>>,
 }
 
 impl Scope {
     fn from_schema(qualifier: Option<String>, schema: SchemaRef) -> Self {
+        Self::from_schema_udafs(qualifier, schema, BTreeMap::new())
+    }
+
+    fn from_schema_udafs(
+        qualifier: Option<String>,
+        schema: SchemaRef,
+        udafs: BTreeMap<String, Arc<dyn CombineAgg>>,
+    ) -> Self {
         let columns = schema
             .fields()
             .iter()
@@ -45,26 +63,45 @@ impl Scope {
                 index,
             })
             .collect();
-        Self { columns, schema }
+        Self {
+            columns,
+            schema,
+            udafs,
+        }
     }
 
     fn join(left: Scope, right: Scope) -> Self {
         let schema = join_schema(&left.schema, &right.schema);
+        let udafs = left.udafs;
         let mut columns = left.columns;
         let offset = columns.len();
         for mut col in right.columns {
             col.index += offset;
             columns.push(col);
         }
-        Self { columns, schema }
+        Self {
+            columns,
+            schema,
+            udafs,
+        }
     }
 }
 
 /// Parse and bind one SQL statement against `catalog`.
 pub fn plan_sql(sql: &str, catalog: &Catalog) -> Result<LogicalPlan> {
+    plan_sql_with_udafs(sql, catalog, &BTreeMap::new())
+}
+
+/// [`plan_sql`] plus registered combinable aggregates.
+pub fn plan_sql_with_udafs(
+    sql: &str,
+    catalog: &Catalog,
+    udafs: &BTreeMap<String, Arc<dyn CombineAgg>>,
+) -> Result<LogicalPlan> {
     let stmt = parse_statements(sql)?;
+    let ctx = BindCtx { catalog, udafs };
     match stmt {
-        Statement::Query(query) => bind_query(&query, catalog),
+        Statement::Query(query) => bind_query(&query, &ctx),
         other => Err(Error::NotImplemented(statement_kind(&other))),
     }
 }
@@ -210,7 +247,12 @@ fn bind_merge_stmt(merge: &SqlMerge, catalog: &Catalog) -> Result<MergePlan> {
     }
     let (target, target_alias) = merge_target(&merge.table, catalog)?;
     let target_schema = catalog.table(&target)?.clone();
-    let source = bind_table_factor(&merge.source, catalog)?;
+    let empty = BTreeMap::new();
+    let ctx = BindCtx {
+        catalog,
+        udafs: &empty,
+    };
+    let source = bind_table_factor(&merge.source, &ctx)?;
     let source_schema = source.plan.schema().clone();
     let target_qual = target_alias.unwrap_or_else(|| target.clone());
     let target_scope = Scope::from_schema(Some(target_qual), target_schema.clone());
@@ -473,9 +515,9 @@ fn bind_merge_insert(
     Ok(MergeActionPlan::Insert { values })
 }
 
-fn bind_query(query: &Query, catalog: &Catalog) -> Result<LogicalPlan> {
+fn bind_query(query: &Query, ctx: &BindCtx<'_>) -> Result<LogicalPlan> {
     reject_query_extras(query)?;
-    let mut plan = bind_set_expr(&query.body, catalog)?;
+    let mut plan = bind_set_expr(&query.body, ctx)?;
     if let Some(order_by) = &query.order_by {
         plan = bind_order_by(plan, order_by)?;
     }
@@ -510,10 +552,10 @@ fn reject_query_extras(query: &Query) -> Result<()> {
     Ok(())
 }
 
-fn bind_set_expr(expr: &SetExpr, catalog: &Catalog) -> Result<LogicalPlan> {
+fn bind_set_expr(expr: &SetExpr, ctx: &BindCtx<'_>) -> Result<LogicalPlan> {
     match expr {
-        SetExpr::Select(select) => bind_select(select, catalog),
-        SetExpr::Query(query) => bind_query(query, catalog),
+        SetExpr::Select(select) => bind_select(select, ctx),
+        SetExpr::Query(query) => bind_query(query, ctx),
         SetExpr::SetOperation {
             left,
             op,
@@ -528,8 +570,8 @@ fn bind_set_expr(expr: &SetExpr, catalog: &Catalog) -> Result<LogicalPlan> {
                 SetQuantifier::None | SetQuantifier::Distinct => false,
                 _ => return Err(Error::NotImplemented("UNION BY NAME")),
             };
-            let left = bind_set_expr(left, catalog)?;
-            let right = bind_set_expr(right, catalog)?;
+            let left = bind_set_expr(left, ctx)?;
+            let right = bind_set_expr(right, ctx)?;
             bind_union(left, right, all)
         }
         SetExpr::Values(_) => Err(Error::NotImplemented("VALUES")),
@@ -560,9 +602,9 @@ fn bind_union(left: LogicalPlan, right: LogicalPlan, all: bool) -> Result<Logica
     })
 }
 
-fn bind_select(select: &Select, catalog: &Catalog) -> Result<LogicalPlan> {
+fn bind_select(select: &Select, ctx: &BindCtx<'_>) -> Result<LogicalPlan> {
     reject_select_extras(select)?;
-    let from = bind_from(&select.from, catalog)?;
+    let from = bind_from(&select.from, ctx)?;
     let mut plan = from.plan;
     let mut scope = from.scope;
 
@@ -576,10 +618,10 @@ fn bind_select(select: &Select, catalog: &Catalog) -> Result<LogicalPlan> {
         scope.schema = plan.schema().clone();
     }
 
-    let grouped = is_grouped(select);
+    let grouped = is_grouped(select, ctx.udafs);
     if grouped {
         plan = bind_aggregate(plan, &scope, select)?;
-        scope = Scope::from_schema(None, plan.schema().clone());
+        scope = Scope::from_schema_udafs(None, plan.schema().clone(), scope.udafs.clone());
         if let Some(having) = &select.having {
             let predicate = bind_having(having, &scope)?;
             require_boolean(expr_type(&predicate, &scope.schema)?, "HAVING")?;
@@ -653,37 +695,37 @@ struct BoundFrom {
     scope: Scope,
 }
 
-fn bind_from(from: &[TableWithJoins], catalog: &Catalog) -> Result<BoundFrom> {
+fn bind_from(from: &[TableWithJoins], ctx: &BindCtx<'_>) -> Result<BoundFrom> {
     if from.is_empty() {
         let schema = Arc::new(Schema::empty());
         return Ok(BoundFrom {
             plan: LogicalPlan::Empty {
                 schema: schema.clone(),
             },
-            scope: Scope::from_schema(None, schema),
+            scope: Scope::from_schema_udafs(None, schema, ctx.udafs.clone()),
         });
     }
-    let mut bound = bind_table_with_joins(&from[0], catalog)?;
+    let mut bound = bind_table_with_joins(&from[0], ctx)?;
     for extra in &from[1..] {
-        let right = bind_table_with_joins(extra, catalog)?;
+        let right = bind_table_with_joins(extra, ctx)?;
         bound = cross_join(bound, right)?;
     }
     Ok(bound)
 }
 
-fn bind_table_with_joins(twj: &TableWithJoins, catalog: &Catalog) -> Result<BoundFrom> {
-    let mut left = bind_table_factor(&twj.relation, catalog)?;
+fn bind_table_with_joins(twj: &TableWithJoins, ctx: &BindCtx<'_>) -> Result<BoundFrom> {
+    let mut left = bind_table_factor(&twj.relation, ctx)?;
     for join in &twj.joins {
         if join.global {
             return Err(Error::NotImplemented("GLOBAL JOIN"));
         }
-        let right = bind_table_factor(&join.relation, catalog)?;
+        let right = bind_table_factor(&join.relation, ctx)?;
         left = bind_join(left, right, &join.join_operator)?;
     }
     Ok(left)
 }
 
-fn bind_table_factor(factor: &TableFactor, catalog: &Catalog) -> Result<BoundFrom> {
+fn bind_table_factor(factor: &TableFactor, ctx: &BindCtx<'_>) -> Result<BoundFrom> {
     match factor {
         TableFactor::Table {
             name,
@@ -712,7 +754,7 @@ fn bind_table_factor(factor: &TableFactor, catalog: &Catalog) -> Result<BoundFro
             let table = object_name(name)?;
             let ident = TableIdent::parse(&table)?;
             let scan_name = ident.sql_name();
-            let schema = catalog.table(&scan_name)?.clone();
+            let schema = ctx.catalog.table(&scan_name)?.clone();
             let alias_name = alias.as_ref().map(|a| ident_key(&a.name));
             if let Some(alias) = alias
                 && !alias.columns.is_empty()
@@ -727,9 +769,9 @@ fn bind_table_factor(factor: &TableFactor, catalog: &Catalog) -> Result<BoundFro
                     alias: alias_name,
                     projection: None,
                     filters: Vec::new(),
-                    stats: catalog.stats(&scan_name).cloned(),
+                    stats: ctx.catalog.stats(&scan_name).cloned(),
                 },
-                scope: Scope::from_schema(Some(qualifier), schema),
+                scope: Scope::from_schema_udafs(Some(qualifier), schema, ctx.udafs.clone()),
             })
         }
         TableFactor::Derived {
@@ -744,12 +786,12 @@ fn bind_table_factor(factor: &TableFactor, catalog: &Catalog) -> Result<BoundFro
             if sample.is_some() {
                 return Err(Error::NotImplemented("TABLESAMPLE"));
             }
-            let plan = bind_query(subquery, catalog)?;
+            let plan = bind_query(subquery, ctx)?;
             let qualifier = alias.as_ref().map(|a| ident_key(&a.name));
             let schema = plan.schema().clone();
             Ok(BoundFrom {
                 plan,
-                scope: Scope::from_schema(qualifier, schema),
+                scope: Scope::from_schema_udafs(qualifier, schema, ctx.udafs.clone()),
             })
         }
         _ => Err(Error::NotImplemented("table factor")),
@@ -815,39 +857,42 @@ fn cross_join(left: BoundFrom, right: BoundFrom) -> Result<BoundFrom> {
     })
 }
 
-fn is_grouped(select: &Select) -> bool {
+fn is_grouped(select: &Select, udafs: &BTreeMap<String, Arc<dyn CombineAgg>>) -> bool {
     match &select.group_by {
         GroupByExpr::Expressions(exprs, _) if !exprs.is_empty() => true,
         GroupByExpr::All(_) => true,
-        _ => projection_has_agg(&select.projection),
+        _ => projection_has_agg(&select.projection, udafs),
     }
 }
 
-fn projection_has_agg(items: &[SelectItem]) -> bool {
+fn projection_has_agg(items: &[SelectItem], udafs: &BTreeMap<String, Arc<dyn CombineAgg>>) -> bool {
     items.iter().any(|item| match item {
-        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => is_agg_expr(e),
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+            is_agg_expr(e, udafs)
+        }
         _ => false,
     })
 }
 
-fn is_agg_expr(expr: &SqlExpr) -> bool {
+fn is_agg_expr(expr: &SqlExpr, udafs: &BTreeMap<String, Arc<dyn CombineAgg>>) -> bool {
     match expr {
-        SqlExpr::Function(func) => classify_agg(func).is_some(),
-        SqlExpr::Nested(inner) => is_agg_expr(inner),
+        SqlExpr::Function(func) => classify_agg(func, udafs).is_some(),
+        SqlExpr::Nested(inner) => is_agg_expr(inner, udafs),
         _ => false,
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum AggKind {
     Count,
     Sum,
     Avg,
     Min,
     Max,
+    User(Arc<dyn CombineAgg>),
 }
 
-fn classify_agg(func: &Function) -> Option<AggKind> {
+fn classify_agg(func: &Function, udafs: &BTreeMap<String, Arc<dyn CombineAgg>>) -> Option<AggKind> {
     if func.over.is_some() {
         return None;
     }
@@ -858,7 +903,7 @@ fn classify_agg(func: &Function) -> Option<AggKind> {
         "avg" => AggKind::Avg,
         "min" => AggKind::Min,
         "max" => AggKind::Max,
-        _ => return None,
+        other => AggKind::User(udafs.get(other)?.clone()),
     })
 }
 
@@ -877,6 +922,11 @@ fn make_agg(kind: AggKind, arg: Option<Expr>, distinct: bool) -> Result<AggCall>
         (AggKind::Avg, Some(e)) => Ok(AggCall::Avg(e)),
         (AggKind::Min, Some(e)) => Ok(AggCall::Min(e)),
         (AggKind::Max, Some(e)) => Ok(AggCall::Max(e)),
+        (AggKind::User(agg), Some(e)) => Ok(AggCall::User {
+            name: agg.name().to_string(),
+            arg: e,
+            agg,
+        }),
         _ => Err(Error::Plan("aggregate is missing its argument".into())),
     }
 }
@@ -911,7 +961,7 @@ fn bind_aggregate(input: LogicalPlan, scope: &Scope, select: &Select) -> Result<
         match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
                 if let SqlExpr::Function(func) = expr
-                    && let Some(kind) = classify_agg(func)
+                    && let Some(kind) = classify_agg(func, &scope.udafs)
                 {
                     if func.over.is_some() {
                         return Err(Error::NotImplemented("window function"));
@@ -926,7 +976,7 @@ fn bind_aggregate(input: LogicalPlan, scope: &Scope, select: &Select) -> Result<
                     aggs.push((name, call));
                     continue;
                 }
-                if is_agg_expr(expr) {
+                if is_agg_expr(expr, &scope.udafs) {
                     return Err(Error::NotImplemented("nested aggregate"));
                 }
                 // non-agg SELECT item must be a grouping expr
@@ -1266,6 +1316,30 @@ fn bind_scalar(expr: &SqlExpr, scope: &Scope) -> Result<Expr> {
             })
         }
         SqlExpr::Function(func) => bind_function(func, scope),
+        SqlExpr::Extract { field, expr, .. } => bind_extract(field.clone(), expr, scope),
+        SqlExpr::Ceil { expr, field } => bind_ceil_floor(UnaryOp::Ceil, expr, field, scope),
+        SqlExpr::Floor { expr, field } => bind_ceil_floor(UnaryOp::Floor, expr, field, scope),
+        SqlExpr::Trim {
+            trim_where,
+            trim_what,
+            expr,
+            trim_characters,
+        } => bind_trim(
+            *trim_where,
+            trim_what.as_deref(),
+            expr,
+            trim_characters.as_ref(),
+            scope,
+        ),
+        SqlExpr::Array(SqlArray { elem, .. }) => {
+            let args = elem
+                .iter()
+                .map(|e| bind_scalar(e, scope))
+                .collect::<Result<Vec<_>>>()?;
+            let out = Expr::Array(args);
+            let _ = expr_type(&out, &scope.schema)?;
+            Ok(out)
+        }
         SqlExpr::Substring {
             expr,
             substring_from,
@@ -1298,26 +1372,156 @@ fn bind_function(func: &Function, scope: &Scope) -> Result<Expr> {
     if func.over.is_some() {
         return Err(Error::NotImplemented("window function"));
     }
-    if classify_agg(func).is_some() {
+    if classify_agg(func, &scope.udafs).is_some() {
         return Err(Error::Plan(
             "aggregate function not allowed in this expression".into(),
         ));
     }
     let name = func_name(func).ok_or(Error::NotImplemented("function name"))?;
     let args = function_args(func, scope)?;
+    let unary = |op: UnaryOp, args: Vec<Expr>| -> Result<Expr> {
+        if args.len() != 1 {
+            return Err(Error::Plan(format!("{name} expects 1 argument")));
+        }
+        Ok(Expr::Unary(op, Box::new(args.into_iter().next().unwrap())))
+    };
     match name.as_str() {
-        "upper" if args.len() == 1 => Ok(Expr::Unary(
-            UnaryOp::Upper,
-            Box::new(args.into_iter().next().unwrap()),
-        )),
-        "lower" if args.len() == 1 => Ok(Expr::Unary(
-            UnaryOp::Lower,
-            Box::new(args.into_iter().next().unwrap()),
-        )),
+        "upper" => unary(UnaryOp::Upper, args),
+        "lower" => unary(UnaryOp::Lower, args),
+        "abs" => unary(UnaryOp::Abs, args),
+        "ceil" | "ceiling" => unary(UnaryOp::Ceil, args),
+        "floor" => unary(UnaryOp::Floor, args),
+        "sqrt" => unary(UnaryOp::Sqrt, args),
+        "round" if args.len() == 1 => unary(UnaryOp::Round, args),
+        "round" if args.len() == 2 => {
+            let digits = literal_i64_expr(&args[1], "round digits")?;
+            if digits != 0 {
+                return Err(Error::NotImplemented("round scale"));
+            }
+            Ok(Expr::Unary(
+                UnaryOp::Round,
+                Box::new(args.into_iter().next().unwrap()),
+            ))
+        }
+        "length" | "char_length" | "character_length" => unary(UnaryOp::CharLength, args),
+        "trim" => unary(UnaryOp::Trim, args),
+        "ltrim" => unary(UnaryOp::Ltrim, args),
+        "rtrim" => unary(UnaryOp::Rtrim, args),
+        "array_length" if args.len() == 2 => {
+            let dim = literal_i64_expr(&args[1], "array_length dimension")?;
+            if dim != 1 {
+                return Err(Error::NotImplemented("array_length dimension"));
+            }
+            Ok(Expr::Unary(
+                UnaryOp::ArrayLength,
+                Box::new(args.into_iter().next().unwrap()),
+            ))
+        }
+        "date_part" if args.len() == 2 => bind_date_part(&args[0], args[1].clone()),
+        "nullif" if args.len() == 2 => {
+            let mut args = args.into_iter();
+            let a = args.next().unwrap();
+            let b = args.next().unwrap();
+            let dt = expr_type(&a, &scope.schema)?;
+            Ok(Expr::Case {
+                operand: None,
+                when_then: vec![(
+                    Expr::Binary(BinaryOp::Eq, Box::new(a.clone()), Box::new(b)),
+                    Expr::lit_null(dt),
+                )],
+                else_expr: Some(Box::new(a)),
+            })
+        }
         "coalesce" => Ok(Expr::Coalesce(args)),
         "concat" => Ok(Expr::Concat(args)),
         _ => Err(Error::NotImplemented("function")),
     }
+}
+
+fn bind_extract(field: DateTimeField, expr: &SqlExpr, scope: &Scope) -> Result<Expr> {
+    let inner = bind_scalar(expr, scope)?;
+    let op = extract_op(field)?;
+    Ok(Expr::Unary(op, Box::new(inner)))
+}
+
+fn bind_date_part(part: &Expr, value: Expr) -> Result<Expr> {
+    let Expr::Literal(arr) = part else {
+        return Err(Error::Plan(
+            "date_part field must be a string literal".into(),
+        ));
+    };
+    let name = arr
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .ok_or_else(|| Error::Plan("date_part field must be a string literal".into()))?;
+    if name.len() != 1 || name.is_null(0) {
+        return Err(Error::Plan(
+            "date_part field must be a string literal".into(),
+        ));
+    }
+    let field = match name.value(0).to_ascii_lowercase().as_str() {
+        "year" => DateTimeField::Year,
+        "month" => DateTimeField::Month,
+        "day" => DateTimeField::Day,
+        "epoch" => DateTimeField::Epoch,
+        _ => return Err(Error::NotImplemented("date_part field")),
+    };
+    Ok(Expr::Unary(extract_op(field)?, Box::new(value)))
+}
+
+fn extract_op(field: DateTimeField) -> Result<UnaryOp> {
+    Ok(match field {
+        DateTimeField::Year | DateTimeField::Years => UnaryOp::ExtractYear,
+        DateTimeField::Month | DateTimeField::Months => UnaryOp::ExtractMonth,
+        DateTimeField::Day | DateTimeField::Days => UnaryOp::ExtractDay,
+        DateTimeField::Epoch => UnaryOp::ExtractEpoch,
+        _ => return Err(Error::NotImplemented("EXTRACT field")),
+    })
+}
+
+fn bind_ceil_floor(
+    op: UnaryOp,
+    expr: &SqlExpr,
+    field: &CeilFloorKind,
+    scope: &Scope,
+) -> Result<Expr> {
+    match field {
+        CeilFloorKind::DateTimeField(DateTimeField::NoDateTime) => {}
+        _ => return Err(Error::NotImplemented("ceil/floor scale")),
+    }
+    Ok(Expr::Unary(op, Box::new(bind_scalar(expr, scope)?)))
+}
+
+fn bind_trim(
+    trim_where: Option<TrimWhereField>,
+    trim_what: Option<&SqlExpr>,
+    expr: &SqlExpr,
+    trim_characters: Option<&Vec<SqlExpr>>,
+    scope: &Scope,
+) -> Result<Expr> {
+    if trim_what.is_some() || trim_characters.is_some() {
+        return Err(Error::NotImplemented("TRIM characters"));
+    }
+    let op = match trim_where {
+        None | Some(TrimWhereField::Both) => UnaryOp::Trim,
+        Some(TrimWhereField::Leading) => UnaryOp::Ltrim,
+        Some(TrimWhereField::Trailing) => UnaryOp::Rtrim,
+    };
+    Ok(Expr::Unary(op, Box::new(bind_scalar(expr, scope)?)))
+}
+
+fn literal_i64_expr(expr: &Expr, what: &str) -> Result<i64> {
+    let Expr::Literal(arr) = expr else {
+        return Err(Error::Plan(format!("{what} must be an integer literal")));
+    };
+    let a = arr
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .ok_or_else(|| Error::Plan(format!("{what} must be an integer literal")))?;
+    if a.len() != 1 || a.is_null(0) {
+        return Err(Error::Plan(format!("{what} must be an integer literal")));
+    }
+    Ok(a.value(0))
 }
 
 fn function_args(func: &Function, scope: &Scope) -> Result<Vec<Expr>> {
@@ -1364,7 +1568,7 @@ fn bind_value(value: &Value) -> Result<Expr> {
 
 fn bind_having(expr: &SqlExpr, scope: &Scope) -> Result<Expr> {
     match expr {
-        SqlExpr::Function(func) if classify_agg(func).is_some() => {
+        SqlExpr::Function(func) if classify_agg(func, &scope.udafs).is_some() => {
             resolve_name(None, &infer_sql_name(expr), scope)
         }
         SqlExpr::BinaryOp { left, op, right } => {

@@ -41,6 +41,7 @@ use crate::plan::{
     AlterTable, Catalog, CatalogProvider, Ddl, LogicalPlan, NamedExpr, TableIdent, apply_alter,
     bind_ddl, normalize_name,
 };
+use crate::udaf::CombineAgg;
 
 pub use cluster::{Cluster, ClusterConfig, WorkerResources};
 pub use config::SessionConfig;
@@ -113,6 +114,8 @@ pub struct Session {
     allow_network: bool,
     /// When true, stage tasks may run a speculative copy; first commit wins.
     speculate: bool,
+    /// Combinable user-defined aggregates, keyed by lower-case SQL name.
+    udafs: BTreeMap<String, Arc<dyn CombineAgg>>,
 }
 
 impl Default for Session {
@@ -135,6 +138,7 @@ impl Default for Session {
             allowed_write_paths: Vec::new(),
             allow_network: false,
             speculate: false,
+            udafs: BTreeMap::new(),
         }
     }
 }
@@ -161,6 +165,7 @@ impl Clone for Session {
             allowed_write_paths: self.allowed_write_paths.clone(),
             allow_network: self.allow_network,
             speculate: self.speculate,
+            udafs: self.udafs.clone(),
         }
     }
 }
@@ -266,6 +271,22 @@ impl Session {
     pub fn with_spill_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.spill_dir = Some(dir.into());
         self
+    }
+
+    /// Register a combinable aggregate callable from SQL by [`CombineAgg::name`].
+    pub fn register_udaf(&mut self, agg: Arc<dyn CombineAgg>) -> Result<()> {
+        let name = agg.name().to_ascii_lowercase();
+        if name.is_empty() {
+            return Err(Error::Plan("aggregate name is empty".into()));
+        }
+        if matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max") {
+            return Err(Error::Plan(format!("aggregate name {name} is reserved")));
+        }
+        self.udafs.insert(name, agg);
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.clear();
+        }
+        Ok(())
     }
 
     /// Byte floor for treating a shuffle partition as skewed. Also must exceed
@@ -1001,7 +1022,7 @@ impl Session {
             }
             catalog.set_stats(name, stats)?;
         }
-        let plan = crate::plan::plan_sql(sql, &catalog)?;
+        let plan = crate::plan::plan_sql_with_udafs(sql, &catalog, &self.udafs)?;
         crate::opt::optimize(plan)
     }
 
@@ -1690,7 +1711,11 @@ fn one_row_empty(schema: SchemaRef) -> Result<Batch> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Float64Array, Int64Array, LargeStringArray, StringArray, UInt32Array};
+    use crate::udaf::ProductI64;
+    use arrow::array::{
+        Array, ArrayRef, Date32Array, Float64Array, Int64Array, LargeStringArray, StringArray,
+        UInt32Array,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
@@ -2201,6 +2226,224 @@ mod tests {
             .execute_sql("SELECT COUNT(DISTINCT a) AS cd FROM t")
             .unwrap();
         assert_eq!(col_i64(&out, "cd"), vec![Some(3)]);
+    }
+
+    #[test]
+    fn sql_function_library_and_nullif() {
+        let out = session()
+            .execute_sql(
+                "SELECT abs(-4) AS a, length('é') AS n, trim('  x ') AS t, ceil(1.1) AS c, \
+                 floor(1.9) AS f, round(1.5) AS r, nullif(1, 1) AS z, nullif(1, 2) AS k, \
+                 array_length(ARRAY[1, 2, 3], 1) AS al",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(4)]);
+        assert_eq!(col_i64(&out, "n"), vec![Some(1)]);
+        assert_eq!(col_utf8(&out, "t"), vec![Some("x".into())]);
+        assert!((col_f64(&out, "c")[0].unwrap() - 2.0).abs() < 1e-12);
+        assert!((col_f64(&out, "f")[0].unwrap() - 1.0).abs() < 1e-12);
+        assert!((col_f64(&out, "r")[0].unwrap() - 2.0).abs() < 1e-12);
+        assert_eq!(col_i64(&out, "z"), vec![None]);
+        assert_eq!(col_i64(&out, "k"), vec![Some(1)]);
+        assert_eq!(col_i64(&out, "al"), vec![Some(3)]);
+    }
+
+    #[test]
+    fn extract_from_date32_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Date32Array::from(vec![Some(0), Some(32)]))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("t", schema, vec![batch]).unwrap();
+        let out = s
+            .execute_sql(
+                "SELECT extract(year FROM d) AS y, extract(month FROM d) AS m, \
+                 extract(day FROM d) AS day, extract(epoch FROM d) AS e FROM t",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&out, "y"), vec![Some(1970), Some(1970)]);
+        assert_eq!(col_i64(&out, "m"), vec![Some(1), Some(2)]);
+        assert_eq!(col_i64(&out, "day"), vec![Some(1), Some(2)]);
+        let e = col_f64(&out, "e");
+        assert_eq!(e[0], Some(0.0));
+        assert_eq!(e[1], Some(32.0 * 86_400.0));
+    }
+
+    #[test]
+    fn udaf_product_parallel_and_spill() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let mut batches = Vec::new();
+        for i in 0..8 {
+            let g = i % 2;
+            batches.push(
+                Batch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(vec![Some(g), Some(g)])),
+                        Arc::new(Int64Array::from(vec![Some(2), Some(3)])),
+                    ],
+                )
+                .unwrap(),
+            );
+        }
+        let cap = tight_limit(&batches);
+        let mut s = Session::new();
+        s.register("t", schema, batches).unwrap();
+        s.register_udaf(Arc::new(ProductI64)).unwrap();
+        let sql = "SELECT g, product(v) AS p FROM t GROUP BY g";
+        let mut want: Vec<(Option<i64>, Option<i64>)> = col_i64(&s.execute_sql(sql).unwrap(), "g")
+            .into_iter()
+            .zip(col_i64(&s.execute_sql(sql).unwrap(), "p"))
+            .collect();
+        want.sort_by_key(|(g, _)| *g);
+        assert_eq!(want, vec![(Some(0), Some(1296)), (Some(1), Some(1296))]);
+
+        let parallel = s.clone().with_workers(2).unwrap().execute_sql(sql).unwrap();
+        let mut got: Vec<(Option<i64>, Option<i64>)> = col_i64(&parallel, "g")
+            .into_iter()
+            .zip(col_i64(&parallel, "p"))
+            .collect();
+        got.sort_by_key(|(g, _)| *g);
+        assert_eq!(got, want);
+
+        let root = spill_root("udaf");
+        let spilled = s
+            .clone()
+            .with_memory_limit(cap)
+            .with_spill_dir(root.clone())
+            .execute_sql(sql)
+            .unwrap();
+        let mut got: Vec<(Option<i64>, Option<i64>)> = col_i64(&spilled, "g")
+            .into_iter()
+            .zip(col_i64(&spilled, "p"))
+            .collect();
+        got.sort_by_key(|(g, _)| *g);
+        assert_eq!(got, want);
+        let left = leftover(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[derive(Debug)]
+    struct SumI64AsF64;
+
+    impl CombineAgg for SumI64AsF64 {
+        fn name(&self) -> &str {
+            "sumf"
+        }
+
+        fn result_type(&self) -> DataType {
+            DataType::Float64
+        }
+
+        fn identity(&self) -> ArrayRef {
+            Arc::new(Float64Array::from(vec![Some(0.0)]))
+        }
+
+        fn update(&self, state: &dyn Array, value: &dyn Array) -> Result<ArrayRef> {
+            let s = state
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| Error::Eval("expected float64 state".into()))?;
+            if value.is_null(0) {
+                return Ok(Arc::new(Float64Array::from(vec![Some(s.value(0))])));
+            }
+            let v = value.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                Error::Eval(format!("expected int64 value, got {}", value.data_type()))
+            })?;
+            Ok(Arc::new(Float64Array::from(vec![Some(
+                s.value(0) + v.value(0) as f64,
+            )])))
+        }
+
+        fn merge(&self, left: &dyn Array, right: &dyn Array) -> Result<ArrayRef> {
+            let l = left
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| Error::Eval("expected float64 buffer".into()))?;
+            let r = right
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| Error::Eval("expected float64 buffer".into()))?;
+            Ok(Arc::new(Float64Array::from(vec![Some(
+                l.value(0) + r.value(0),
+            )])))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ConstI64(i64);
+
+    impl CombineAgg for ConstI64 {
+        fn name(&self) -> &str {
+            "product"
+        }
+
+        fn result_type(&self) -> DataType {
+            DataType::Int64
+        }
+
+        fn identity(&self) -> ArrayRef {
+            Arc::new(Int64Array::from(vec![Some(self.0)]))
+        }
+
+        fn update(&self, _state: &dyn Array, _value: &dyn Array) -> Result<ArrayRef> {
+            Ok(Arc::new(Int64Array::from(vec![Some(self.0)])))
+        }
+
+        fn merge(&self, _left: &dyn Array, _right: &dyn Array) -> Result<ArrayRef> {
+            Ok(Arc::new(Int64Array::from(vec![Some(self.0)])))
+        }
+    }
+
+    #[test]
+    fn udaf_update_keeps_argument_type() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(2), Some(3)]))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("t", schema, vec![batch]).unwrap();
+        s.register_udaf(Arc::new(SumI64AsF64)).unwrap();
+        let out = s.execute_sql("SELECT sumf(v) AS s FROM t").unwrap();
+        assert_eq!(col_f64(&out, "s"), vec![Some(5.0)]);
+    }
+
+    #[test]
+    fn register_udaf_invalidates_query_cache() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(2), Some(3)]))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("t", schema, vec![batch]).unwrap();
+        s.register_udaf(Arc::new(ProductI64)).unwrap();
+        let sql = "SELECT product(v) AS p FROM t";
+        assert_eq!(col_i64(&s.execute_sql(sql).unwrap(), "p"), vec![Some(6)]);
+        let _ = s.execute_sql(sql).unwrap();
+        assert_eq!(s.cache_hits(), 1);
+        s.register_udaf(Arc::new(ConstI64(1))).unwrap();
+        assert_eq!(col_i64(&s.execute_sql(sql).unwrap(), "p"), vec![Some(1)]);
+        assert_eq!(s.cache_hits(), 1);
+    }
+
+    #[test]
+    fn array_length_rejects_utf8() {
+        let err = Session::new()
+            .execute_sql("SELECT array_length('é', 1) AS n")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("array_length requires list"), "{msg}");
     }
 
     #[test]

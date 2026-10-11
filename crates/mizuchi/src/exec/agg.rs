@@ -30,6 +30,7 @@ use crate::batch::{Batch, BatchPolicy};
 use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::plan::{AggCall, NamedExpr};
+use crate::udaf::CombineAgg;
 
 pub(super) fn run(
     mut input: Box<dyn Operator>,
@@ -130,12 +131,17 @@ pub(super) fn combine_partials(
                 AggCall::CountStar | AggCall::Count(_) | AggCall::Sum(_) => AggCall::Sum(col),
                 AggCall::Min(_) => AggCall::Min(col),
                 AggCall::Max(_) => AggCall::Max(col),
+                AggCall::User { name, agg, .. } => AggCall::User {
+                    name: name.clone(),
+                    arg: col,
+                    agg: agg.clone(),
+                },
                 other => other.clone(),
             };
             (name.clone(), call)
         })
         .collect();
-    let mut table = HashAgg::new(&merge_group, &merge_aggs, schema)?;
+    let mut table = HashAgg::combining(&merge_group, &merge_aggs, schema)?;
     for batch in partials {
         table.update(&batch)?;
     }
@@ -165,12 +171,17 @@ fn merge_partial_files(
                 AggCall::CountStar | AggCall::Count(_) | AggCall::Sum(_) => AggCall::Sum(col),
                 AggCall::Min(_) => AggCall::Min(col),
                 AggCall::Max(_) => AggCall::Max(col),
+                AggCall::User { name, agg, .. } => AggCall::User {
+                    name: name.clone(),
+                    arg: col,
+                    agg: agg.clone(),
+                },
                 other => other.clone(),
             };
             (name.clone(), call)
         })
         .collect();
-    let mut table = HashAgg::new(&merge_group, &merge_aggs, schema.clone())?;
+    let mut table = HashAgg::combining(&merge_group, &merge_aggs, schema.clone())?;
     for path in paths {
         for batch in memory::read_spill(path, schema.clone())? {
             table.update(&batch)?;
@@ -185,6 +196,7 @@ pub(super) struct HashAgg {
     aggs: Vec<AggCall>,
     schema: SchemaRef,
     grouped: bool,
+    combining: bool,
     slots: HashMap<Vec<Scalar>, usize>,
     keys: Vec<Vec<Scalar>>,
     accums: Vec<Vec<Accum>>,
@@ -196,11 +208,29 @@ impl HashAgg {
         aggs: &[(String, AggCall)],
         schema: SchemaRef,
     ) -> Result<Self> {
+        Self::build(group, aggs, schema, false)
+    }
+
+    fn combining(
+        group: &[NamedExpr],
+        aggs: &[(String, AggCall)],
+        schema: SchemaRef,
+    ) -> Result<Self> {
+        Self::build(group, aggs, schema, true)
+    }
+
+    fn build(
+        group: &[NamedExpr],
+        aggs: &[(String, AggCall)],
+        schema: SchemaRef,
+        combining: bool,
+    ) -> Result<Self> {
         Ok(Self {
             group_exprs: group.iter().map(|g| g.expr.clone()).collect(),
             aggs: aggs.iter().map(|(_, c)| c.clone()).collect(),
             schema,
             grouped: !group.is_empty(),
+            combining,
             slots: HashMap::new(),
             keys: Vec::new(),
             accums: Vec::new(),
@@ -221,7 +251,8 @@ impl HashAgg {
                 | AggCall::Sum(e)
                 | AggCall::Avg(e)
                 | AggCall::Min(e)
-                | AggCall::Max(e) => Some(e.eval(batch)?),
+                | AggCall::Max(e)
+                | AggCall::User { arg: e, .. } => Some(e.eval(batch)?),
             });
         }
         for row in 0..batch.num_rows() {
@@ -244,7 +275,13 @@ impl HashAgg {
             .aggs
             .iter()
             .enumerate()
-            .map(|(i, call)| Accum::from_call(call, self.schema.field(n_group + i).data_type()))
+            .map(|(i, call)| {
+                Accum::from_call(
+                    call,
+                    self.schema.field(n_group + i).data_type(),
+                    self.combining,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         self.slots.insert(key.clone(), slot);
         self.keys.push(key);
@@ -300,16 +337,38 @@ impl HashAgg {
 enum Accum {
     Count(i64),
     CountDistinct(HashSet<Scalar>),
-    SumI64 { sum: i64, seen: bool },
-    SumU64 { sum: u64, seen: bool },
-    SumF64 { sum: f64, seen: bool },
-    Avg { sum: f64, count: i64 },
-    Min { current: Option<Scalar> },
-    Max { current: Option<Scalar> },
+    SumI64 {
+        sum: i64,
+        seen: bool,
+    },
+    SumU64 {
+        sum: u64,
+        seen: bool,
+    },
+    SumF64 {
+        sum: f64,
+        seen: bool,
+    },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
+    Min {
+        current: Option<Scalar>,
+    },
+    Max {
+        current: Option<Scalar>,
+    },
+    User {
+        agg: Arc<dyn CombineAgg>,
+        state: Scalar,
+        combining: bool,
+        dt: DataType,
+    },
 }
 
 impl Accum {
-    fn from_call(call: &AggCall, result_type: &DataType) -> Result<Self> {
+    fn from_call(call: &AggCall, result_type: &DataType, combining: bool) -> Result<Self> {
         Ok(match call {
             AggCall::CountStar | AggCall::Count(_) => Self::Count(0),
             AggCall::CountDistinct(_) => Self::CountDistinct(HashSet::new()),
@@ -332,6 +391,15 @@ impl Accum {
             AggCall::Avg(_) => Self::Avg { sum: 0.0, count: 0 },
             AggCall::Min(_) => Self::Min { current: None },
             AggCall::Max(_) => Self::Max { current: None },
+            AggCall::User { agg, .. } => {
+                let id = agg.identity();
+                Self::User {
+                    agg: agg.clone(),
+                    state: scalar_at(id.as_ref(), 0)?,
+                    combining,
+                    dt: agg.result_type(),
+                }
+            }
         })
     }
 
@@ -362,6 +430,26 @@ impl Accum {
             Self::Avg { sum, count } => update_avg(sum, count, arg, row),
             Self::Min { current } => update_minmax(current, arg, row, true),
             Self::Max { current } => update_minmax(current, arg, row, false),
+            Self::User {
+                agg,
+                state,
+                combining,
+                dt,
+            } => {
+                let array =
+                    arg.ok_or_else(|| Error::Eval("user aggregate needs an argument".into()))?;
+                let state_arr = build_array(std::slice::from_ref(state), dt)?;
+                let out = if *combining {
+                    let value = scalar_at(array, row)?;
+                    let value_arr = build_array(std::slice::from_ref(&value), dt)?;
+                    agg.merge(state_arr.as_ref(), value_arr.as_ref())?
+                } else {
+                    let value_arr = array.slice(row, 1);
+                    agg.update(state_arr.as_ref(), value_arr.as_ref())?
+                };
+                *state = scalar_at(out.as_ref(), 0)?;
+                Ok(())
+            }
         }
     }
 
@@ -400,6 +488,7 @@ impl Accum {
             Self::Min { current } | Self::Max { current } => {
                 current.clone().unwrap_or(Scalar::Null)
             }
+            Self::User { state, .. } => state.clone(),
         }
     }
 }
