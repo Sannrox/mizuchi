@@ -21,9 +21,11 @@ pub struct SessionConfig {
     /// Directory for shuffle IPC files.
     pub shuffle_dir: Option<PathBuf>,
     /// Roots that [`super::Session::register_parquet`],
-    /// [`super::Session::register_csv`], and other session reads may open.
+    /// [`super::Session::register_csv`], Delta/Iceberg reads, and other
+    /// session reads may open.
     pub allowed_read_paths: Vec<PathBuf>,
-    /// Roots that [`super::Session::write_parquet`] may create.
+    /// Roots that [`super::Session::write_parquet`], Delta, and Iceberg
+    /// writes may create.
     pub allowed_write_paths: Vec<PathBuf>,
 }
 

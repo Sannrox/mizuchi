@@ -16,6 +16,7 @@ execute; skipped records are parsed and ignored.
 | Inner join | `join.slt` |
 | Uncorrelated `FROM` subquery (derived table) | `subquery.slt` |
 | `CAST` of integer, float, and text | `decimal.slt` |
+| `MERGE INTO` match / update / insert / delete | `merge.slt` |
 
 Arrow `Decimal*`, Date, Timestamp, Duration, and Interval are accepted at the
 schema boundary (`schema.rs` unit tests). They have no SQL path yet.

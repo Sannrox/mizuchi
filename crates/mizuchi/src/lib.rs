@@ -16,6 +16,7 @@ pub mod batch;
 mod error;
 pub mod exec;
 pub mod expr;
+pub mod lake;
 pub mod opt;
 pub mod plan;
 pub mod read;
@@ -27,14 +28,21 @@ pub mod write;
 pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
 pub use error::{Error, Result};
 pub use exec::{
-    CancelToken, Cluster, ClusterConfig, Engine, InputScan, MicroBatchAgg, OperatorMetrics,
-    OutputWrite, QueryReport, QueryResult, Session, SessionConfig, WorkerResources,
+    CancelToken, Cluster, ClusterConfig, Engine, InputScan, MergeStats, MicroBatchAgg,
+    OperatorMetrics, OutputWrite, QueryReport, QueryResult, Session, SessionConfig,
+    WorkerResources,
 };
 pub use expr::{BinaryOp, Expr, UnaryOp};
+pub use lake::{
+    LakeSnapshot, SchemaEvolution, TimeTravel, delta_head, evolve_delta, evolve_iceberg,
+    iceberg_head, read_delta, read_iceberg, write_delta, write_delta_at, write_iceberg,
+    write_iceberg_at,
+};
 pub use object_store::ObjectStore;
 pub use opt::{estimate_rows, optimize};
 pub use plan::{
-    Catalog, ColumnStats, JoinType, LogicalPlan, TableStats, plan_sql, table_stats_from_batches,
+    Catalog, ColumnStats, JoinType, LogicalPlan, MergeActionPlan, MergeClausePlan, MergeMatch,
+    MergePlan, TableStats, bind_merge, merge_target_table, plan_sql, table_stats_from_batches,
 };
 pub use read::{
     ColumnRange, CsvReadOptions, ParquetReadOptions, RowGroupStats, read_csv, read_parquet,

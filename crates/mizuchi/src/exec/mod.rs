@@ -11,6 +11,7 @@ mod incremental;
 mod join;
 mod key;
 mod memory;
+mod merge;
 mod metrics;
 mod op;
 mod report;
@@ -39,6 +40,7 @@ pub use cluster::{Cluster, ClusterConfig, WorkerResources};
 pub use config::SessionConfig;
 pub use engine::Engine;
 pub use incremental::MicroBatchAgg;
+pub use merge::MergeStats;
 pub use metrics::OperatorMetrics;
 pub use op::{CpuLowering, Lowering, Operator};
 pub use report::{InputScan, OutputWrite, QueryReport, QueryResult};
@@ -395,6 +397,178 @@ impl Session {
             bytes: stats.bytes,
             commit_id: stats.commit_id,
         }))
+    }
+
+    /// Batches and schema of a registered table.
+    pub fn table_data(&self, name: &str) -> Result<(SchemaRef, Vec<Batch>)> {
+        let table = self
+            .tables
+            .get(&normalize_name(name))
+            .ok_or_else(|| Error::Plan(format!("table not found: {name}")))?;
+        Ok((table.schema.clone(), table.batches.clone()))
+    }
+
+    /// Apply a `MERGE` statement to a registered target table.
+    pub fn merge_sql(&mut self, sql: &str) -> Result<MergeStats> {
+        self.cancel.check()?;
+        let mut catalog = Catalog::new();
+        for (name, table) in &self.tables {
+            catalog.register(name, table.schema.clone())?;
+            catalog.set_stats(name, table.stats.clone())?;
+        }
+        let plan = crate::plan::bind_merge(sql, &catalog)?;
+        let (batches, stats) = merge::run(self, &plan)?;
+        self.register(stats.table.clone(), plan.target_schema, batches)?;
+        Ok(stats)
+    }
+
+    /// Write a registered table as a Delta table after the write allow-list check.
+    pub fn write_delta(
+        &self,
+        dest: impl AsRef<Path>,
+        name: &str,
+        mode: crate::write::WriteMode,
+    ) -> Result<crate::lake::LakeSnapshot> {
+        let dest = dest.as_ref();
+        config::assert_allowed(dest, &self.allowed_write_paths)?;
+        let (_, batches) = self.table_data(name)?;
+        crate::lake::write_delta(dest, &batches, mode)
+    }
+
+    /// Load a Delta snapshot as an in-memory table after the read allow-list check.
+    pub fn register_delta(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+        travel: crate::lake::TimeTravel,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        config::assert_allowed(path, &self.allowed_read_paths)?;
+        let batches = crate::lake::read_delta(path, travel)?;
+        let schema = match batches.first() {
+            Some(batch) => batch.schema(),
+            None => return Err(Error::Io(format!("{} produced no batches", path.display()))),
+        };
+        self.register(name, schema, batches)
+    }
+
+    /// Merge into a Delta table: read the current snapshot, apply `sql`, commit.
+    pub fn merge_delta(
+        &mut self,
+        dest: impl AsRef<Path>,
+        sql: &str,
+    ) -> Result<crate::lake::LakeSnapshot> {
+        let dest = dest.as_ref();
+        config::assert_allowed(dest, &self.allowed_write_paths)?;
+        config::assert_allowed(dest, &self.allowed_read_paths)?;
+        let target = crate::plan::merge_target_table(sql)?;
+        let head = crate::lake::delta_head(dest)?;
+        let batches = crate::lake::read_delta(dest, crate::lake::TimeTravel::Latest)?;
+        let schema = match batches.first() {
+            Some(b) => b.schema(),
+            None => {
+                return Err(Error::Io(format!("{} produced no batches", dest.display())));
+            }
+        };
+        self.merge_and_commit(sql, target, schema, batches, |session, name| {
+            let (_, out) = session.table_data(name)?;
+            crate::lake::write_delta_at(
+                dest,
+                &out,
+                crate::write::WriteMode::Overwrite,
+                Some(head.version),
+            )
+        })
+    }
+
+    /// Write a registered table as an Iceberg table after the write allow-list check.
+    pub fn write_iceberg(
+        &self,
+        dest: impl AsRef<Path>,
+        name: &str,
+        mode: crate::write::WriteMode,
+    ) -> Result<crate::lake::LakeSnapshot> {
+        let dest = dest.as_ref();
+        config::assert_allowed(dest, &self.allowed_write_paths)?;
+        let (_, batches) = self.table_data(name)?;
+        crate::lake::write_iceberg(dest, &batches, mode)
+    }
+
+    /// Load an Iceberg snapshot as an in-memory table after the read allow-list check.
+    pub fn register_iceberg(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+        travel: crate::lake::TimeTravel,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        config::assert_allowed(path, &self.allowed_read_paths)?;
+        let batches = crate::lake::read_iceberg(path, travel)?;
+        let schema = match batches.first() {
+            Some(batch) => batch.schema(),
+            None => return Err(Error::Io(format!("{} produced no batches", path.display()))),
+        };
+        self.register(name, schema, batches)
+    }
+
+    /// Merge into an Iceberg table: read the current snapshot, apply `sql`, commit.
+    pub fn merge_iceberg(
+        &mut self,
+        dest: impl AsRef<Path>,
+        sql: &str,
+    ) -> Result<crate::lake::LakeSnapshot> {
+        let dest = dest.as_ref();
+        config::assert_allowed(dest, &self.allowed_write_paths)?;
+        config::assert_allowed(dest, &self.allowed_read_paths)?;
+        let target = crate::plan::merge_target_table(sql)?;
+        let head = crate::lake::iceberg_head(dest)?;
+        let batches = crate::lake::read_iceberg(dest, crate::lake::TimeTravel::Latest)?;
+        let schema = match batches.first() {
+            Some(b) => b.schema(),
+            None => {
+                return Err(Error::Io(format!("{} produced no batches", dest.display())));
+            }
+        };
+        self.merge_and_commit(sql, target, schema, batches, |session, name| {
+            let (_, out) = session.table_data(name)?;
+            crate::lake::write_iceberg_at(
+                dest,
+                &out,
+                crate::write::WriteMode::Overwrite,
+                Some(head.version),
+            )
+        })
+    }
+
+    fn merge_and_commit(
+        &mut self,
+        sql: &str,
+        target: String,
+        schema: SchemaRef,
+        batches: Vec<Batch>,
+        commit: impl FnOnce(&Session, &str) -> Result<crate::lake::LakeSnapshot>,
+    ) -> Result<crate::lake::LakeSnapshot> {
+        let key = normalize_name(&target);
+        let previous = self.tables.get(&key).cloned();
+        self.register(target, schema, batches)?;
+        let result = (|| {
+            let stats = self.merge_sql(sql)?;
+            commit(self, &stats.table)
+        })();
+        match result {
+            Ok(snap) => Ok(snap),
+            Err(e) => {
+                match previous {
+                    Some(table) => {
+                        self.tables.insert(key, table);
+                    }
+                    None => {
+                        self.tables.remove(&key);
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Bind and optimize `sql` against registered tables.
@@ -1598,7 +1772,7 @@ mod tests {
         assert_eq!(amts.len(), 100);
         assert_eq!(
             amts.iter().map(|v| v.unwrap_or(0)).sum::<i64>(),
-            (0..100).sum()
+            (0..100).sum::<i64>()
         );
         let filtered = s
             .execute_sql(

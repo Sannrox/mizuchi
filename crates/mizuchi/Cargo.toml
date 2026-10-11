@@ -16,6 +16,7 @@ parquet = { workspace = true }
 sqlparser = { workspace = true }
 object_store = { workspace = true }
 futures = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 default = []
