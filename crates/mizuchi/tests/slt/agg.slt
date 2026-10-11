@@ -1,0 +1,27 @@
+statement ok
+CREATE TABLE t (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z'), (NULL, 'n')
+
+query IIIIII
+SELECT COUNT(*), COUNT(a), SUM(a), MIN(a), MAX(a), COUNT(DISTINCT a) FROM t
+----
+4
+3
+6
+1
+3
+3
+
+query II rowsort
+SELECT a, COUNT(*) FROM t GROUP BY a
+----
+NULL
+1
+1
+1
+2
+1
+3
+1

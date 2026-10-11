@@ -1,0 +1,28 @@
+# Public-style SELECT subset.
+
+statement ok
+CREATE TABLE t (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z'), (NULL, 'n')
+
+query I
+SELECT a FROM t WHERE a > 1
+----
+2
+3
+
+query IT rowsort
+SELECT a, b FROM t WHERE a IS NOT NULL
+----
+1
+x
+2
+y
+3
+z
+
+query I
+SELECT 1 + 2
+----
+3
