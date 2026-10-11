@@ -15,6 +15,6 @@ name = "mizuchi"
 crate-type = ["cdylib"]
 
 [dependencies]
-arrow = { version = "60.0.0", default-features = false }
+arrow = { version = "60.0.0", default-features = false, features = ["ffi"] }
 mizuchi = { path = "../crates/mizuchi" }
 pyo3 = { version = "0.25", features = ["abi3-py310", "extension-module"] }

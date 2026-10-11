@@ -1,8 +1,12 @@
 //! Lazy DataFrame API over mizuchi plans, exposed to Python via PyO3.
 //!
 //! Expressions are SQL fragments bound by the engine. collect() runs the
-//! composed query and returns rows as tuples.
+//! composed query and returns rows as tuples. Vectorized Python UDFs and
+//! Arrow C Data Interface interchange live in this crate.
 
+mod arrow_c;
+
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ::mizuchi::{ArrayRef, Batch, Error as EngineError, Session, VERSION};
@@ -11,7 +15,9 @@ use arrow::array::{
     Int32Array, Int64Array, LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array,
     UInt64Array,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::compute::take;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
 use pyo3::BoundObject;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -69,6 +75,21 @@ impl PySession {
             sql: sql.to_string(),
             n: 0,
         }
+    }
+
+    /// Register a table from an Arrow C Data Interface producer
+    /// (pyarrow, Polars, pandas with Arrow dtypes, or any `__arrow_c_stream__`).
+    fn register_arrow(&self, name: &str, obj: Bound<'_, PyAny>) -> PyResult<()> {
+        let batches = arrow_c::import_batches(&obj)?;
+        if batches.is_empty() {
+            return Err(PyValueError::new_err(
+                "register_arrow requires at least one batch",
+            ));
+        }
+        let schema = batches[0].schema();
+        lock_session(&self.inner)?
+            .register(name, schema, batches)
+            .map_err(py_err)
     }
 }
 
@@ -154,6 +175,42 @@ impl PyDataFrame {
         rows_to_pylist(py, &batches)
     }
 
+    /// Export result batches as an Arrow C stream (zero-copy capsules).
+    fn to_arrow(&self) -> PyResult<PyArrowStream> {
+        let session = lock_session(&self.session)?;
+        let batches = session.execute_sql(&self.sql).map_err(py_err)?;
+        let (schema, rbs) = batches_to_stream_parts(batches)?;
+        Ok(PyArrowStream {
+            schema,
+            batches: rbs,
+        })
+    }
+
+    /// Vectorized scalar UDF: `func` takes one pyarrow.Array per column and
+    /// returns an array of the same length. Nulls are passed through.
+    #[pyo3(signature = (name, func, *cols))]
+    fn udf(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        func: Bound<'_, PyAny>,
+        cols: Vec<String>,
+    ) -> PyResult<Self> {
+        if cols.is_empty() {
+            return Err(PyValueError::new_err("udf requires at least one column"));
+        }
+        let mut session = lock_session(&self.session)?;
+        let batches = session.execute_sql(&self.sql).map_err(py_err)?;
+        let out = apply_scalar_udf(py, &batches, name, &func, &cols)?;
+        let table = format!("_mudf{}", self.n);
+        let schema = out
+            .first()
+            .map(|b| b.schema())
+            .ok_or_else(|| PyValueError::new_err("udf produced no batches"))?;
+        session.register(&table, schema, out).map_err(py_err)?;
+        Ok(self.wrap(format!("SELECT * FROM {}", quote_ident(&table))))
+    }
+
     fn explain(&self) -> PyResult<String> {
         let session = lock_session(&self.session)?;
         session.explain_stages(&self.sql).map_err(py_err)
@@ -187,6 +244,455 @@ impl PyGrouped {
             self.df.sql
         )))
     }
+
+    /// Vectorized aggregate UDF: `func` takes one pyarrow.Array per column for
+    /// the group and returns a scalar (or a length-1 array).
+    #[pyo3(signature = (name, func, *cols))]
+    fn agg_udf(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        func: Bound<'_, PyAny>,
+        cols: Vec<String>,
+    ) -> PyResult<PyDataFrame> {
+        if cols.is_empty() {
+            return Err(PyValueError::new_err(
+                "agg_udf requires at least one column",
+            ));
+        }
+        let mut session = lock_session(&self.df.session)?;
+        let batches = session.execute_sql(&self.df.sql).map_err(py_err)?;
+        let out = apply_agg_udf(py, &batches, &self.keys, name, &func, &cols)?;
+        let table = format!("_magg{}", self.df.n);
+        let schema = out
+            .first()
+            .map(|b| b.schema())
+            .ok_or_else(|| PyValueError::new_err("agg_udf produced no batches"))?;
+        session.register(&table, schema, out).map_err(py_err)?;
+        Ok(self
+            .df
+            .wrap(format!("SELECT * FROM {}", quote_ident(&table))))
+    }
+}
+
+/// Arrow C stream producer. pyarrow, Polars, and pandas consume this via
+/// `__arrow_c_stream__`.
+#[pyclass(name = "ArrowStream")]
+struct PyArrowStream {
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+}
+
+#[pymethods]
+impl PyArrowStream {
+    #[pyo3(signature = (requested_schema=None))]
+    fn __arrow_c_stream__<'py>(
+        &self,
+        py: Python<'py>,
+        requested_schema: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        let _ = requested_schema;
+        arrow_c::export_stream(py, self.schema.clone(), self.batches.clone())
+    }
+}
+
+fn batches_to_stream_parts(batches: Vec<Batch>) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
+    if batches.is_empty() {
+        return Ok((Arc::new(Schema::empty()), Vec::new()));
+    }
+    let schema = batches[0].schema();
+    let rbs = batches.into_iter().map(Batch::into_arrow).collect();
+    Ok((schema, rbs))
+}
+
+fn apply_scalar_udf(
+    py: Python<'_>,
+    batches: &[Batch],
+    out_name: &str,
+    func: &Bound<'_, PyAny>,
+    cols: &[String],
+) -> PyResult<Vec<Batch>> {
+    if batches.is_empty() {
+        return Err(PyValueError::new_err("udf input is empty"));
+    }
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let args = py_args_from_batch(py, batch, cols)?;
+        let result = func.call1(PyTuple::new(py, args)?)?;
+        let array = result_to_array(&result)?;
+        if array.len() != batch.num_rows() {
+            return Err(PyValueError::new_err(format!(
+                "scalar UDF must return {} rows, got {}",
+                batch.num_rows(),
+                array.len()
+            )));
+        }
+        out.push(with_column(batch, out_name, array)?);
+    }
+    Ok(out)
+}
+
+fn apply_agg_udf(
+    py: Python<'_>,
+    batches: &[Batch],
+    keys: &[String],
+    out_name: &str,
+    func: &Bound<'_, PyAny>,
+    cols: &[String],
+) -> PyResult<Vec<Batch>> {
+    if batches.is_empty() {
+        return Err(PyValueError::new_err("agg_udf input is empty"));
+    }
+    let schema = batches[0].schema();
+    let key_idx = column_indices(schema.as_ref(), keys)?;
+    let arg_idx = column_indices(schema.as_ref(), cols)?;
+    let mut groups: HashMap<Vec<Cell>, Vec<u32>> = HashMap::new();
+    let mut order: Vec<Vec<Cell>> = Vec::new();
+    let mut base: u32 = 0;
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            let key: Vec<Cell> = key_idx
+                .iter()
+                .map(|&i| cell_at(batch.column(i), row))
+                .collect::<PyResult<_>>()?;
+            let global = base + row as u32;
+            if let Some(rows) = groups.get_mut(&key) {
+                rows.push(global);
+            } else {
+                groups.insert(key.clone(), vec![global]);
+                order.push(key);
+            }
+        }
+        base += batch.num_rows() as u32;
+    }
+    let mut key_builders: Vec<Vec<Cell>> = vec![Vec::new(); keys.len()];
+    let mut out_arrays: Vec<ArrayRef> = Vec::new();
+    let mut out_type: Option<DataType> = None;
+    for key in &order {
+        let rows = &groups[key];
+        let args = take_group_args(py, batches, &arg_idx, rows)?;
+        let result = func.call1(PyTuple::new(py, args)?)?;
+        let array = result_to_array_or_scalar(&result)?;
+        if array.len() != 1 {
+            return Err(PyValueError::new_err(
+                "aggregate UDF must return a scalar or a length-1 array",
+            ));
+        }
+        match &out_type {
+            None => out_type = Some(array.data_type().clone()),
+            Some(dt) if dt != array.data_type() => {
+                return Err(PyValueError::new_err(
+                    "aggregate UDF return type must be the same for every group",
+                ));
+            }
+            _ => {}
+        }
+        out_arrays.push(array);
+        for (i, cell) in key.iter().enumerate() {
+            key_builders[i].push(cell.clone());
+        }
+    }
+    let dt = out_type.unwrap_or(DataType::Null);
+    let mut fields = Vec::new();
+    let mut columns: Vec<ArrayRef> = Vec::new();
+    for (i, name) in keys.iter().enumerate() {
+        let dt = schema.field(key_idx[i]).data_type().clone();
+        fields.push(Field::new(name, dt.clone(), true));
+        columns.push(cells_to_array(&key_builders[i], &dt)?);
+    }
+    fields.push(Field::new(out_name, dt.clone(), true));
+    columns.push(concat_len1(&out_arrays, &dt, order.len())?);
+    let schema = Arc::new(Schema::new(fields));
+    Ok(vec![Batch::try_new(schema, columns).map_err(py_err)?])
+}
+
+fn column_indices(schema: &Schema, names: &[String]) -> PyResult<Vec<usize>> {
+    names
+        .iter()
+        .map(|name| {
+            schema
+                .index_of(name)
+                .or_else(|_| schema.index_of(&name.to_ascii_lowercase()))
+                .map_err(|_| PyValueError::new_err(format!("column not found: {name}")))
+        })
+        .collect()
+}
+
+fn py_args_from_batch<'py>(
+    py: Python<'py>,
+    batch: &Batch,
+    cols: &[String],
+) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    let mut args = Vec::with_capacity(cols.len());
+    for name in cols {
+        let arr = batch
+            .column_by_name(name)
+            .or_else(|| batch.column_by_name(&name.to_ascii_lowercase()))
+            .ok_or_else(|| PyValueError::new_err(format!("column not found: {name}")))?;
+        args.push(arrow_c::to_pyarrow_array(py, arr.as_ref())?);
+    }
+    Ok(args)
+}
+
+fn take_group_args<'py>(
+    py: Python<'py>,
+    batches: &[Batch],
+    arg_idx: &[usize],
+    rows: &[u32],
+) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    let indices = UInt32Array::from(rows.to_vec());
+    let mut args = Vec::with_capacity(arg_idx.len());
+    for &col in arg_idx {
+        let full = concat_column(batches, col)?;
+        let taken =
+            take(&full, &indices, None).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        args.push(arrow_c::to_pyarrow_array(py, taken.as_ref())?);
+    }
+    Ok(args)
+}
+
+fn concat_column(batches: &[Batch], col: usize) -> PyResult<ArrayRef> {
+    let refs: Vec<&dyn Array> = batches.iter().map(|b| b.column(col).as_ref()).collect();
+    arrow::compute::concat(&refs).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+fn concat_len1(arrays: &[ArrayRef], dt: &DataType, n: usize) -> PyResult<ArrayRef> {
+    if arrays.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "cannot build empty {dt} aggregate column ({n} groups)"
+        )));
+    }
+    let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+    arrow::compute::concat(&refs).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+fn result_to_array(obj: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
+    if obj.hasattr("__arrow_c_array__")? {
+        arrow_c::import_array(obj)
+    } else {
+        Err(PyValueError::new_err(
+            "UDF must return an Arrow array (__arrow_c_array__)",
+        ))
+    }
+}
+
+fn result_to_array_or_scalar(obj: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
+    if obj.hasattr("__arrow_c_array__")? {
+        return arrow_c::import_array(obj);
+    }
+    if obj.hasattr("as_py")? {
+        let inner = obj.call_method0("as_py")?;
+        return python_scalar_array(&inner);
+    }
+    python_scalar_array(obj)
+}
+
+fn python_scalar_array(obj: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
+    if obj.is_none() {
+        return Ok(Arc::new(Int64Array::from(vec![None::<i64>])));
+    }
+    if obj.is_instance_of::<PyBool>() {
+        let v: bool = obj.extract()?;
+        return Ok(Arc::new(BooleanArray::from(vec![Some(v)])));
+    }
+    if obj.is_instance_of::<PyInt>() {
+        let v: i64 = obj.extract()?;
+        return Ok(Arc::new(Int64Array::from(vec![Some(v)])));
+    }
+    if let Ok(v) = obj.extract::<f64>() {
+        return Ok(Arc::new(Float64Array::from(vec![Some(v)])));
+    }
+    if let Ok(v) = obj.extract::<String>() {
+        return Ok(Arc::new(StringArray::from(vec![Some(v)])));
+    }
+    Err(PyValueError::new_err(
+        "aggregate UDF returned an unsupported scalar",
+    ))
+}
+
+fn with_column(batch: &Batch, name: &str, array: ArrayRef) -> PyResult<Batch> {
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    let mut columns: Vec<ArrayRef> = (0..batch.num_columns())
+        .map(|i| batch.column(i).clone())
+        .collect();
+    match batch.schema().index_of(name) {
+        Ok(i) => {
+            fields[i] = Field::new(name, array.data_type().clone(), true);
+            columns[i] = array;
+        }
+        Err(_) => {
+            fields.push(Field::new(name, array.data_type().clone(), true));
+            columns.push(array);
+        }
+    }
+    let schema = Arc::new(Schema::new(fields));
+    Batch::try_new(schema, columns).map_err(py_err)
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum Cell {
+    Null,
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64(u64),
+    Utf8(String),
+    Bin(Vec<u8>),
+}
+
+fn cell_at(arr: &ArrayRef, row: usize) -> PyResult<Cell> {
+    if arr.is_null(row) {
+        return Ok(Cell::Null);
+    }
+    match arr.data_type() {
+        DataType::Boolean => Ok(Cell::Bool(
+            downcast::<BooleanArray>(arr, "Boolean")?.value(row),
+        )),
+        DataType::Int8 => Ok(Cell::I64(i64::from(
+            downcast::<Int8Array>(arr, "Int8")?.value(row),
+        ))),
+        DataType::Int16 => Ok(Cell::I64(i64::from(
+            downcast::<Int16Array>(arr, "Int16")?.value(row),
+        ))),
+        DataType::Int32 => Ok(Cell::I64(i64::from(
+            downcast::<Int32Array>(arr, "Int32")?.value(row),
+        ))),
+        DataType::Int64 => Ok(Cell::I64(downcast::<Int64Array>(arr, "Int64")?.value(row))),
+        DataType::UInt8 => Ok(Cell::U64(u64::from(
+            downcast::<UInt8Array>(arr, "UInt8")?.value(row),
+        ))),
+        DataType::UInt16 => Ok(Cell::U64(u64::from(
+            downcast::<UInt16Array>(arr, "UInt16")?.value(row),
+        ))),
+        DataType::UInt32 => Ok(Cell::U64(u64::from(
+            downcast::<UInt32Array>(arr, "UInt32")?.value(row),
+        ))),
+        DataType::UInt64 => Ok(Cell::U64(
+            downcast::<UInt64Array>(arr, "UInt64")?.value(row),
+        )),
+        DataType::Float32 => Ok(Cell::F64(
+            f64::from(downcast::<Float32Array>(arr, "Float32")?.value(row)).to_bits(),
+        )),
+        DataType::Float64 => Ok(Cell::F64(
+            downcast::<Float64Array>(arr, "Float64")?
+                .value(row)
+                .to_bits(),
+        )),
+        DataType::Utf8 => Ok(Cell::Utf8(
+            downcast::<StringArray>(arr, "Utf8")?.value(row).to_string(),
+        )),
+        DataType::LargeUtf8 => Ok(Cell::Utf8(
+            downcast::<LargeStringArray>(arr, "LargeUtf8")?
+                .value(row)
+                .to_string(),
+        )),
+        DataType::Binary => Ok(Cell::Bin(
+            downcast::<BinaryArray>(arr, "Binary")?.value(row).to_vec(),
+        )),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported grouping type {other}"
+        ))),
+    }
+}
+
+fn cells_to_array(cells: &[Cell], dt: &DataType) -> PyResult<ArrayRef> {
+    match dt {
+        DataType::Boolean => Ok(Arc::new(BooleanArray::from(map_cells(
+            cells,
+            |c| match c {
+                Cell::Bool(v) => Some(*v),
+                _ => None,
+            },
+        )))),
+        DataType::Int8 => Ok(Arc::new(Int8Array::from(map_cells(cells, |c| match c {
+            Cell::I64(v) => i8::try_from(*v).ok(),
+            _ => None,
+        })))),
+        DataType::Int16 => Ok(Arc::new(Int16Array::from(map_cells(cells, |c| match c {
+            Cell::I64(v) => i16::try_from(*v).ok(),
+            _ => None,
+        })))),
+        DataType::Int32 => Ok(Arc::new(Int32Array::from(map_cells(cells, |c| match c {
+            Cell::I64(v) => i32::try_from(*v).ok(),
+            _ => None,
+        })))),
+        DataType::Int64 => Ok(Arc::new(Int64Array::from(map_cells(cells, |c| match c {
+            Cell::I64(v) => Some(*v),
+            _ => None,
+        })))),
+        DataType::UInt8 => Ok(Arc::new(UInt8Array::from(map_cells(cells, |c| match c {
+            Cell::U64(v) => u8::try_from(*v).ok(),
+            _ => None,
+        })))),
+        DataType::UInt16 => Ok(Arc::new(UInt16Array::from(map_cells(cells, |c| match c {
+            Cell::U64(v) => u16::try_from(*v).ok(),
+            _ => None,
+        })))),
+        DataType::UInt32 => Ok(Arc::new(UInt32Array::from(map_cells(cells, |c| match c {
+            Cell::U64(v) => u32::try_from(*v).ok(),
+            _ => None,
+        })))),
+        DataType::UInt64 => Ok(Arc::new(UInt64Array::from(map_cells(cells, |c| match c {
+            Cell::U64(v) => Some(*v),
+            _ => None,
+        })))),
+        DataType::Float32 => Ok(Arc::new(Float32Array::from(map_cells(
+            cells,
+            |c| match c {
+                Cell::F64(b) => Some(f64::from_bits(*b) as f32),
+                _ => None,
+            },
+        )))),
+        DataType::Float64 => Ok(Arc::new(Float64Array::from(map_cells(
+            cells,
+            |c| match c {
+                Cell::F64(b) => Some(f64::from_bits(*b)),
+                _ => None,
+            },
+        )))),
+        DataType::Utf8 => Ok(Arc::new(StringArray::from(
+            cells
+                .iter()
+                .map(|c| match c {
+                    Cell::Utf8(v) => Some(v.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        ))),
+        DataType::LargeUtf8 => Ok(Arc::new(LargeStringArray::from(
+            cells
+                .iter()
+                .map(|c| match c {
+                    Cell::Utf8(v) => Some(v.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        ))),
+        DataType::Binary => Ok(Arc::new(BinaryArray::from(
+            cells
+                .iter()
+                .map(|c| match c {
+                    Cell::Bin(v) => Some(v.as_slice()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        ))),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported grouping key type {other}"
+        ))),
+    }
+}
+
+fn map_cells<T>(cells: &[Cell], f: impl Fn(&Cell) -> Option<T>) -> Vec<Option<T>> {
+    cells
+        .iter()
+        .map(|c| if matches!(c, Cell::Null) { None } else { f(c) })
+        .collect()
 }
 
 fn dict_to_batch(columns: &Bound<'_, PyDict>) -> PyResult<Batch> {
@@ -400,6 +906,7 @@ fn mizuchi(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySession>()?;
     m.add_class::<PyDataFrame>()?;
     m.add_class::<PyGrouped>()?;
+    m.add_class::<PyArrowStream>()?;
     m.add("version", VERSION)?;
     Ok(())
 }

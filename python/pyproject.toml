@@ -9,6 +9,9 @@ description = "Python DataFrame API for the mizuchi query engine."
 requires-python = ">=3.10"
 license = "Apache-2.0"
 
+[project.optional-dependencies]
+arrow = ["pyarrow>=14"]
+
 [tool.maturin]
 manifest-path = "Cargo.toml"
 module-name = "mizuchi"
