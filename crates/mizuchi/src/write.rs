@@ -67,6 +67,33 @@ pub fn write_parquet_cancel(
     opts: ParquetWriteOptions<'_>,
     cancel: &CancelToken,
 ) -> Result<()> {
+    write_parquet_stats(dest, batches, opts, cancel).map(|_| ())
+}
+
+/// Stats for a committed write: partitions, rows, bytes, and a stable commit id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteStats {
+    /// Dataset directory.
+    pub path: String,
+    /// Hive-style partition directories that received files.
+    pub partitions: Vec<String>,
+    /// `append` or `overwrite`.
+    pub mode: String,
+    /// Rows in `batches`.
+    pub rows: u64,
+    /// Bytes of committed Parquet files.
+    pub bytes: u64,
+    /// Deterministic id (`mode:rows:bytes:partitions`).
+    pub commit_id: String,
+}
+
+/// [`write_parquet_cancel`] that also returns [`WriteStats`].
+pub fn write_parquet_stats(
+    dest: impl AsRef<Path>,
+    batches: &[Batch],
+    opts: ParquetWriteOptions<'_>,
+    cancel: &CancelToken,
+) -> Result<WriteStats> {
     write_inner(dest.as_ref(), batches, opts, cancel, CommitCtrl::default())
 }
 
@@ -83,7 +110,7 @@ fn write_inner(
     opts: ParquetWriteOptions<'_>,
     cancel: &CancelToken,
     ctrl: CommitCtrl,
-) -> Result<()> {
+) -> Result<WriteStats> {
     cancel.check()?;
     if let Some(batch) = batches.first() {
         validate_partitions(batch, opts.partition_by)?;
@@ -96,7 +123,7 @@ fn write_inner(
         }
     } else if !opts.partition_by.is_empty() && opts.mode == WriteMode::Append {
         // Nothing to add; keep the dataset.
-        return Ok(());
+        return dataset_write_stats(dest, batches, opts);
     }
 
     fs::create_dir_all(dest).map_err(|e| io_err(dest, e))?;
@@ -119,13 +146,13 @@ fn write_inner(
         }
         publish(dest, &staging, opts.mode, id)?;
         write_success(dest)?;
-        Ok(())
+        dataset_write_stats(dest, batches, opts)
     })();
 
     match run {
-        Ok(()) => {
+        Ok(stats) => {
             let _ = fs::remove_dir_all(&staging);
-            Ok(())
+            Ok(stats)
         }
         Err(e) => {
             if !ctrl.leave_staging {
@@ -134,6 +161,45 @@ fn write_inner(
             Err(e)
         }
     }
+}
+
+fn dataset_write_stats(
+    dest: &Path,
+    batches: &[Batch],
+    opts: ParquetWriteOptions<'_>,
+) -> Result<WriteStats> {
+    let files = list_parquets(dest).unwrap_or_default();
+    let bytes: u64 = files
+        .iter()
+        .map(|f| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0))
+        .sum();
+    let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+    let mut partitions: Vec<String> = files
+        .iter()
+        .filter_map(|f| {
+            let rel = f.strip_prefix(dest).ok()?;
+            let parent = rel.parent()?;
+            if parent.as_os_str().is_empty() {
+                None
+            } else {
+                Some(parent.to_string_lossy().replace('\\', "/"))
+            }
+        })
+        .collect();
+    partitions.sort();
+    partitions.dedup();
+    let mode = match opts.mode {
+        WriteMode::Append => "append",
+        WriteMode::Overwrite => "overwrite",
+    };
+    Ok(WriteStats {
+        path: dest.display().to_string(),
+        partitions: partitions.clone(),
+        mode: mode.to_string(),
+        rows,
+        bytes,
+        commit_id: format!("{mode}:{rows}:{bytes}:{}", partitions.join("/")),
+    })
 }
 
 pub(crate) fn validate_partitions(batch: &Batch, partition_by: &[String]) -> Result<()> {
@@ -496,6 +562,7 @@ mod tests {
             &CancelToken::new(),
             ctrl,
         )
+        .map(|_| ())
     }
 
     fn committed_parts(dest: &Path) -> Vec<PathBuf> {
