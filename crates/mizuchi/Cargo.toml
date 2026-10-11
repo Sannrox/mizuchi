@@ -37,6 +37,7 @@ postgres = ["dep:postgres", "dep:postgres-native-tls", "dep:native-tls"]
 
 [dev-dependencies]
 arrow = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 landlock = "0.4.7"

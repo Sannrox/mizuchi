@@ -72,8 +72,9 @@ grant is denied. Optional Linux filesystem-limit tests use
 `--features sandbox` and `.github/workflows/sandbox.yml`
 (`workflow_dispatch` only). PostgreSQL source tests use
 `--features postgres` and `.github/workflows/postgres.yml`
-(`workflow_dispatch` only). Object-store lake and Iceberg REST catalog
-tests use `--features s3` and `.github/workflows/lake-store.yml`
+(`workflow_dispatch` only). Object-store S3 emulator tests (`--features s3
+-- --ignored`) run in default CI against MinIO; the job fails if they
+are skipped. Lake REST HTTP remains `.github/workflows/lake-store.yml`
 (`workflow_dispatch` only). `Cluster` sizes in-process workers, scales
 them, and may run speculative task copies. Layouts for a runner to
 deploy are under `deploy/`.

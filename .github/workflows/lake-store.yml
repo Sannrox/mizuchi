@@ -18,17 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Start MinIO
-        run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
-          for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:9000/minio/health/live && break
-            sleep 1
-          done
-          docker run --rm --network host --entrypoint /bin/sh minio/mc -c \
-            "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && mc mb local/mizuchi"
+        run: bash scripts/start-s3-emulator.sh
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
