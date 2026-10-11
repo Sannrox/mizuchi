@@ -3,14 +3,19 @@
 //! Equi-joins and grouped aggregates require a hash clustering of their inputs.
 //! Those requirements become exchange operators. The plan is then cut at each
 //! exchange: the child is a shuffle-map stage that writes partitioned batches
-//! into an in-memory shuffle, and the parent reads them as `ShuffleRead`.
+//! into a shuffle, and the parent reads them as `ShuffleRead`.
 //! A result stage produces the query output. Tasks of one stage are assigned
-//! round-robin to a bounded worker pool.
+//! round-robin to a bounded worker pool. A failed task is retried on any
+//! remaining worker up to four attempts; committed shuffle blocks are kept
+//! and reused. Partial writes from a failed attempt are discarded.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -548,8 +553,20 @@ fn join_schema(left: &SchemaRef, right: &SchemaRef) -> arrow::datatypes::Schema 
 
 static JOB_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// Failed tasks retry this many times, matching the usual default of four
+/// individual task failures before the stage is aborted.
+const MAX_TASK_ATTEMPTS: u32 = 4;
+
+#[cfg(test)]
+static INJECT_TASK_FAILURES: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static INJECT_RESULT_ONLY: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static MAP_COMMITS: AtomicU64 = AtomicU64::new(0);
+
 struct ShuffleStore {
-    memory: Mutex<HashMap<(usize, usize), Vec<Batch>>>,
+    /// In-memory blocks keyed by `(shuffle_id, map_partition, reduce_partition)`.
+    memory: Mutex<HashMap<(usize, usize, usize), Vec<Batch>>>,
     dir: Option<PathBuf>,
 }
 
@@ -596,7 +613,7 @@ impl ShuffleStore {
         map: usize,
         reduce: usize,
         schema: SchemaRef,
-        mut batches: Vec<Batch>,
+        batches: Vec<Batch>,
     ) -> Result<()> {
         if let Some(path) = self.block_path(shuffle_id, map, reduce) {
             return write_ipc(&path, schema, &batches);
@@ -605,9 +622,7 @@ impl ShuffleStore {
             .memory
             .lock()
             .map_err(|_| Error::Eval("shuffle lock poisoned".into()))?;
-        g.entry((shuffle_id, reduce))
-            .or_default()
-            .append(&mut batches);
+        g.insert((shuffle_id, map, reduce), batches);
         Ok(())
     }
 
@@ -619,29 +634,81 @@ impl ShuffleStore {
             .memory
             .lock()
             .map_err(|_| Error::Eval("shuffle lock poisoned".into()))?;
-        match g.get(&(shuffle_id, reduce)) {
-            Some(batches) => Ok(batches.clone()),
-            None => Ok(vec![Batch::empty(schema)?]),
+        let mut maps: Vec<(usize, Vec<Batch>)> = g
+            .iter()
+            .filter_map(|((sid, map, red), batches)| {
+                if *sid == shuffle_id && *red == reduce {
+                    Some((*map, batches.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        maps.sort_by_key(|(map, _)| *map);
+        let mut out = Vec::new();
+        for (_, batches) in maps {
+            out.extend(batches);
         }
+        if out.is_empty() {
+            out.push(Batch::empty(schema)?);
+        }
+        Ok(out)
     }
+
+    /// Drop a failed map attempt so a retry does not mix with partial output.
+    fn abort_map(&self, shuffle_id: usize, map: usize, reduces: usize) -> Result<()> {
+        if self.dir.is_some() {
+            for reduce in 0..reduces {
+                if let Some(path) = self.block_path(shuffle_id, map, reduce) {
+                    let _ = fs::remove_file(&path);
+                    let _ = fs::remove_file(tmp_path(&path));
+                }
+            }
+            return Ok(());
+        }
+        let mut g = self
+            .memory
+            .lock()
+            .map_err(|_| Error::Eval("shuffle lock poisoned".into()))?;
+        for reduce in 0..reduces {
+            g.remove(&(shuffle_id, map, reduce));
+        }
+        Ok(())
+    }
+}
+
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(".tmp");
+    PathBuf::from(os)
 }
 
 fn write_ipc(path: &Path, schema: SchemaRef, batches: &[Batch]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
     }
-    let file = File::create(path).map_err(|e| Error::Io(e.to_string()))?;
-    let mut writer =
-        FileWriter::try_new(file, schema.as_ref()).map_err(|e| Error::Io(e.to_string()))?;
-    for batch in batches {
-        if batch.num_rows() > 0 {
-            writer
-                .write(batch.as_arrow())
-                .map_err(|e| Error::Io(e.to_string()))?;
+    let tmp = tmp_path(path);
+    let write_tmp = || -> Result<()> {
+        let file = File::create(&tmp).map_err(|e| Error::Io(e.to_string()))?;
+        let mut writer =
+            FileWriter::try_new(file, schema.as_ref()).map_err(|e| Error::Io(e.to_string()))?;
+        for batch in batches {
+            if batch.num_rows() > 0 {
+                writer
+                    .write(batch.as_arrow())
+                    .map_err(|e| Error::Io(e.to_string()))?;
+            }
+        }
+        writer.finish().map_err(|e| Error::Io(e.to_string()))?;
+        Ok(())
+    };
+    match write_tmp() {
+        Ok(()) => fs::rename(&tmp, path).map_err(|e| Error::Io(e.to_string())),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
         }
     }
-    writer.finish().map_err(|e| Error::Io(e.to_string()))?;
-    Ok(())
 }
 
 fn read_ipc_reduce(
@@ -726,57 +793,231 @@ fn run_stage(
 ) -> Result<Vec<Batch>> {
     let n = stage.partitions.max(1);
     let workers = workers.min(n).max(1);
-    let jobs: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new((0..n).collect()));
-    let mut handles = Vec::with_capacity(workers);
-    for _ in 0..workers {
-        let jobs = jobs.clone();
-        let shuffle = shuffle.clone();
-        let session = session.clone();
-        let plan = stage.plan.clone();
-        let write = stage.write.clone();
-        let pool = pool.clone();
-        handles.push(thread::spawn(move || -> Result<Vec<Batch>> {
-            let mut local = Vec::new();
-            loop {
-                session.cancel.check()?;
-                let p = {
-                    let mut g = jobs
+    let pending: Arc<Mutex<Vec<(usize, u32)>>> =
+        Arc::new(Mutex::new((0..n).map(|p| (p, 0u32)).collect()));
+    let abort: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
+    let mut out = Vec::new();
+    loop {
+        if let Some(err) = abort
+            .lock()
+            .map_err(|_| Error::Eval("abort lock poisoned".into()))?
+            .take()
+        {
+            return Err(err);
+        }
+        let remaining = pending
+            .lock()
+            .map_err(|_| Error::Eval("task queue lock poisoned".into()))?
+            .len();
+        if remaining == 0 {
+            break;
+        }
+        let wave = workers.min(remaining).max(1);
+        let in_flight = Arc::new(Mutex::new(vec![None; wave]));
+        let mut handles = Vec::with_capacity(wave);
+        for i in 0..wave {
+            let pending = pending.clone();
+            let abort = abort.clone();
+            let in_flight = in_flight.clone();
+            let shuffle = shuffle.clone();
+            let session = session.clone();
+            let plan = stage.plan.clone();
+            let write = stage.write.clone();
+            let pool = pool.clone();
+            let kind = stage.kind;
+            handles.push(thread::spawn(move || -> Result<Vec<Batch>> {
+                let mut local = Vec::new();
+                loop {
+                    if abort
                         .lock()
-                        .map_err(|_| Error::Eval("task queue lock poisoned".into()))?;
-                    g.pop()
-                };
-                let Some(p) = p else {
-                    break;
-                };
-                let ctx = TaskCtx {
-                    session: session.clone(),
-                    partition: p,
-                    partitions: n,
-                    shuffle: shuffle.clone(),
-                    pool: pool.clone(),
-                };
-                let batches = collect(execute_physical(&plan, &ctx)?, &session.cancel)?;
-                if let Some(write) = &write {
-                    let parts = partition_batches(&batches, &write.keys, write.partitions)?;
-                    let schema = plan.schema().clone();
-                    for (r, part) in parts.into_iter().enumerate() {
-                        shuffle.write(write.shuffle_id, p, r, schema.clone(), part)?;
+                        .map_err(|_| Error::Eval("abort lock poisoned".into()))?
+                        .is_some()
+                    {
+                        break;
                     }
-                } else {
-                    local.extend(batches);
+                    session.cancel.check()?;
+                    let job = {
+                        let mut g = pending
+                            .lock()
+                            .map_err(|_| Error::Eval("task queue lock poisoned".into()))?;
+                        g.pop()
+                    };
+                    let Some((p, attempts)) = job else {
+                        break;
+                    };
+                    {
+                        let mut g = in_flight
+                            .lock()
+                            .map_err(|_| Error::Eval("in-flight lock poisoned".into()))?;
+                        g[i] = Some((p, attempts));
+                    }
+                    let ran = panic::catch_unwind(AssertUnwindSafe(|| {
+                        inject_failure(kind);
+                        run_one_task(&plan, &write, &session, p, n, &shuffle, &pool)
+                    }));
+                    {
+                        let mut g = in_flight
+                            .lock()
+                            .map_err(|_| Error::Eval("in-flight lock poisoned".into()))?;
+                        g[i] = None;
+                    }
+                    match ran {
+                        Ok(Ok(batches)) => local.extend(batches),
+                        Ok(Err(e)) => {
+                            requeue_or_abort(&pending, &abort, p, attempts, e, &write, &shuffle)?;
+                        }
+                        Err(_) => {
+                            requeue_or_abort(
+                                &pending,
+                                &abort,
+                                p,
+                                attempts,
+                                Error::Eval("worker panicked".into()),
+                                &write,
+                                &shuffle,
+                            )?;
+                        }
+                    }
+                }
+                Ok(local)
+            }));
+        }
+        for (i, h) in handles.into_iter().enumerate() {
+            match h.join() {
+                Ok(Ok(part)) => out.extend(part),
+                Ok(Err(e)) => {
+                    let mut g = abort
+                        .lock()
+                        .map_err(|_| Error::Eval("abort lock poisoned".into()))?;
+                    if g.is_none() {
+                        *g = Some(e);
+                    }
+                }
+                Err(_) => {
+                    let job = {
+                        let mut g = in_flight
+                            .lock()
+                            .map_err(|_| Error::Eval("in-flight lock poisoned".into()))?;
+                        g[i].take()
+                    };
+                    if let Some((p, attempts)) = job {
+                        requeue_or_abort(
+                            &pending,
+                            &abort,
+                            p,
+                            attempts,
+                            Error::Eval("worker panicked".into()),
+                            &stage.write,
+                            shuffle,
+                        )?;
+                    }
                 }
             }
-            Ok(local)
-        }));
+        }
     }
-    let mut out = Vec::new();
-    for h in handles {
-        let part = h
-            .join()
-            .map_err(|_| Error::Eval("worker panicked".into()))??;
-        out.extend(part);
+    if let Some(err) = abort
+        .lock()
+        .map_err(|_| Error::Eval("abort lock poisoned".into()))?
+        .take()
+    {
+        return Err(err);
     }
     Ok(out)
+}
+
+fn inject_failure(_kind: StageKind) {
+    #[cfg(test)]
+    {
+        if INJECT_RESULT_ONLY.load(Ordering::SeqCst) && _kind != StageKind::Result {
+            return;
+        }
+        let mut cur = INJECT_TASK_FAILURES.load(Ordering::SeqCst);
+        loop {
+            if cur == 0 {
+                return;
+            }
+            match INJECT_TASK_FAILURES.compare_exchange(
+                cur,
+                cur - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => panic!("injected worker failure"),
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+}
+
+fn run_one_task(
+    plan: &PhysicalPlan,
+    write: &Option<ShuffleWrite>,
+    session: &Session,
+    partition: usize,
+    partitions: usize,
+    shuffle: &Arc<ShuffleStore>,
+    pool: &Arc<super::memory::MemoryPool>,
+) -> Result<Vec<Batch>> {
+    let ctx = TaskCtx {
+        session: session.clone(),
+        partition,
+        partitions,
+        shuffle: shuffle.clone(),
+        pool: pool.clone(),
+    };
+    let batches = collect(execute_physical(plan, &ctx)?, &session.cancel)?;
+    if let Some(write) = write {
+        let parts = partition_batches(&batches, &write.keys, write.partitions)?;
+        let schema = plan.schema().clone();
+        for (r, part) in parts.into_iter().enumerate() {
+            shuffle.write(write.shuffle_id, partition, r, schema.clone(), part)?;
+        }
+        #[cfg(test)]
+        MAP_COMMITS.fetch_add(1, Ordering::Relaxed);
+        Ok(Vec::new())
+    } else {
+        Ok(batches)
+    }
+}
+
+fn requeue_or_abort(
+    pending: &Mutex<Vec<(usize, u32)>>,
+    abort: &Mutex<Option<Error>>,
+    partition: usize,
+    attempts: u32,
+    cause: Error,
+    write: &Option<ShuffleWrite>,
+    shuffle: &ShuffleStore,
+) -> Result<()> {
+    if matches!(cause, Error::Cancelled) {
+        let mut g = abort
+            .lock()
+            .map_err(|_| Error::Eval("abort lock poisoned".into()))?;
+        if g.is_none() {
+            *g = Some(cause);
+        }
+        return Ok(());
+    }
+    if let Some(write) = write {
+        shuffle.abort_map(write.shuffle_id, partition, write.partitions)?;
+    }
+    let next = attempts.saturating_add(1);
+    if next >= MAX_TASK_ATTEMPTS {
+        let mut g = abort
+            .lock()
+            .map_err(|_| Error::Eval("abort lock poisoned".into()))?;
+        if g.is_none() {
+            *g = Some(Error::Eval(format!(
+                "task partition {partition} failed after {MAX_TASK_ATTEMPTS} attempts: {cause}"
+            )));
+        }
+        return Ok(());
+    }
+    pending
+        .lock()
+        .map_err(|_| Error::Eval("task queue lock poisoned".into()))?
+        .push((partition, next));
+    Ok(())
 }
 
 fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
@@ -999,7 +1240,7 @@ mod tests {
     use super::*;
     use arrow::array::{Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn join_session() -> Session {
         let t_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
@@ -1065,6 +1306,7 @@ mod tests {
 
     #[test]
     fn join_explain_shows_shuffle_map_and_result_stages() {
+        let _g = lock_stage_tests();
         let s = join_session().with_workers(2).unwrap();
         let text = s
             .explain_stages("SELECT t.a, u.id FROM t JOIN u ON t.a = u.id")
@@ -1078,6 +1320,7 @@ mod tests {
 
     #[test]
     fn two_worker_join_matches_pull_path() {
+        let _g = lock_stage_tests();
         let s = join_session().with_workers(2).unwrap();
         let sql = "SELECT t.a, u.id FROM t JOIN u ON t.a = u.id";
         let pull = s.execute_sql(sql).unwrap();
@@ -1090,6 +1333,7 @@ mod tests {
 
     #[test]
     fn scan_only_is_a_single_result_stage() {
+        let _g = lock_stage_tests();
         let s = join_session().with_workers(2).unwrap();
         let text = s.explain_stages("SELECT a FROM t").unwrap();
         assert!(text.contains("Stage 0 result"), "{text}");
@@ -1104,6 +1348,7 @@ mod tests {
 
     #[test]
     fn ipc_shuffle_dir_matches_pull_and_cleans_up() {
+        let _g = lock_stage_tests();
         let root = std::env::temp_dir().join(format!(
             "mizuchi-shuffle-{}-{}",
             std::process::id(),
@@ -1131,6 +1376,7 @@ mod tests {
 
     #[test]
     fn shuffle_files_are_arrow_ipc() {
+        let _g = lock_stage_tests();
         let root = std::env::temp_dir().join(format!(
             "mizuchi-shuffle-ipc-{}-{}",
             std::process::id(),
@@ -1153,5 +1399,104 @@ mod tests {
         let got = store.read(0, 1, schema).unwrap();
         assert_eq!(got.iter().map(Batch::num_rows).sum::<usize>(), 2);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    static STAGE_GATE: Mutex<()> = Mutex::new(());
+
+    fn lock_stage_tests() -> std::sync::MutexGuard<'static, ()> {
+        STAGE_GATE.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn reset_inject() {
+        INJECT_TASK_FAILURES.store(0, Ordering::SeqCst);
+        INJECT_RESULT_ONLY.store(false, Ordering::SeqCst);
+        MAP_COMMITS.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn killed_worker_retries_and_matches_pull() {
+        let _g = lock_stage_tests();
+        reset_inject();
+        INJECT_TASK_FAILURES.store(1, Ordering::SeqCst);
+        let s = join_session().with_workers(2).unwrap();
+        let sql = "SELECT t.a, u.id FROM t JOIN u ON t.a = u.id";
+        let pull = s.execute_sql(sql).unwrap();
+        let staged = s.execute_staged(sql).unwrap();
+        assert_eq!(
+            sorted_pairs(&pull, "a", "id"),
+            sorted_pairs(&staged, "a", "id")
+        );
+        reset_inject();
+    }
+
+    #[test]
+    fn result_retry_reuses_committed_shuffle_maps() {
+        let _g = lock_stage_tests();
+        reset_inject();
+        INJECT_RESULT_ONLY.store(true, Ordering::SeqCst);
+        INJECT_TASK_FAILURES.store(1, Ordering::SeqCst);
+        let s = join_session().with_workers(2).unwrap();
+        let sql = "SELECT t.a, u.id FROM t JOIN u ON t.a = u.id";
+        let pull = s.execute_sql(sql).unwrap();
+        let staged = s.execute_staged(sql).unwrap();
+        assert_eq!(
+            sorted_pairs(&pull, "a", "id"),
+            sorted_pairs(&staged, "a", "id")
+        );
+        // Two shuffle-map stages × two partitions; result-stage retry must
+        // not re-run maps.
+        assert_eq!(MAP_COMMITS.load(Ordering::SeqCst), 4);
+        reset_inject();
+    }
+
+    #[test]
+    fn too_many_task_failures_fail_closed() {
+        let _g = lock_stage_tests();
+        reset_inject();
+        INJECT_TASK_FAILURES.store(MAX_TASK_ATTEMPTS as u64, Ordering::SeqCst);
+        let s = join_session().with_workers(1).unwrap();
+        let err = s.execute_staged("SELECT a FROM t").unwrap_err();
+        assert!(
+            matches!(err, Error::Eval(ref m) if m.contains("failed after")),
+            "{err:?}"
+        );
+        reset_inject();
+        INJECT_TASK_FAILURES.store((MAX_TASK_ATTEMPTS - 1) as u64, Ordering::SeqCst);
+        let out = s.execute_staged("SELECT a FROM t").unwrap();
+        assert_eq!(sorted_pairs(&out, "a", "a").len(), 5);
+        reset_inject();
+    }
+
+    #[test]
+    fn ipc_shuffle_survives_killed_worker() {
+        let _g = lock_stage_tests();
+        reset_inject();
+        INJECT_RESULT_ONLY.store(true, Ordering::SeqCst);
+        INJECT_TASK_FAILURES.store(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "mizuchi-shuffle-retry-{}-{}",
+            std::process::id(),
+            JOB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let s = join_session()
+            .with_workers(2)
+            .unwrap()
+            .with_shuffle_dir(root.clone());
+        let sql = "SELECT t.a, u.id FROM t JOIN u ON t.a = u.id";
+        let pull = s.execute_sql(sql).unwrap();
+        let staged = s.execute_staged(sql).unwrap();
+        assert_eq!(
+            sorted_pairs(&pull, "a", "id"),
+            sorted_pairs(&staged, "a", "id")
+        );
+        assert_eq!(MAP_COMMITS.load(Ordering::SeqCst), 4);
+        let leftover: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert!(leftover.is_empty(), "{leftover:?}");
+        reset_inject();
     }
 }

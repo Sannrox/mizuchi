@@ -30,3 +30,4 @@ All notable changes to this project are documented here.
 - Python DataFrame API via PyO3: lazy select, filter, group_by, join, sort, and SQL, with a pip-installable wheel built in CI.
 - LibFuzzer targets for SQL parse, plan, execute, and a supported-SQL grammar. CI runs them for a bounded time; crashes land as regression tests.
 - Engine owner shares: reserved memory and worker slices so concurrent owners cannot starve each other.
+- Stage tasks retry after a worker failure and reuse committed shuffle files. Partial writes from a failed attempt are discarded.
