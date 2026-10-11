@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "mizuchi"
+version = "0.1.0"
+description = "Python DataFrame API for the mizuchi query engine."
+requires-python = ">=3.10"
+license = "Apache-2.0"
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+module-name = "mizuchi"

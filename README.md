@@ -51,6 +51,14 @@ cargo test --locked --workspace
 bash scripts/validate-workflow-skills.sh
 ```
 
+Python (optional, not part of the default Cargo workspace):
+
+```sh
+pip install maturin
+cd python && maturin develop
+python examples/lazy_df.py
+```
+
 Contributor and agent policy: [AGENTS.md](AGENTS.md). Decisions:
 [docs/decisions/](docs/decisions/README.md).
 

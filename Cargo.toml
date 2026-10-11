@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/mizuchi"]
 default-members = ["crates/mizuchi"]
+exclude = ["python"]
 resolver = "2"
 
 [workspace.package]
