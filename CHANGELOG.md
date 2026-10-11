@@ -28,3 +28,4 @@ All notable changes to this project are documented here.
 - TPC-H and TPC-DS style decision-support harness: a tiny in-memory generator, a fixed query set, and JSON with per-query time and memory. Larger scales stay out of the default `cargo test` run.
 - Decision-support comparison against DuckDB and DataFusion: same SQL and tables, JSON with result diffs and timing ratios. CI uses committed goldens so the default test run stays offline.
 - Python DataFrame API via PyO3: lazy select, filter, group_by, join, sort, and SQL, with a pip-installable wheel built in CI.
+- LibFuzzer targets for SQL parse, plan, execute, and a supported-SQL grammar. CI runs them for a bounded time; crashes land as regression tests.

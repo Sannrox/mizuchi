@@ -3,6 +3,9 @@
 /python/dist
 /python/*.egg-info
 /python/.venv
+/fuzz/target
+/fuzz/artifacts
+/fuzz/coverage
 .state/
 /.worktrees/
 /bench-data/

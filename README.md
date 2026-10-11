@@ -59,6 +59,15 @@ cd python && maturin develop
 python examples/lazy_df.py
 ```
 
+Fuzz (nightly, not part of the default Cargo workspace):
+
+```sh
+cargo +nightly install cargo-fuzz
+cargo +nightly fuzz run parse -- -max_total_time=30
+```
+
+Crashes under `fuzz/artifacts/` become regression cases in `crates/mizuchi/tests/fuzz_sql.rs`.
+
 Contributor and agent policy: [AGENTS.md](AGENTS.md). Decisions:
 [docs/decisions/](docs/decisions/README.md).
 
