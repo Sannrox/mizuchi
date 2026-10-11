@@ -9,5 +9,6 @@ Decisions that must outlive a single PR.
 | [0003](0003-sql-parser-and-dialect.md) | SQL parser and first dialect | Accepted |
 | [0004](0004-pull-vectorized-execution.md) | Pull-based vectorized execution | Accepted |
 | [0005](0005-incremental-microbatch.md) | Incremental execution as micro-batches | Accepted |
+| [0006](0006-gpu-acceleration.md) | GPU acceleration is a no-go for this phase | Accepted |
 
 Template: short context, decision, consequences, rejected alternatives.
