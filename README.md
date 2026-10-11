@@ -52,6 +52,11 @@ a `CancelToken`. `execute_sql_reported` / `write_parquet_reported` return
 a `QueryReport` (inputs after partition prune, outputs, version, plan).
 `mizuchi::VERSION` and `Session::explain` are the strings a runner
 records. A complete walk-through is `cargo run -p mizuchi --example embed`.
+The engine never opens network connections. Runners apply OS filesystem,
+memory, and CPU limits; mizuchi honors `SessionConfig` and returns
+`Error::Io` or `Error::Memory` when a grant is denied. Optional Linux
+filesystem-limit tests use `--features sandbox` and
+`.github/workflows/sandbox.yml` (`workflow_dispatch` only).
 
 ## Releases
 

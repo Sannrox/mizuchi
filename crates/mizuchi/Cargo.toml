@@ -22,6 +22,12 @@ default = []
 # Optional Amazon S3 client for the ignored emulator test. The engine API takes
 # a caller-provided ObjectStore; it does not open S3 itself.
 s3 = ["object_store/aws"]
+# Optional Linux filesystem-limit tests in `tests/sandbox_os.rs`. Library
+# sources do not use this feature.
+sandbox = []
 
 [dev-dependencies]
 arrow = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+landlock = "0.4.7"
