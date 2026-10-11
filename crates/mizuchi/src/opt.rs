@@ -103,6 +103,14 @@ pub fn estimate_rows(plan: &LogicalPlan) -> Option<f64> {
             }
             Some(n.max(1.0))
         }
+        LogicalPlan::Recursive { anchors, .. } => {
+            let mut n = 0.0;
+            for anchor in anchors {
+                n += estimate_rows(anchor)?;
+            }
+            Some(n.max(1.0))
+        }
+        LogicalPlan::WorkScan { .. } => None,
     }
 }
 
@@ -282,7 +290,26 @@ fn map_children(
             fns,
             schema,
         }),
-        leaf @ (LogicalPlan::Empty { .. } | LogicalPlan::Scan { .. }) => Ok(leaf),
+        LogicalPlan::Recursive {
+            name,
+            anchors,
+            step,
+            schema,
+        } => {
+            let mut next = Vec::with_capacity(anchors.len());
+            for anchor in anchors {
+                next.push(f(anchor)?);
+            }
+            Ok(LogicalPlan::Recursive {
+                name,
+                anchors: next,
+                step: Box::new(f(*step)?),
+                schema,
+            })
+        }
+        leaf @ (LogicalPlan::Empty { .. }
+        | LogicalPlan::Scan { .. }
+        | LogicalPlan::WorkScan { .. }) => Ok(leaf),
     }
 }
 

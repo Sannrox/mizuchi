@@ -50,7 +50,7 @@ fn per_feature_slt_files_exist_with_skipif_gaps() {
     let slt = root().join("crates/mizuchi/tests/slt");
     for (name, must_skip) in [
         ("window.slt", false),
-        ("cte.slt", true),
+        ("cte.slt", false),
         ("subquery.slt", true),
         ("setops.slt", true),
         ("decimal.slt", true),
