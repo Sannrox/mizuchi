@@ -11,5 +11,6 @@ Decisions that must outlive a single PR.
 | [0005](0005-incremental-microbatch.md) | Incremental execution as micro-batches | Accepted |
 | [0006](0006-gpu-acceleration.md) | GPU acceleration is a no-go for this phase | Accepted |
 | [0007](0007-api-stability-and-releases.md) | API stability, versioning, and releases | Accepted |
+| [0008](0008-network-sources-require-grant.md) | Network sources require an embedder grant | Accepted |
 
 Template: short context, decision, consequences, rejected alternatives.

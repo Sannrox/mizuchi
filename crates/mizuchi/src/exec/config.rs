@@ -27,6 +27,10 @@ pub struct SessionConfig {
     /// Roots that [`super::Session::write_parquet`], Delta, and Iceberg
     /// writes may create.
     pub allowed_write_paths: Vec<PathBuf>,
+    /// When true, [`super::Session::register_postgres`] may open TCP to a
+    /// host the runner supplied. Default is false. An empty path allow-list
+    /// does not grant network.
+    pub allow_network: bool,
 }
 
 pub(super) fn resolve_roots(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {

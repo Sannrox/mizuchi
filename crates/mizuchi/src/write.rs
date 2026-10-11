@@ -1,10 +1,12 @@
-//! Partitioned Parquet writer with append/overwrite and staging commit.
+//! Writers for Parquet datasets and single-file JSON, Avro, and ORC.
 //!
-//! Files land under a hidden staging directory, then publish by rename so the
-//! dataset directory never shows a partial write. A failed or cancelled job
-//! removes staging and leaves committed files as they were. Partition layout
-//! is Hive-style `col=value` directories. Partition columns stay in the file
-//! schema so [`crate::read::read_parquet`] round-trips a part file.
+//! Parquet files land under a hidden staging directory, then publish by rename
+//! so the dataset directory never shows a partial write. A failed or cancelled
+//! job removes staging and leaves committed files as they were. Partition
+//! layout is Hive-style `col=value` directories. Partition columns stay in the
+//! file schema so [`crate::read::read_parquet`] round-trips a part file.
+//! JSON is newline-delimited. Avro is Object Container Files. ORC is the
+//! uncompressed DIRECT subset.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -479,6 +481,51 @@ fn walk_parquets(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 fn write_success(dest: &Path) -> Result<()> {
     let path = dest.join("_SUCCESS");
     fs::write(&path, b"").map_err(|e| io_err(&path, e))
+}
+
+/// Write newline-delimited JSON.
+pub fn write_json(path: impl AsRef<Path>, batches: &[Batch]) -> Result<()> {
+    let path = path.as_ref();
+    if batches.is_empty() {
+        return Err(Error::InvalidBatch(
+            "JSON write needs at least one batch".into(),
+        ));
+    }
+    let file = File::create(path).map_err(|e| io_err(path, e))?;
+    let mut writer = arrow::json::LineDelimitedWriter::new(file);
+    for batch in batches {
+        writer
+            .write(batch.as_arrow())
+            .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+    }
+    writer
+        .finish()
+        .map_err(|e| Error::Io(format!("{}: {e}", path.display())))
+}
+
+/// Write an Avro Object Container File.
+pub fn write_avro(path: impl AsRef<Path>, batches: &[Batch]) -> Result<()> {
+    let path = path.as_ref();
+    let first = batches
+        .first()
+        .ok_or_else(|| Error::InvalidBatch("Avro write needs at least one batch".into()))?;
+    let file = File::create(path).map_err(|e| io_err(path, e))?;
+    let mut writer = arrow_avro::writer::AvroWriter::new(file, first.schema().as_ref().clone())
+        .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+    for batch in batches {
+        writer
+            .write(batch.as_arrow())
+            .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+    }
+    writer
+        .finish()
+        .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+    Ok(())
+}
+
+/// Write an uncompressed ORC file.
+pub fn write_orc(path: impl AsRef<Path>, batches: &[Batch]) -> Result<()> {
+    crate::orc::write_file(path, batches)
 }
 
 fn io_err(path: &Path, err: std::io::Error) -> Error {

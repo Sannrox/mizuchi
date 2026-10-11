@@ -101,6 +101,8 @@ pub struct Session {
     lowering: op::LoweringArc,
     allowed_read_paths: Vec<PathBuf>,
     allowed_write_paths: Vec<PathBuf>,
+    /// When true, [`Session::register_postgres`] may open TCP.
+    allow_network: bool,
     /// When true, stage tasks may run a speculative copy; first commit wins.
     speculate: bool,
 }
@@ -122,6 +124,7 @@ impl Default for Session {
             lowering: op::LoweringArc::default(),
             allowed_read_paths: Vec::new(),
             allowed_write_paths: Vec::new(),
+            allow_network: false,
             speculate: false,
         }
     }
@@ -146,6 +149,7 @@ impl Clone for Session {
             lowering: self.lowering.clone(),
             allowed_read_paths: self.allowed_read_paths.clone(),
             allowed_write_paths: self.allowed_write_paths.clone(),
+            allow_network: self.allow_network,
             speculate: self.speculate,
         }
     }
@@ -190,6 +194,7 @@ impl Session {
         }
         session.allowed_read_paths = config::resolve_roots(cfg.allowed_read_paths)?;
         session.allowed_write_paths = config::resolve_roots(cfg.allowed_write_paths)?;
+        session.allow_network = cfg.allow_network;
         Ok(session)
     }
 
@@ -353,6 +358,83 @@ impl Session {
         self.register(name, schema, batches)
     }
 
+    /// Register a newline-delimited JSON file after the read allow-list check.
+    pub fn register_json(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+        opts: crate::read::JsonReadOptions<'_>,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        config::assert_allowed(path, &self.allowed_read_paths)?;
+        let batches = crate::read::read_json(path, opts)?;
+        let schema = match batches.first() {
+            Some(batch) => batch.schema(),
+            None => {
+                return Err(Error::Io(format!("{} produced no batches", path.display())));
+            }
+        };
+        self.register(name, schema, batches)
+    }
+
+    /// Register an Avro Object Container File after the read allow-list check.
+    pub fn register_avro(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+        opts: crate::read::AvroReadOptions<'_>,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        config::assert_allowed(path, &self.allowed_read_paths)?;
+        let batches = crate::read::read_avro(path, opts)?;
+        let schema = match batches.first() {
+            Some(batch) => batch.schema(),
+            None => {
+                return Err(Error::Io(format!("{} produced no batches", path.display())));
+            }
+        };
+        self.register(name, schema, batches)
+    }
+
+    /// Register an ORC file after the read allow-list check.
+    pub fn register_orc(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+        opts: crate::read::OrcReadOptions<'_>,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        config::assert_allowed(path, &self.allowed_read_paths)?;
+        let batches = crate::read::read_orc(path, opts)?;
+        let schema = match batches.first() {
+            Some(batch) => batch.schema(),
+            None => {
+                return Err(Error::Io(format!("{} produced no batches", path.display())));
+            }
+        };
+        self.register(name, schema, batches)
+    }
+
+    /// Register a PostgreSQL table or query after the network grant check.
+    pub fn register_postgres(
+        &mut self,
+        name: impl Into<String>,
+        source: &crate::postgres::PostgresSource,
+        opts: crate::postgres::PostgresReadOptions<'_>,
+    ) -> Result<()> {
+        if !self.allow_network {
+            return Err(Error::Io("network is not granted".into()));
+        }
+        let batches = crate::postgres::read_postgres(source, opts)?;
+        let schema = match batches.first() {
+            Some(batch) => batch.schema(),
+            None => {
+                return Err(Error::Io("PostgreSQL source produced no batches".into()));
+            }
+        };
+        self.register(name, schema, batches)
+    }
+
     /// Register batches from an Arrow C Data Interface stream.
     pub fn register_arrow_stream(
         &mut self,
@@ -377,6 +459,27 @@ impl Session {
     ) -> Result<()> {
         let _ = self.write_parquet_reported(dest, batches, opts)?;
         Ok(())
+    }
+
+    /// Write newline-delimited JSON after the write allow-list check.
+    pub fn write_json(&self, dest: impl AsRef<Path>, batches: &[Batch]) -> Result<()> {
+        let dest = dest.as_ref();
+        config::assert_allowed(dest, &self.allowed_write_paths)?;
+        crate::write::write_json(dest, batches)
+    }
+
+    /// Write an Avro Object Container File after the write allow-list check.
+    pub fn write_avro(&self, dest: impl AsRef<Path>, batches: &[Batch]) -> Result<()> {
+        let dest = dest.as_ref();
+        config::assert_allowed(dest, &self.allowed_write_paths)?;
+        crate::write::write_avro(dest, batches)
+    }
+
+    /// Write an uncompressed ORC file after the write allow-list check.
+    pub fn write_orc(&self, dest: impl AsRef<Path>, batches: &[Batch]) -> Result<()> {
+        let dest = dest.as_ref();
+        config::assert_allowed(dest, &self.allowed_write_paths)?;
+        crate::write::write_orc(dest, batches)
     }
 
     /// [`Self::write_parquet`] plus the output side of a [`QueryReport`].

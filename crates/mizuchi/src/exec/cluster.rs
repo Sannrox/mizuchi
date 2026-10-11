@@ -1,6 +1,6 @@
 //! In-process cluster coordinator: workers, resources, dynamic allocation.
 //!
-//! The engine never opens network connections. A runner maps these worker
+//! The engine opens TCP only when the embedder grants network. A runner maps these worker
 //! slots onto processes or pods using the manifests under `deploy/`.
 
 use std::path::PathBuf;
