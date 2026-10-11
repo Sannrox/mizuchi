@@ -6,8 +6,10 @@
 //!
 //! Embedding runners pass [`SessionConfig`] (memory, threads, spill, allowed
 //! paths), register Arrow batches, files, or an Arrow C stream, and pull
-//! results as batches. [`VERSION`] and [`Session::explain`] are the strings
-//! a runner records. See `crates/mizuchi/examples/embed.rs`.
+//! results as batches. The engine never opens network connections; denied
+//! paths and memory caps surface as [`Error::Io`] and [`Error::Memory`].
+//! [`VERSION`] and [`Session::explain`] are the strings a runner records.
+//! See `crates/mizuchi/examples/embed.rs`.
 
 pub mod batch;
 mod error;

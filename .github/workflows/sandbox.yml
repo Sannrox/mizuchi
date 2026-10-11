@@ -1,0 +1,26 @@
+name: Sandbox limits
+
+# Optional job. Never on pull requests. Default cargo test stays generic:
+# the engine has no sandbox backend.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-fs-limits:
+    name: Linux filesystem limits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Engine contract
+        run: cargo test --locked --test sandbox
+      - name: OS filesystem limits
+        run: cargo test --locked --test sandbox_os --features sandbox -- --test-threads=1
