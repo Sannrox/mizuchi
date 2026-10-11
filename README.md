@@ -42,6 +42,11 @@ Tracked as GitHub Issues and milestones:
 7. Python API
 8. Advanced: incremental/streaming, caching, GPU research
 
+## Releases
+
+Pre-1.0. The public surface, SemVer rules, deprecation window, and tag
+dry-run job are [ADR 0007](docs/decisions/0007-api-stability-and-releases.md).
+
 ## Development
 
 ```sh
