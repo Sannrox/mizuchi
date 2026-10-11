@@ -637,7 +637,7 @@ fn expr_side(expr: &Expr, left_ncols: usize) -> Result<Side> {
             }
             s
         }
-        Expr::Coalesce(args) | Expr::Concat(args) => {
+        Expr::Coalesce(args) | Expr::Concat(args) | Expr::Array(args) => {
             let mut s = Side::None;
             for a in args {
                 s = combine(s, expr_side(a, left_ncols)?);
@@ -694,5 +694,6 @@ fn shift_right(expr: &Expr, left_ncols: usize) -> Expr {
             start: *start,
             length: *length,
         },
+        Expr::Array(args) => Expr::Array(args.iter().map(|e| shift_right(e, left_ncols)).collect()),
     }
 }

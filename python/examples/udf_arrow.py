@@ -69,6 +69,21 @@ def main() -> None:
     doubled = s.table("g").udf("v", times_two, "v").sort("v").collect()
     assert doubled == [("x", 2), ("x", 4), (None, 14), ("y", 20)], doubled
 
+    def product_update(state, value):
+        if value is None:
+            return state
+        if state is None:
+            return value
+        return state * value
+
+    s.register_udaf("product", product_update, product_update, None)
+    s.register("p", {"g": [1, 1, 2], "v": [2, 3, 4]})
+    prod = s.sql("SELECT g, product(v) AS p FROM p GROUP BY g").sort("g").collect()
+    assert prod == [(1, 6), (2, 4)], prod
+
+    arr = s.sql("SELECT ARRAY[1, 2, 3] AS a").collect()
+    assert arr == [([1, 2, 3],)], arr
+
     print("ok")
 
 

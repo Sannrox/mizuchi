@@ -8,16 +8,24 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Int64Array, StringArray, UInt32Array, new_null_array,
+    Array, ArrayRef, AsArray, BooleanArray, Int64Array, ListArray, StringArray, UInt32Array,
+    new_null_array,
 };
+use arrow::buffer::OffsetBuffer;
 use arrow::compute::kernels::boolean::{and_kleene, is_not_null, is_null, not, or_kleene};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow::compute::kernels::concat_elements::concat_elements_utf8_many;
+use arrow::compute::kernels::length::length;
 use arrow::compute::kernels::numeric::{add, div, mul, neg, sub};
 use arrow::compute::kernels::substring::substring;
+use arrow::compute::kernels::temporal::{DatePart, date_part};
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{cast, take};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{
+    DataType, Date32Type, Date64Type, Field, Float32Type, Float64Type, Int8Type, Int16Type,
+    Int32Type, Int64Type, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
+    TimestampNanosecondType, TimestampSecondType,
+};
 use arrow::error::ArrowError;
 
 use crate::batch::Batch;
@@ -49,6 +57,20 @@ pub enum UnaryOp {
     IsNotNull,
     Upper,
     Lower,
+    Abs,
+    Ceil,
+    Floor,
+    Sqrt,
+    Round,
+    CharLength,
+    Trim,
+    Ltrim,
+    Rtrim,
+    ExtractYear,
+    ExtractMonth,
+    ExtractDay,
+    ExtractEpoch,
+    ArrayLength,
 }
 
 /// Scalar expression tree.
@@ -82,6 +104,8 @@ pub enum Expr {
         start: i64,
         length: Option<u64>,
     },
+    /// SQL `ARRAY[e1, e2, ...]`, one list value per input row.
+    Array(Vec<Expr>),
 }
 
 impl Expr {
@@ -163,6 +187,7 @@ fn eval_expr(expr: &Expr, batch: &Batch) -> Result<ArrayRef> {
             let arrow_start = if *start >= 1 { *start - 1 } else { *start };
             substring(child.as_ref(), arrow_start, *length).map_err(eval_err)
         }
+        Expr::Array(elems) => eval_array(batch, elems),
     }
 }
 
@@ -197,6 +222,20 @@ fn eval_unary(op: UnaryOp, child: &ArrayRef) -> Result<ArrayRef> {
         UnaryOp::IsNotNull => Ok(Arc::new(is_not_null(child.as_ref()).map_err(eval_err)?)),
         UnaryOp::Upper => map_utf8(child, str::to_uppercase),
         UnaryOp::Lower => map_utf8(child, str::to_lowercase),
+        UnaryOp::Abs => eval_abs(child),
+        UnaryOp::Ceil => map_f64(child, f64::ceil),
+        UnaryOp::Floor => map_f64(child, f64::floor),
+        UnaryOp::Sqrt => map_f64(child, f64::sqrt),
+        UnaryOp::Round => map_f64(child, f64::round),
+        UnaryOp::CharLength => map_utf8_i64(child, |s| s.chars().count() as i64),
+        UnaryOp::Trim => map_utf8(child, |s| s.trim().to_string()),
+        UnaryOp::Ltrim => map_utf8(child, |s| s.trim_start().to_string()),
+        UnaryOp::Rtrim => map_utf8(child, |s| s.trim_end().to_string()),
+        UnaryOp::ExtractYear => extract_part(child, DatePart::Year),
+        UnaryOp::ExtractMonth => extract_part(child, DatePart::Month),
+        UnaryOp::ExtractDay => extract_part(child, DatePart::Day),
+        UnaryOp::ExtractEpoch => extract_epoch(child),
+        UnaryOp::ArrayLength => eval_array_length(child),
     }
 }
 
@@ -301,6 +340,162 @@ fn map_utf8(array: &ArrayRef, f: impl Fn(&str) -> String) -> Result<ArrayRef> {
     Ok(Arc::new(out))
 }
 
+fn map_utf8_i64(array: &ArrayRef, f: impl Fn(&str) -> i64) -> Result<ArrayRef> {
+    let strings = as_utf8(array)?;
+    let out: Int64Array = strings.iter().map(|v| v.map(&f)).collect();
+    Ok(Arc::new(out))
+}
+
+fn eval_abs(child: &ArrayRef) -> Result<ArrayRef> {
+    Ok(match child.data_type() {
+        DataType::Int8 => Arc::new(
+            child
+                .as_primitive::<Int8Type>()
+                .unary::<_, Int8Type>(|v| v.saturating_abs()),
+        ),
+        DataType::Int16 => Arc::new(
+            child
+                .as_primitive::<Int16Type>()
+                .unary::<_, Int16Type>(|v| v.saturating_abs()),
+        ),
+        DataType::Int32 => Arc::new(
+            child
+                .as_primitive::<Int32Type>()
+                .unary::<_, Int32Type>(|v| v.saturating_abs()),
+        ),
+        DataType::Int64 => Arc::new(
+            child
+                .as_primitive::<Int64Type>()
+                .unary::<_, Int64Type>(|v| v.saturating_abs()),
+        ),
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => child.clone(),
+        DataType::Float32 => Arc::new(
+            child
+                .as_primitive::<Float32Type>()
+                .unary::<_, Float32Type>(f32::abs),
+        ),
+        DataType::Float64 => Arc::new(
+            child
+                .as_primitive::<Float64Type>()
+                .unary::<_, Float64Type>(f64::abs),
+        ),
+        other => {
+            return Err(Error::Eval(format!("abs requires numeric, got {other}")));
+        }
+    })
+}
+
+fn map_f64(child: &ArrayRef, f: impl Fn(f64) -> f64) -> Result<ArrayRef> {
+    let as_f64 = if child.data_type() == &DataType::Float64 {
+        child.clone()
+    } else {
+        cast(child.as_ref(), &DataType::Float64).map_err(eval_err)?
+    };
+    Ok(Arc::new(
+        as_f64
+            .as_primitive::<Float64Type>()
+            .unary::<_, Float64Type>(f),
+    ))
+}
+
+fn extract_part(child: &ArrayRef, part: DatePart) -> Result<ArrayRef> {
+    let parts = date_part(child.as_ref(), part).map_err(eval_err)?;
+    cast(parts.as_ref(), &DataType::Int64).map_err(eval_err)
+}
+
+fn extract_epoch(child: &ArrayRef) -> Result<ArrayRef> {
+    Ok(match child.data_type() {
+        DataType::Date32 => Arc::new(
+            child
+                .as_primitive::<Date32Type>()
+                .unary::<_, Float64Type>(|d| f64::from(d) * 86_400.0),
+        ),
+        DataType::Date64 => Arc::new(
+            child
+                .as_primitive::<Date64Type>()
+                .unary::<_, Float64Type>(|ms| ms as f64 / 1_000.0),
+        ),
+        DataType::Timestamp(TimeUnit::Second, _) => Arc::new(
+            child
+                .as_primitive::<TimestampSecondType>()
+                .unary::<_, Float64Type>(|v| v as f64),
+        ),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Arc::new(
+            child
+                .as_primitive::<TimestampMillisecondType>()
+                .unary::<_, Float64Type>(|v| v as f64 / 1_000.0),
+        ),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => Arc::new(
+            child
+                .as_primitive::<TimestampMicrosecondType>()
+                .unary::<_, Float64Type>(|v| v as f64 / 1_000_000.0),
+        ),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Arc::new(
+            child
+                .as_primitive::<TimestampNanosecondType>()
+                .unary::<_, Float64Type>(|v| v as f64 / 1_000_000_000.0),
+        ),
+        other => {
+            return Err(Error::Eval(format!(
+                "extract epoch requires date or timestamp, got {other}"
+            )));
+        }
+    })
+}
+
+fn eval_array_length(child: &ArrayRef) -> Result<ArrayRef> {
+    match child.data_type() {
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {}
+        other => {
+            return Err(Error::Eval(format!(
+                "array_length requires list, got {other}"
+            )));
+        }
+    }
+    let lens = length(child.as_ref()).map_err(eval_err)?;
+    cast(lens.as_ref(), &DataType::Int64).map_err(eval_err)
+}
+
+fn eval_array(batch: &Batch, elems: &[Expr]) -> Result<ArrayRef> {
+    if elems.is_empty() {
+        return Err(Error::Eval("ARRAY requires at least one element".into()));
+    }
+    let arrays: Vec<ArrayRef> = elems
+        .iter()
+        .map(|e| eval_expr(e, batch))
+        .collect::<Result<_>>()?;
+    let dt = arrays[0].data_type().clone();
+    for a in &arrays[1..] {
+        if a.data_type() != &dt {
+            return Err(Error::Eval("ARRAY elements must share a type".into()));
+        }
+    }
+    let rows = batch.num_rows();
+    let n = arrays.len();
+    let mut offsets: Vec<i32> = Vec::with_capacity(rows + 1);
+    offsets.push(0);
+    let mut values: Vec<ArrayRef> = Vec::with_capacity(rows * n);
+    for row in 0..rows {
+        let idx = UInt32Array::from(vec![row as u32]);
+        for array in &arrays {
+            values.push(take(array.as_ref(), &idx, None).map_err(eval_err)?);
+        }
+        offsets.push(
+            i32::try_from((row + 1) * n).map_err(|_| Error::Eval("ARRAY is too large".into()))?,
+        );
+    }
+    let flat = if values.is_empty() {
+        arrays[0].slice(0, 0)
+    } else {
+        let refs: Vec<&dyn Array> = values.iter().map(|a| a.as_ref()).collect();
+        arrow::compute::concat(&refs).map_err(eval_err)?
+    };
+    let field = Arc::new(Field::new("item", dt, true));
+    let list = ListArray::try_new(field, OffsetBuffer::new(offsets.into()), flat, None)
+        .map_err(eval_err)?;
+    Ok(Arc::new(list))
+}
+
 fn cmp_array(result: std::result::Result<BooleanArray, ArrowError>) -> Result<ArrayRef> {
     Ok(Arc::new(result.map_err(eval_err)?))
 }
@@ -311,8 +506,8 @@ fn eval_err(err: ArrowError) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{AsArray, Int64Array};
-    use arrow::datatypes::{Field, Int64Type, Schema};
+    use arrow::array::{AsArray, Date32Array, Int64Array, ListArray};
+    use arrow::datatypes::{Field, Float64Type, Int64Type, Schema};
 
     use super::*;
 
@@ -539,5 +734,68 @@ mod tests {
         assert_eq!(arr.len(), N as usize);
         assert_eq!(arr.value(0), 1);
         assert_eq!(arr.value((N as usize) - 1), N);
+    }
+
+    #[test]
+    fn math_string_array_and_extract() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("d", DataType::Date32, true),
+        ]));
+        let batch = Batch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(-4), None, Some(9)])),
+                Arc::new(StringArray::from(vec![Some(" Ab "), None, Some("xy")])),
+                Arc::new(Date32Array::from(vec![Some(0), None, Some(1)])),
+            ],
+        )
+        .unwrap();
+        let abs = Expr::Unary(UnaryOp::Abs, Box::new(Expr::column("id")));
+        assert_eq!(
+            i64_values(&abs.eval(&batch).unwrap()),
+            vec![Some(4), None, Some(9)]
+        );
+        let sqrt = Expr::Unary(UnaryOp::Sqrt, Box::new(Expr::column("id")));
+        let sq = sqrt.eval(&batch).unwrap();
+        let sq = sq.as_primitive::<Float64Type>();
+        assert!(sq.value(2) > 2.9 && sq.value(2) < 3.1);
+        assert!(sq.is_null(1));
+        let trim = Expr::Unary(UnaryOp::Trim, Box::new(Expr::column("name")));
+        assert_eq!(
+            utf8_values(&trim.eval(&batch).unwrap()),
+            vec![Some("Ab".into()), None, Some("xy".into())]
+        );
+        let len = Expr::Unary(UnaryOp::CharLength, Box::new(Expr::column("name")));
+        assert_eq!(
+            i64_values(&len.eval(&batch).unwrap()),
+            vec![Some(4), None, Some(2)]
+        );
+        let year = Expr::Unary(UnaryOp::ExtractYear, Box::new(Expr::column("d")));
+        assert_eq!(
+            i64_values(&year.eval(&batch).unwrap()),
+            vec![Some(1970), None, Some(1970)]
+        );
+        let epoch = Expr::Unary(UnaryOp::ExtractEpoch, Box::new(Expr::column("d")));
+        let ep = epoch.eval(&batch).unwrap();
+        let ep = ep.as_primitive::<Float64Type>();
+        assert_eq!(ep.value(0), 0.0);
+        assert_eq!(ep.value(2), 86_400.0);
+        let arr = Expr::Array(vec![Expr::lit_i64(1), Expr::lit_i64(2), Expr::column("id")]);
+        let lists = arr.eval(&batch).unwrap();
+        let lists = lists.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(lists.len(), 3);
+        let alen = Expr::Unary(UnaryOp::ArrayLength, Box::new(arr));
+        assert_eq!(
+            i64_values(&alen.eval(&batch).unwrap()),
+            vec![Some(3), Some(3), Some(3)]
+        );
+        let on_utf8 = Expr::Unary(UnaryOp::ArrayLength, Box::new(Expr::column("name")));
+        let err = on_utf8.eval(&batch).unwrap_err();
+        assert!(
+            err.to_string().contains("array_length requires list"),
+            "{err}"
+        );
     }
 }

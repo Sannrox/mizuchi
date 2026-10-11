@@ -12,6 +12,7 @@ execute; skipped records are parsed and ignored.
 | Feature | Evidence |
 | --- | --- |
 | Filter, project, arithmetic, `IS NULL` | `select.slt` |
+| String, math, `nullif`, `ARRAY` / `array_length` | `functions.slt` |
 | Hash aggregate, `GROUP BY`, `COUNT(DISTINCT)` | `agg.slt` |
 | Inner join | `join.slt` |
 | Uncorrelated `FROM` subquery (derived table) | `subquery.slt` |

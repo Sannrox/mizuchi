@@ -97,7 +97,11 @@ python examples/lazy_df.py
 # UDFs and Arrow C Data Interface (optional extra):
 pip install pyarrow
 python examples/udf_arrow.py
+# Vectorized vs row-wise UDF timing (not part of cargo test):
+python ../scripts/bench_udf.py
 ```
+
+Function coverage: [docs/functions.md](docs/functions.md).
 
 Fuzz (nightly, not part of the default Cargo workspace):
 

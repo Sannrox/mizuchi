@@ -28,6 +28,7 @@ pub mod read;
 pub mod schema;
 pub mod sql;
 pub mod store;
+pub mod udaf;
 pub mod write;
 
 pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
@@ -49,7 +50,7 @@ pub use plan::{
     AlterTable, Catalog, CatalogProvider, ColumnStats, DEFAULT_CATALOG, DEFAULT_NAMESPACE, Ddl,
     JoinType, LogicalPlan, MergeActionPlan, MergeClausePlan, MergeMatch, MergePlan, NamespaceIdent,
     TableIdent, TableMeta, TableStats, apply_alter, bind_ddl, bind_merge, merge_target_table,
-    plan_sql, table_stats_from_batches,
+    plan_sql, plan_sql_with_udafs, table_stats_from_batches,
 };
 pub use postgres::{PostgresReadOptions, PostgresSource, postgres_scan_sql, read_postgres};
 pub use read::{
@@ -62,6 +63,7 @@ pub use sql::parse_sql;
 pub use store::{
     prune_partitions, read_parquet_store, read_parquet_store_reported, write_parquet_store,
 };
+pub use udaf::{CombineAgg, ProductI64};
 pub use write::{
     ParquetWriteOptions, WriteMode, WriteStats, write_avro, write_json, write_orc, write_parquet,
     write_parquet_cancel, write_parquet_stats,

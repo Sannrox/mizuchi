@@ -380,6 +380,11 @@ fn fold_expr(expr: Expr) -> Result<Expr> {
             start,
             length,
         },
+        Expr::Array(args) => Expr::Array(
+            args.into_iter()
+                .map(fold_expr)
+                .collect::<Result<Vec<_>>>()?,
+        ),
         other => other,
     };
     if matches!(expr, Expr::Literal(_)) || !is_foldable(&expr) {
@@ -409,7 +414,9 @@ fn is_foldable(expr: &Expr) -> bool {
                     .all(|(w, t)| is_foldable(w) && is_foldable(t))
                 && else_expr.as_deref().is_none_or(is_foldable)
         }
-        Expr::Coalesce(args) | Expr::Concat(args) => args.iter().all(is_foldable),
+        Expr::Coalesce(args) | Expr::Concat(args) | Expr::Array(args) => {
+            args.iter().all(is_foldable)
+        }
     }
 }
 
@@ -770,6 +777,9 @@ fn nth_to_column(expr: Expr, schema: &Schema) -> Expr {
             start,
             length,
         },
+        Expr::Array(args) => {
+            Expr::Array(args.into_iter().map(|e| nth_to_column(e, schema)).collect())
+        }
         other => other,
     }
 }
@@ -813,7 +823,7 @@ fn expr_side(expr: &Expr, left_ncols: usize) -> Side {
             }
             s
         }
-        Expr::Coalesce(args) | Expr::Concat(args) => args
+        Expr::Coalesce(args) | Expr::Concat(args) | Expr::Array(args) => args
             .iter()
             .map(|e| expr_side(e, left_ncols))
             .fold(Side::Both, merge_side),
@@ -870,6 +880,9 @@ fn shift_nth(expr: Expr, left_ncols: usize) -> Expr {
             start,
             length,
         },
+        Expr::Array(args) => {
+            Expr::Array(args.into_iter().map(|e| shift_nth(e, left_ncols)).collect())
+        }
         other => other,
     }
 }
@@ -1061,6 +1074,7 @@ fn add_nth(expr: Expr, n: usize) -> Expr {
             start,
             length,
         },
+        Expr::Array(args) => Expr::Array(args.into_iter().map(|e| add_nth(e, n)).collect()),
         other => other,
     }
 }
@@ -1366,6 +1380,11 @@ fn remap_nth(expr: Expr, from_cols: &[(usize, usize)], to_cols: &[(usize, usize)
             start,
             length,
         },
+        Expr::Array(args) => Expr::Array(
+            args.into_iter()
+                .map(|e| remap_nth(e, from_cols, to_cols))
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -1617,6 +1636,7 @@ fn subst_nth(expr: Expr, inner: &[NamedExpr]) -> Expr {
             start,
             length,
         },
+        Expr::Array(args) => Expr::Array(args.into_iter().map(|e| subst_nth(e, inner)).collect()),
         other => other,
     }
 }
