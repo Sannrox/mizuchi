@@ -17,6 +17,7 @@ execute; skipped records are parsed and ignored.
 | Inner join | `join.slt` |
 | Uncorrelated `FROM` subquery (derived table) | `subquery.slt` |
 | `CAST` of integer, float, and text | `decimal.slt` |
+| Window functions (`OVER`, `ROW_NUMBER`, ranking, frames, named `WINDOW`) | `window.slt` (#78) |
 | `MERGE INTO` match / update / insert / delete | `merge.slt` |
 
 Arrow `Decimal*`, Date, Timestamp, Duration, and Interval are accepted at the
@@ -26,7 +27,6 @@ schema boundary (`schema.rs` unit tests). They have no SQL path yet.
 
 | Feature | Status | Evidence | Follow-up |
 | --- | --- | --- | --- |
-| Window functions (`OVER`, `ROW_NUMBER`, ranking, frames, named `WINDOW`) | skipped | `window.slt` | #78 |
 | CTEs (`WITH`, `WITH RECURSIVE`) | skipped | `cte.slt` | #79 |
 | `IN` lists, `IN (SELECT ...)`, `EXISTS`, scalar subquery, correlated, `LATERAL` | skipped | `subquery.slt` | #80 |
 | `UNION` / `UNION ALL` / `UNION DISTINCT` | skipped | `setops.slt` | #81 |

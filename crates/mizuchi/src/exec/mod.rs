@@ -19,6 +19,7 @@ mod schedule;
 mod sort;
 mod stage;
 mod stream;
+mod window;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1191,7 +1192,8 @@ fn collect_scan_reports(plan: &LogicalPlan, session: &Session, out: &mut Vec<Inp
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Sort { input, .. }
-        | LogicalPlan::Limit { input, .. } => collect_scan_reports(input, session, out),
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Window { input, .. } => collect_scan_reports(input, session, out),
         LogicalPlan::Join { left, right, .. } => {
             collect_scan_reports(left, session, out);
             collect_scan_reports(right, session, out);
@@ -1621,6 +1623,41 @@ fn build_physical(
             }
         },
         LogicalPlan::Union { .. } => Err(Error::NotImplemented("physical union")),
+        LogicalPlan::Window {
+            input,
+            partition,
+            order,
+            frame,
+            fns,
+            schema,
+        } => {
+            let (child, child_node) = build_physical(input, session, pool, analyze)?;
+            let t0 = Instant::now();
+            let batches = window::run(
+                child,
+                input.schema().clone(),
+                partition,
+                order,
+                *frame,
+                fns,
+                schema.clone(),
+                &session.policy,
+                pool,
+                &session.cancel,
+            )?;
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let (op, node) = metrics::finish(
+                "Window",
+                lowering.scan(batches)?,
+                vec![child_node],
+                analyze,
+                pool,
+            );
+            if analyze {
+                metrics::add_blocking(&node, ns, pool.peak());
+            }
+            Ok((op, node))
+        }
     }
 }
 
@@ -2218,6 +2255,123 @@ mod tests {
                 (Some(3), Some(1)),
             ]
         );
+    }
+
+    #[test]
+    fn window_row_number_rank_and_count() {
+        let out = session()
+            .execute_sql(
+                "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn, \
+                 RANK() OVER (ORDER BY a) AS r, \
+                 DENSE_RANK() OVER (ORDER BY a) AS d \
+                 FROM t WHERE a IS NOT NULL",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2), Some(3)]);
+        assert_eq!(col_i64(&out, "rn"), vec![Some(1), Some(2), Some(3)]);
+        assert_eq!(col_i64(&out, "r"), vec![Some(1), Some(2), Some(3)]);
+        assert_eq!(col_i64(&out, "d"), vec![Some(1), Some(2), Some(3)]);
+        let c = session()
+            .execute_sql("SELECT COUNT(*) OVER () AS c FROM t WHERE a IS NOT NULL")
+            .unwrap();
+        assert_eq!(col_i64(&c, "c"), vec![Some(3), Some(3), Some(3)]);
+        let running = session()
+            .execute_sql("SELECT COUNT(*) OVER (ORDER BY a) AS c FROM t WHERE a IS NOT NULL")
+            .unwrap();
+        assert_eq!(col_i64(&running, "c"), vec![Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn window_rank_ties_and_running_sum() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), Some(1), Some(1), Some(2)])),
+                Arc::new(Int64Array::from(vec![
+                    Some(10),
+                    Some(10),
+                    Some(20),
+                    Some(5),
+                ])),
+            ],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("w", schema, vec![batch]).unwrap();
+        let ranks = s
+            .execute_sql(
+                "SELECT g, v, \
+                 RANK() OVER (PARTITION BY g ORDER BY v) AS r, \
+                 DENSE_RANK() OVER (PARTITION BY g ORDER BY v) AS d \
+                 FROM w",
+            )
+            .unwrap();
+        assert_eq!(
+            col_i64(&ranks, "g"),
+            vec![Some(1), Some(1), Some(1), Some(2)]
+        );
+        assert_eq!(
+            col_i64(&ranks, "v"),
+            vec![Some(10), Some(10), Some(20), Some(5)]
+        );
+        assert_eq!(
+            col_i64(&ranks, "r"),
+            vec![Some(1), Some(1), Some(3), Some(1)]
+        );
+        assert_eq!(
+            col_i64(&ranks, "d"),
+            vec![Some(1), Some(1), Some(2), Some(1)]
+        );
+        let sums = s
+            .execute_sql(
+                "SELECT g, SUM(v) OVER (PARTITION BY g ORDER BY v \
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM w",
+            )
+            .unwrap();
+        assert_eq!(
+            col_i64(&sums, "s"),
+            vec![Some(10), Some(20), Some(40), Some(5)]
+        );
+        let range_sums = s
+            .execute_sql("SELECT g, SUM(v) OVER (PARTITION BY g ORDER BY v) AS s FROM w")
+            .unwrap();
+        assert_eq!(
+            col_i64(&range_sums, "s"),
+            vec![Some(20), Some(20), Some(40), Some(5)]
+        );
+    }
+
+    #[test]
+    fn window_named_window() {
+        let out = session()
+            .execute_sql("SELECT ROW_NUMBER() OVER w AS n FROM t WHERE a IS NOT NULL WINDOW w AS (ORDER BY a)")
+            .unwrap();
+        assert_eq!(col_i64(&out, "n"), vec![Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn window_sum_rejects_non_integer() {
+        let err = session()
+            .execute_sql("SELECT SUM(CAST(a AS DOUBLE)) OVER () FROM t WHERE a IS NOT NULL");
+        assert!(matches!(err, Err(Error::NotImplemented(_))), "{err:?}");
+    }
+
+    #[test]
+    fn window_fails_closed_without_spill() {
+        let (s, cap) = register_numbered(12, 32);
+        let err = s
+            .clone()
+            .with_memory_limit(cap)
+            .execute_sql("SELECT ROW_NUMBER() OVER (ORDER BY a) AS n FROM t");
+        assert!(matches!(err, Err(Error::Memory(_))), "{err:?}");
+        let err = s
+            .with_memory_limit(cap)
+            .execute_sql("SELECT COUNT(*) OVER () AS c FROM t");
+        assert!(matches!(err, Err(Error::Memory(_))), "{err:?}");
     }
 
     #[test]
