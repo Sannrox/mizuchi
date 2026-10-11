@@ -6,6 +6,7 @@ mod agg;
 mod join;
 mod key;
 mod sort;
+mod stage;
 
 use std::collections::BTreeMap;
 
@@ -20,10 +21,22 @@ use crate::expr::Expr;
 use crate::plan::{Catalog, LogicalPlan, NamedExpr, normalize_name};
 
 /// In-memory tables plus a batch-size policy.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Session {
     tables: BTreeMap<String, MemTable>,
     policy: BatchPolicy,
+    /// Parallel tasks per stage. Default 1 keeps the pull iterator path.
+    workers: usize,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            tables: BTreeMap::new(),
+            policy: BatchPolicy::default(),
+            workers: 1,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +50,15 @@ impl Session {
     /// Empty session with the default morsel size.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Number of worker threads used by staged execution. `n` must be at least 1.
+    pub fn with_workers(mut self, n: usize) -> Result<Self> {
+        if n == 0 {
+            return Err(Error::Plan("workers must be greater than zero".into()));
+        }
+        self.workers = n;
+        Ok(self)
     }
 
     /// Register an in-memory table. All batches must share `schema`.
@@ -68,19 +90,32 @@ impl Session {
 
     /// Plan and run `sql` against registered tables.
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<Batch>> {
+        collect(physical(&self.bind_optimized(sql)?, self)?)
+    }
+
+    /// Split the optimized plan into stages at hash-partition exchanges.
+    pub fn explain_stages(&self, sql: &str) -> Result<String> {
+        stage::explain_stages(&self.bind_optimized(sql)?, self.workers.max(1))
+    }
+
+    /// Run `sql` as shuffle-map and result stages on `workers` threads.
+    pub fn execute_staged(&self, sql: &str) -> Result<Vec<Batch>> {
+        stage::execute_staged(&self.bind_optimized(sql)?, self)
+    }
+
+    fn bind_optimized(&self, sql: &str) -> Result<LogicalPlan> {
         let mut catalog = Catalog::new();
         for (name, table) in &self.tables {
             catalog.register(name, table.schema.clone())?;
             catalog.set_stats(name, table.stats.clone())?;
         }
         let plan = crate::plan::plan_sql(sql, &catalog)?;
-        let plan = crate::opt::optimize(plan)?;
-        collect(physical(&plan, self)?)
+        crate::opt::optimize(plan)
     }
 }
 
 /// Pull iterator of morsels.
-enum Exec {
+pub(super) enum Exec {
     Empty {
         schema: SchemaRef,
         done: bool,
@@ -176,7 +211,7 @@ fn limit_next(input: &mut Exec, skip: &mut u64, fetch: &mut Option<u64>) -> Resu
     }
 }
 
-fn physical(plan: &LogicalPlan, session: &Session) -> Result<Exec> {
+pub(super) fn physical(plan: &LogicalPlan, session: &Session) -> Result<Exec> {
     match plan {
         LogicalPlan::Empty { schema } => Ok(Exec::Empty {
             schema: schema.clone(),
@@ -302,7 +337,7 @@ fn physical(plan: &LogicalPlan, session: &Session) -> Result<Exec> {
     }
 }
 
-fn collect(mut exec: Exec) -> Result<Vec<Batch>> {
+pub(super) fn collect(mut exec: Exec) -> Result<Vec<Batch>> {
     let mut out = Vec::new();
     while let Some(batch) = exec.next_batch()? {
         if batch.num_rows() > 0 {
