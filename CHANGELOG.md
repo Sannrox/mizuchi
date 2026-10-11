@@ -31,3 +31,4 @@ All notable changes to this project are documented here.
 - LibFuzzer targets for SQL parse, plan, execute, and a supported-SQL grammar. CI runs them for a bounded time; crashes land as regression tests.
 - Engine owner shares: reserved memory and worker slices so concurrent owners cannot starve each other.
 - Stage tasks retry after a worker failure and reuse committed shuffle files. Partial writes from a failed attempt are discarded.
+- Adaptive skew handling: after shuffle-map, oversized join partitions are split by grouping map outputs and the matching other-side partition is replicated. `EXPLAIN ANALYZE` via `Session::explain_analyze` reports the splits.
