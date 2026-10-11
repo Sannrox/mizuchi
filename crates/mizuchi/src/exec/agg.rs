@@ -22,6 +22,7 @@ use arrow::datatypes::{
     UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 
+use super::CancelToken;
 use super::Exec;
 use super::key::{Scalar, eval_all, extract_key, scalar_at};
 use super::memory::{self, MemoryPool, batch_bytes};
@@ -37,11 +38,12 @@ pub(super) fn run(
     schema: SchemaRef,
     policy: &BatchPolicy,
     pool: &MemoryPool,
+    cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
     let mut table = HashAgg::new(group, aggs, schema.clone())?;
     let mut held: Vec<super::memory::Reservation<'_>> = Vec::new();
     let mut partials: Vec<std::path::PathBuf> = Vec::new();
-    while let Some(batch) = input.next_batch()? {
+    while let Some(batch) = input.next_batch(cancel)? {
         if batch.num_rows() == 0 {
             continue;
         }
@@ -93,9 +95,51 @@ fn spill_hash(
     Ok(())
 }
 
+pub(super) fn can_combine(aggs: &[(String, AggCall)]) -> bool {
+    spill_ok(aggs)
+}
+
 fn spill_ok(aggs: &[(String, AggCall)]) -> bool {
     aggs.iter()
         .all(|(_, c)| !matches!(c, AggCall::Avg(_) | AggCall::CountDistinct(_)))
+}
+
+pub(super) fn combine_partials(
+    partials: Vec<Batch>,
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+    policy: &BatchPolicy,
+) -> Result<Vec<Batch>> {
+    if partials.is_empty() {
+        return HashAgg::new(group, aggs, schema)?.finish(policy);
+    }
+    let group_n = group.len();
+    let merge_group: Vec<NamedExpr> = (0..group_n)
+        .map(|i| NamedExpr {
+            expr: Expr::nth(i),
+            name: schema.field(i).name().clone(),
+        })
+        .collect();
+    let merge_aggs: Vec<(String, AggCall)> = aggs
+        .iter()
+        .enumerate()
+        .map(|(i, (name, call))| {
+            let col = Expr::nth(group_n + i);
+            let call = match call {
+                AggCall::CountStar | AggCall::Count(_) | AggCall::Sum(_) => AggCall::Sum(col),
+                AggCall::Min(_) => AggCall::Min(col),
+                AggCall::Max(_) => AggCall::Max(col),
+                other => other.clone(),
+            };
+            (name.clone(), call)
+        })
+        .collect();
+    let mut table = HashAgg::new(&merge_group, &merge_aggs, schema)?;
+    for batch in partials {
+        table.update(&batch)?;
+    }
+    table.finish(policy)
 }
 
 fn merge_partial_files(

@@ -21,6 +21,8 @@ pub enum Error {
     Io(String),
     /// A memory limit could not be honoured and spill was unavailable.
     Memory(String),
+    /// The caller cancelled the query.
+    Cancelled,
 }
 
 impl std::fmt::Display for Error {
@@ -35,6 +37,7 @@ impl std::fmt::Display for Error {
             Error::Plan(reason) => write!(f, "plan: {reason}"),
             Error::Io(reason) => write!(f, "io: {reason}"),
             Error::Memory(reason) => write!(f, "memory: {reason}"),
+            Error::Cancelled => write!(f, "cancelled"),
         }
     }
 }

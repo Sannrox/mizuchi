@@ -15,7 +15,7 @@ use arrow::datatypes::SchemaRef;
 
 use super::key::{Scalar, extract_key};
 use super::memory::{self, MemoryPool, batch_bytes};
-use super::{Exec, filter_batch};
+use super::{CancelToken, Exec, filter_batch};
 use crate::batch::{Batch, BatchPolicy};
 use crate::error::{Error, Result};
 use crate::expr::{BinaryOp, Expr};
@@ -35,9 +35,10 @@ pub(super) fn run(
     spec: JoinSpec<'_>,
     policy: &BatchPolicy,
     pool: &MemoryPool,
+    cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
-    let left_chunks = collect_chunks(&mut left, spec.left_schema.clone(), pool)?;
-    let right_chunks = collect_chunks(&mut right, spec.right_schema.clone(), pool)?;
+    let left_chunks = collect_chunks(&mut left, spec.left_schema.clone(), pool, cancel)?;
+    let right_chunks = collect_chunks(&mut right, spec.right_schema.clone(), pool, cancel)?;
     let spilled = left_chunks.len() > 1 || right_chunks.len() > 1;
     if spilled
         && matches!(
@@ -80,14 +81,19 @@ fn load_chunk(chunk: &Chunk, schema: SchemaRef) -> Result<Batch> {
     }
 }
 
-fn collect_chunks(exec: &mut Exec, schema: SchemaRef, pool: &MemoryPool) -> Result<Vec<Chunk>> {
+fn collect_chunks(
+    exec: &mut Exec,
+    schema: SchemaRef,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Vec<Chunk>> {
     if !pool.has_limit() {
-        return Ok(vec![Chunk::Mem(concat_exec(exec, schema)?)]);
+        return Ok(vec![Chunk::Mem(concat_exec(exec, schema, cancel)?)]);
     }
     let mut out = Vec::new();
     let mut cur: Vec<Batch> = Vec::new();
     let mut held: Vec<super::memory::Reservation<'_>> = Vec::new();
-    while let Some(batch) = exec.next_batch()? {
+    while let Some(batch) = exec.next_batch(cancel)? {
         if batch.num_rows() == 0 {
             continue;
         }
@@ -276,9 +282,9 @@ fn join_pair(
         .collect())
 }
 
-fn concat_exec(exec: &mut Exec, schema: SchemaRef) -> Result<Batch> {
+fn concat_exec(exec: &mut Exec, schema: SchemaRef, cancel: &CancelToken) -> Result<Batch> {
     let mut batches = Vec::new();
-    while let Some(batch) = exec.next_batch()? {
+    while let Some(batch) = exec.next_batch(cancel)? {
         if batch.num_rows() > 0 {
             batches.push(batch);
         }

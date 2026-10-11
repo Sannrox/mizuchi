@@ -16,7 +16,7 @@ pub mod sql;
 
 pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
 pub use error::Error;
-pub use exec::Session;
+pub use exec::{CancelToken, Session};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use opt::{estimate_rows, optimize};
 pub use plan::{
