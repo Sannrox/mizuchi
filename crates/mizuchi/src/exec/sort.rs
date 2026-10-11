@@ -10,8 +10,8 @@ use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices
 use arrow::datatypes::SchemaRef;
 
 use super::CancelToken;
-use super::Exec;
 use super::memory::{self, MemoryPool, batch_bytes};
+use super::{Exec, Operator};
 use crate::batch::{Batch, BatchPolicy};
 use crate::error::{Error, Result};
 use crate::plan::SortExpr;
@@ -19,7 +19,7 @@ use crate::plan::SortExpr;
 /// Sort `child` by `order`, then apply `skip` / `fetch` (top-k when `fetch` is set).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn ordered(
-    mut child: Exec,
+    mut child: Box<dyn Operator>,
     schema: SchemaRef,
     order: &[SortExpr],
     skip: u64,
@@ -82,7 +82,7 @@ pub(super) fn ordered(
 }
 
 fn sort_concat(
-    child: &mut Exec,
+    child: &mut dyn Operator,
     schema: SchemaRef,
     order: &[SortExpr],
     skip: u64,
@@ -149,8 +149,8 @@ fn spill_sorted_run(
     Ok(path)
 }
 
-fn batches_to_exec(batches: Vec<Batch>, _schema: SchemaRef) -> Exec {
-    Exec::Scan { batches, index: 0 }
+fn batches_to_exec(batches: Vec<Batch>, _schema: SchemaRef) -> Box<dyn Operator> {
+    Box::new(Exec::Scan { batches, index: 0 })
 }
 
 fn merge_spilled(
@@ -221,7 +221,7 @@ fn apply_skip_fetch(
         .collect())
 }
 
-fn concat_exec(exec: &mut Exec, schema: SchemaRef, cancel: &CancelToken) -> Result<Batch> {
+fn concat_exec(exec: &mut dyn Operator, schema: SchemaRef, cancel: &CancelToken) -> Result<Batch> {
     let mut batches = Vec::new();
     while let Some(batch) = exec.next_batch(cancel)? {
         if batch.num_rows() > 0 {

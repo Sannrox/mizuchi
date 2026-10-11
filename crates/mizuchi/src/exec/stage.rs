@@ -32,7 +32,7 @@ use arrow::ipc::writer::FileWriter;
 use super::join::{self, JoinSpec};
 use super::key;
 use super::memory::batch_bytes;
-use super::{Exec, Session, collect, physical};
+use super::{Operator, Session, collect, physical};
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::expr::Expr;
@@ -1324,12 +1324,10 @@ fn requeue_or_abort(
     Ok(())
 }
 
-fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
+fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operator>> {
+    let lowering = ctx.session.lowering.0.as_ref();
     match plan {
-        PhysicalPlan::Empty { schema } => Ok(Exec::Empty {
-            schema: schema.clone(),
-            done: false,
-        }),
+        PhysicalPlan::Empty { schema } => lowering.empty(schema.clone()),
         PhysicalPlan::Scan {
             table,
             projection,
@@ -1348,40 +1346,30 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
                 physical(&logical, &ctx.session, ctx.pool.as_ref())?,
                 &ctx.session.cancel,
             )?;
-            Ok(Exec::Scan {
-                batches: slice_partition(
-                    batches,
-                    plan.schema().clone(),
-                    ctx.partition,
-                    ctx.partitions,
-                )?,
-                index: 0,
-            })
+            lowering.scan(slice_partition(
+                batches,
+                plan.schema().clone(),
+                ctx.partition,
+                ctx.partitions,
+            )?)
         }
         PhysicalPlan::ShuffleRead {
             shuffle_id, schema, ..
         } => {
             let maps = ctx.map_filter.get(shuffle_id).map(|v| v.as_slice());
-            Ok(Exec::Scan {
-                batches: ctx
-                    .shuffle
+            lowering.scan(
+                ctx.shuffle
                     .read(*shuffle_id, ctx.partition, schema.clone(), maps)?,
-                index: 0,
-            })
+            )
         }
-        PhysicalPlan::Filter { input, predicate } => Ok(Exec::Filter {
-            input: Box::new(execute_physical(input, ctx)?),
-            predicate: predicate.clone(),
-        }),
+        PhysicalPlan::Filter { input, predicate } => {
+            lowering.filter(execute_physical(input, ctx)?, predicate.clone())
+        }
         PhysicalPlan::Project {
             input,
             exprs,
             schema,
-        } => Ok(Exec::Project {
-            input: Box::new(execute_physical(input, ctx)?),
-            exprs: exprs.clone(),
-            schema: schema.clone(),
-        }),
+        } => lowering.project(execute_physical(input, ctx)?, exprs.clone(), schema.clone()),
         PhysicalPlan::Aggregate {
             input,
             group,
@@ -1398,7 +1386,7 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
                 ctx.pool.as_ref(),
                 &ctx.session.cancel,
             )?;
-            Ok(Exec::Scan { batches, index: 0 })
+            lowering.scan(batches)
         }
         PhysicalPlan::Join {
             left,
@@ -1421,7 +1409,7 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
                 ctx.pool.as_ref(),
                 &ctx.session.cancel,
             )?;
-            Ok(Exec::Scan { batches, index: 0 })
+            lowering.scan(batches)
         }
         PhysicalPlan::Sort { input, order } => {
             let batches = super::sort::ordered(
@@ -1434,7 +1422,7 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
                 ctx.pool.as_ref(),
                 &ctx.session.cancel,
             )?;
-            Ok(Exec::Scan { batches, index: 0 })
+            lowering.scan(batches)
         }
         PhysicalPlan::Limit { input, skip, fetch } => match input.as_ref() {
             PhysicalPlan::Sort {
@@ -1451,13 +1439,9 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
                     ctx.pool.as_ref(),
                     &ctx.session.cancel,
                 )?;
-                Ok(Exec::Scan { batches, index: 0 })
+                lowering.scan(batches)
             }
-            _ => Ok(Exec::Limit {
-                input: Box::new(execute_physical(input, ctx)?),
-                skip: *skip,
-                fetch: *fetch,
-            }),
+            _ => lowering.limit(execute_physical(input, ctx)?, *skip, *fetch),
         },
         PhysicalPlan::Union { .. } => Err(Error::NotImplemented("physical union")),
         PhysicalPlan::Exchange { .. } => {

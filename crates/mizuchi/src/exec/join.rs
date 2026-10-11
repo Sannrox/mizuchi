@@ -15,7 +15,7 @@ use arrow::datatypes::SchemaRef;
 
 use super::key::{Scalar, extract_key};
 use super::memory::{self, MemoryPool, batch_bytes};
-use super::{CancelToken, Exec, filter_batch};
+use super::{CancelToken, Operator, filter_batch};
 use crate::batch::{Batch, BatchPolicy};
 use crate::error::{Error, Result};
 use crate::expr::{BinaryOp, Expr};
@@ -30,8 +30,8 @@ pub(super) struct JoinSpec<'a> {
 }
 
 pub(super) fn run(
-    mut left: Exec,
-    mut right: Exec,
+    mut left: Box<dyn Operator>,
+    mut right: Box<dyn Operator>,
     spec: JoinSpec<'_>,
     policy: &BatchPolicy,
     pool: &MemoryPool,
@@ -82,7 +82,7 @@ fn load_chunk(chunk: &Chunk, schema: SchemaRef) -> Result<Batch> {
 }
 
 fn collect_chunks(
-    exec: &mut Exec,
+    exec: &mut dyn Operator,
     schema: SchemaRef,
     pool: &MemoryPool,
     cancel: &CancelToken,
@@ -282,7 +282,7 @@ fn join_pair(
         .collect())
 }
 
-fn concat_exec(exec: &mut Exec, schema: SchemaRef, cancel: &CancelToken) -> Result<Batch> {
+fn concat_exec(exec: &mut dyn Operator, schema: SchemaRef, cancel: &CancelToken) -> Result<Batch> {
     let mut batches = Vec::new();
     while let Some(batch) = exec.next_batch(cancel)? {
         if batch.num_rows() > 0 {

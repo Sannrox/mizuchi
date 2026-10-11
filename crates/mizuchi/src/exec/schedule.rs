@@ -112,10 +112,10 @@ fn parallel_agg(
     let morsels = parallel_pipeline(pipe, session)?;
     if morsels.is_empty() {
         return super::agg::run(
-            Exec::Scan {
+            Box::new(Exec::Scan {
                 batches: Vec::new(),
                 index: 0,
-            },
+            }),
             group,
             aggs,
             schema,
@@ -138,10 +138,10 @@ fn parallel_agg(
             handles.push(scope.spawn(move || -> Result<()> {
                 session.cancel.check()?;
                 let out = super::agg::run(
-                    Exec::Scan {
+                    Box::new(Exec::Scan {
                         batches: chunk,
                         index: 0,
-                    },
+                    }),
                     group,
                     aggs,
                     schema,
