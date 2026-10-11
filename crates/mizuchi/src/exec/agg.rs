@@ -179,7 +179,8 @@ fn merge_partial_files(
     table.finish(policy)
 }
 
-struct HashAgg {
+#[derive(Clone)]
+pub(super) struct HashAgg {
     group_exprs: Vec<Expr>,
     aggs: Vec<AggCall>,
     schema: SchemaRef,
@@ -190,7 +191,11 @@ struct HashAgg {
 }
 
 impl HashAgg {
-    fn new(group: &[NamedExpr], aggs: &[(String, AggCall)], schema: SchemaRef) -> Result<Self> {
+    pub(super) fn new(
+        group: &[NamedExpr],
+        aggs: &[(String, AggCall)],
+        schema: SchemaRef,
+    ) -> Result<Self> {
         Ok(Self {
             group_exprs: group.iter().map(|g| g.expr.clone()).collect(),
             aggs: aggs.iter().map(|(_, c)| c.clone()).collect(),
@@ -202,7 +207,7 @@ impl HashAgg {
         })
     }
 
-    fn update(&mut self, batch: &Batch) -> Result<()> {
+    pub(super) fn update(&mut self, batch: &Batch) -> Result<()> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -284,8 +289,14 @@ impl HashAgg {
             .filter(|b| b.num_rows() > 0)
             .collect())
     }
+
+    /// Complete output without dropping running state (micro-batch snapshot).
+    pub(super) fn snapshot(&self, policy: &BatchPolicy) -> Result<Vec<Batch>> {
+        self.clone().finish(policy)
+    }
 }
 
+#[derive(Clone)]
 enum Accum {
     Count(i64),
     CountDistinct(HashSet<Scalar>),
