@@ -19,6 +19,7 @@ use crate::sql::parse_sql;
 use crate::udaf::CombineAgg;
 
 pub use bind::{bind_ddl, bind_merge, merge_target_table, plan_sql, plan_sql_with_udafs};
+pub(crate) use bind::{bind_merge_at, plan_sql_at, unix_micros_now};
 pub(crate) use catalog::normalize_name;
 pub use catalog::{
     AlterTable, Catalog, CatalogProvider, DEFAULT_CATALOG, DEFAULT_NAMESPACE, Ddl, NamespaceIdent,
@@ -832,6 +833,16 @@ fn unary_type(op: crate::expr::UnaryOp, dt: DataType) -> Result<DataType> {
         }
         CharLength => Ok(DataType::Int64),
         ExtractYear | ExtractMonth | ExtractDay => Ok(DataType::Int64),
+        DateTruncDay => match dt {
+            DataType::Date32 | DataType::Date64 => Ok(DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                None,
+            )),
+            DataType::Timestamp(_, _) => Ok(dt),
+            other => Err(Error::Plan(format!(
+                "date_trunc requires date or timestamp, got {other}"
+            ))),
+        },
         ArrayLength => {
             require_list(dt, "array_length")?;
             Ok(DataType::Int64)
@@ -1178,5 +1189,45 @@ mod tests {
         assert!(matches!(err, Error::Plan(_)), "{err:?}");
         let err = plan_sql("SELECT SUM(CAST(1 AS DECIMAL(10, 2)))", &Catalog::new()).unwrap_err();
         assert!(matches!(err, Error::Plan(_)), "{err:?}");
+    }
+
+    #[test]
+    fn datetime_sql_maps_and_function_types() {
+        let plan = plan_sql("SELECT CAST('2020-01-01' AS DATE)", &Catalog::new()).unwrap();
+        assert_eq!(plan.schema().field(0).data_type(), &DataType::Date32);
+        let plan = plan_sql(
+            "SELECT CAST('2020-01-01 00:00:00' AS TIMESTAMP)",
+            &Catalog::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.schema().field(0).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+        );
+        let plan = plan_sql("SELECT INTERVAL '1' DAY", &Catalog::new()).unwrap();
+        assert_eq!(
+            plan.schema().field(0).data_type(),
+            &DataType::Interval(arrow::datatypes::IntervalUnit::DayTime)
+        );
+        let plan = plan_sql(
+            "SELECT DATE_TRUNC('day', TIMESTAMP '2020-01-02 15:04:05')",
+            &Catalog::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.schema().field(0).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+        );
+        let plan = plan_sql("SELECT CURRENT_DATE", &Catalog::new()).unwrap();
+        assert_eq!(plan.schema().field(0).data_type(), &DataType::Date32);
+        let plan = plan_sql("SELECT NOW()", &Catalog::new()).unwrap();
+        assert_eq!(
+            plan.schema().field(0).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+        );
+        let err = plan_sql("SELECT DATE_TRUNC('week', NOW())", &Catalog::new()).unwrap_err();
+        assert!(matches!(err, Error::NotImplemented(_)), "{err:?}");
+        let err = plan_sql("SELECT CAST(1 AS INTERVAL YEAR)", &Catalog::new()).unwrap_err();
+        assert!(matches!(err, Error::NotImplemented(_)), "{err:?}");
     }
 }

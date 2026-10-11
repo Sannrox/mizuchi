@@ -120,6 +120,9 @@ pub struct Session {
     speculate: bool,
     /// Combinable user-defined aggregates, keyed by lower-case SQL name.
     udafs: BTreeMap<String, Arc<dyn CombineAgg>>,
+    /// Query-start clock in microseconds since the Unix epoch. `None` uses
+    /// the process clock when binding `CURRENT_DATE` / `NOW()`.
+    now_micros: Option<i64>,
 }
 
 impl Default for Session {
@@ -143,6 +146,7 @@ impl Default for Session {
             allow_network: false,
             speculate: false,
             udafs: BTreeMap::new(),
+            now_micros: None,
         }
     }
 }
@@ -170,6 +174,7 @@ impl Clone for Session {
             allow_network: self.allow_network,
             speculate: self.speculate,
             udafs: self.udafs.clone(),
+            now_micros: self.now_micros,
         }
     }
 }
@@ -214,6 +219,7 @@ impl Session {
         session.allowed_read_paths = config::resolve_roots(cfg.allowed_read_paths)?;
         session.allowed_write_paths = config::resolve_roots(cfg.allowed_write_paths)?;
         session.allow_network = cfg.allow_network;
+        session.now_micros = cfg.now_micros;
         Ok(session)
     }
 
@@ -310,6 +316,16 @@ impl Session {
     pub fn with_lowering(mut self, lowering: std::sync::Arc<dyn Lowering>) -> Self {
         self.lowering = op::LoweringArc(lowering);
         self
+    }
+
+    /// Pin `CURRENT_DATE` and `NOW()` to `micros` since the Unix epoch.
+    pub fn with_now_micros(mut self, micros: i64) -> Self {
+        self.now_micros = Some(micros);
+        self
+    }
+
+    fn query_now_micros(&self) -> i64 {
+        self.now_micros.unwrap_or_else(crate::plan::unix_micros_now)
     }
 
     /// Register an in-memory table. All batches must share `schema`.
@@ -699,7 +715,7 @@ impl Session {
             catalog.register(name, table.schema.clone())?;
             catalog.set_stats(name, table.stats.clone())?;
         }
-        let plan = crate::plan::bind_merge(sql, &catalog)?;
+        let plan = crate::plan::bind_merge_at(sql, &catalog, self.query_now_micros())?;
         let (batches, stats) = merge::run(self, &plan)?;
         self.register(stats.table.clone(), plan.target_schema, batches)?;
         Ok(stats)
@@ -1026,7 +1042,7 @@ impl Session {
             }
             catalog.set_stats(name, stats)?;
         }
-        let plan = crate::plan::plan_sql_with_udafs(sql, &catalog, &self.udafs)?;
+        let plan = crate::plan::plan_sql_at(sql, &catalog, &self.udafs, self.query_now_micros())?;
         crate::opt::optimize(plan)
     }
 
@@ -2921,6 +2937,110 @@ mod tests {
         assert_eq!(col_i64(&out, "z"), vec![None]);
         assert_eq!(col_i64(&out, "k"), vec![Some(1)]);
         assert_eq!(col_i64(&out, "al"), vec![Some(3)]);
+    }
+
+    #[test]
+    fn datetime_sql_casts_and_clock() {
+        const NOW: i64 = 1_577_836_800_000_000; // 2020-01-01 00:00:00 UTC
+        let s = Session::new().with_now_micros(NOW);
+        let out = s
+            .execute_sql("SELECT CAST('2020-01-01' AS DATE) AS d")
+            .unwrap();
+        let d = out[0].column(0);
+        assert_eq!(d.data_type(), &DataType::Date32);
+        assert_eq!(
+            d.as_any().downcast_ref::<Date32Array>().unwrap().value(0),
+            18_262
+        );
+        let out = s
+            .execute_sql("SELECT CAST('2020-01-01 00:00:00' AS TIMESTAMP) AS ts")
+            .unwrap();
+        let ts = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts.value(0), NOW);
+        let out = s.execute_sql("SELECT INTERVAL '1' DAY AS i").unwrap();
+        assert_eq!(
+            out[0].schema().field(0).data_type(),
+            &DataType::Interval(arrow::datatypes::IntervalUnit::DayTime)
+        );
+        let out = s
+            .execute_sql("SELECT EXTRACT(YEAR FROM DATE '2020-01-01') AS y")
+            .unwrap();
+        assert_eq!(col_i64(&out, "y"), vec![Some(2020)]);
+        let out = s
+            .execute_sql("SELECT DATE_TRUNC('day', TIMESTAMP '2020-01-02 15:04:05') AS t")
+            .unwrap();
+        let t = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(t.value(0), 1_577_923_200_000_000);
+        let out = s
+            .execute_sql("SELECT CURRENT_DATE AS d, NOW() AS t")
+            .unwrap();
+        assert_eq!(
+            out[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap()
+                .value(0),
+            18_262
+        );
+        assert_eq!(
+            out[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                .unwrap()
+                .value(0),
+            NOW
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(1), Some(2)]))],
+        )
+        .unwrap();
+        let mut ordered = Session::new().with_now_micros(NOW);
+        ordered
+            .register("t", schema.clone(), vec![batch.clone()])
+            .unwrap();
+        let out = ordered
+            .execute_sql(
+                "SELECT n FROM t ORDER BY CASE WHEN CURRENT_DATE = DATE '2020-01-01' THEN n ELSE -n END",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&out, "n"), vec![Some(1), Some(2)]);
+        let mut merged = Session::new().with_now_micros(NOW);
+        merged
+            .register("t", schema.clone(), vec![batch.clone()])
+            .unwrap();
+        merged
+            .register(
+                "s",
+                schema,
+                vec![
+                    Batch::try_new(
+                        batch.schema().clone(),
+                        vec![Arc::new(Int64Array::from(vec![Some(1)]))],
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+        merged
+            .merge_sql(
+                "MERGE INTO t USING s ON t.n = s.n \
+                 WHEN MATCHED AND CURRENT_DATE = DATE '2020-01-01' THEN DELETE",
+            )
+            .unwrap();
+        let out = merged.execute_sql("SELECT n FROM t").unwrap();
+        assert_eq!(col_i64(&out, "n"), vec![Some(2)]);
     }
 
     #[test]

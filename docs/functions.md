@@ -15,7 +15,7 @@ Struct field access is out of this slice.
 | Math | `abs`, `round`, `ceil` / `ceiling`, `floor`, `sqrt` | `round` is 0 decimal places. `ceil` / `floor` / `sqrt` / `round` return Float64. |
 | Conditional | `CASE`, `coalesce`, `nullif` | `nullif(a, b)` rewrites to `CASE WHEN a = b THEN NULL ELSE a END`. |
 | Array | `ARRAY[e, ...]`, `array_length(a, 1)` | One list per row. `array_length` requires a list (not a string). Dimension other than 1 is unimplemented. |
-| Date/time | `EXTRACT(YEAR\|MONTH\|DAY\|EPOCH FROM x)`, `date_part('year'\|'month'\|'day'\|'epoch', x)` | Input is an Arrow Date or Timestamp column. SQL `DATE` / `TIMESTAMP` literals are a later family (`datetime.slt`). |
+| Date/time | `EXTRACT(YEAR\|MONTH\|DAY\|EPOCH FROM x)`, `date_part('year'\|'month'\|'day'\|'epoch', x)`, `DATE_TRUNC('day', ts)`, `CURRENT_DATE`, `NOW()` / `CURRENT_TIMESTAMP`, `DATE` / `TIMESTAMP` / `INTERVAL 'n' DAY` literals | `DATE` is Arrow Date32; `TIMESTAMP` is Timestamp(Microsecond) without time zone; day intervals are Interval(DayTime). `CURRENT_DATE` / `NOW()` use the session clock. |
 
 Evidence: `crates/mizuchi/tests/slt/functions.slt`, plus `extract_from_date32_column` for EXTRACT on Date32.
 

@@ -18,14 +18,17 @@ execute; skipped records are parsed and ignored.
 | Uncorrelated `FROM` subquery (derived table) | `subquery.slt` |
 | `IN` lists, `IN`/`NOT IN (SELECT ...)`, `EXISTS`, scalar subquery, `LATERAL` | `subquery.slt` (#80) |
 | `CAST` of integer, float, and text; `DECIMAL` / `NUMERIC` casts and arithmetic | `decimal.slt` (#82) |
+| `DATE`, `TIMESTAMP`, `INTERVAL` casts, `EXTRACT`, `DATE_TRUNC`, `CURRENT_DATE`, `NOW()` | `datetime.slt` (#83) |
 | Window functions (`OVER`, `ROW_NUMBER`, ranking, frames, named `WINDOW`) | `window.slt` (#78) |
 | CTEs (`WITH`, `WITH RECURSIVE`) | `cte.slt` (#79) |
 | `UNION` / `UNION ALL` / `UNION DISTINCT`, `INTERSECT`, `EXCEPT` (DISTINCT and ALL) | `setops.slt` (#81) |
 | `MERGE INTO` match / update / insert / delete | `merge.slt` |
 
 Arrow Date, Timestamp, Duration, and Interval are accepted at the schema
-boundary (`schema.rs` unit tests). They have no SQL path yet. `DECIMAL` /
-`NUMERIC` map onto Arrow `Decimal32` / `Decimal64` / `Decimal128`.
+boundary (`schema.rs` unit tests). SQL `DATE` maps to Arrow `Date32`,
+`TIMESTAMP` (without time zone) to `Timestamp(Microsecond)`, and
+`INTERVAL … DAY` to `Interval(DayTime)`. `DECIMAL` / `NUMERIC` map onto
+Arrow `Decimal32` / `Decimal64` / `Decimal128`.
 
 ## Audited families
 
@@ -35,12 +38,12 @@ boundary (`schema.rs` unit tests). They have no SQL path yet. `DECIMAL` /
 | `UNION` / `UNION ALL` / `UNION DISTINCT` | supported | `setops.slt` | #81 |
 | `INTERSECT` / `EXCEPT` (DISTINCT and ALL) | supported | `setops.slt` | #81 |
 | DECIMAL arithmetic and casts | supported | `decimal.slt` | #82 |
-| DATE, TIMESTAMP, INTERVAL casts and functions | skipped | `datetime.slt` | #83 |
+| DATE, TIMESTAMP, INTERVAL casts and functions | supported | `datetime.slt` | #83 |
 
 Set operators keep left column names. Column counts must match. Compatible
 integer, float, and null types widen; incompatible types fail at plan time.
 Nulls compare equal. `UNION BY NAME` is unimplemented.
-`CURRENT_DATE` and `NOW()` in `datetime.slt` keep placeholder expected rows
-until a session clock exists.
+`CURRENT_DATE` and `NOW()` bind to the session clock (`SessionConfig.now_micros`
+or `Session::with_now_micros`); the slt runner pins 2020-01-01 00:00:00 UTC.
 
 `gaps.slt` is a pointer to the per-family files.

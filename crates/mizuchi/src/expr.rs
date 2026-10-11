@@ -71,6 +71,8 @@ pub enum UnaryOp {
     ExtractMonth,
     ExtractDay,
     ExtractEpoch,
+    /// `DATE_TRUNC('day', ts)`: midnight of the calendar day.
+    DateTruncDay,
     ArrayLength,
 }
 
@@ -447,6 +449,7 @@ fn eval_unary(op: UnaryOp, child: &ArrayRef) -> Result<ArrayRef> {
         UnaryOp::ExtractMonth => extract_part(child, DatePart::Month),
         UnaryOp::ExtractDay => extract_part(child, DatePart::Day),
         UnaryOp::ExtractEpoch => extract_epoch(child),
+        UnaryOp::DateTruncDay => trunc_day(child),
         UnaryOp::ArrayLength => eval_array_length(child),
     }
 }
@@ -643,6 +646,39 @@ fn map_f64(child: &ArrayRef, f: impl Fn(f64) -> f64) -> Result<ArrayRef> {
 fn extract_part(child: &ArrayRef, part: DatePart) -> Result<ArrayRef> {
     let parts = date_part(child.as_ref(), part).map_err(eval_err)?;
     cast(parts.as_ref(), &DataType::Int64).map_err(eval_err)
+}
+
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+/// Truncate a date or timestamp to midnight of its calendar day.
+///
+/// Dates become `Timestamp(Microsecond)` at that midnight. Timestamps keep
+/// their unit and timezone. Arrow 60 has no date_trunc kernel.
+fn trunc_day(child: &ArrayRef) -> Result<ArrayRef> {
+    let out_ty = match child.data_type() {
+        DataType::Date32 | DataType::Date64 => DataType::Timestamp(TimeUnit::Microsecond, None),
+        DataType::Timestamp(unit, tz) => DataType::Timestamp(*unit, tz.clone()),
+        other => {
+            return Err(Error::Eval(format!(
+                "date_trunc requires date or timestamp, got {other}"
+            )));
+        }
+    };
+    let micros_ty = DataType::Timestamp(TimeUnit::Microsecond, None);
+    let micros = if child.data_type() == &micros_ty {
+        child.clone()
+    } else {
+        cast_strict(child.as_ref(), &micros_ty)?
+    };
+    let truncated = micros
+        .as_primitive::<TimestampMicrosecondType>()
+        .unary::<_, TimestampMicrosecondType>(|us| us.div_euclid(MICROS_PER_DAY) * MICROS_PER_DAY);
+    let truncated: ArrayRef = Arc::new(truncated);
+    if truncated.data_type() == &out_ty {
+        Ok(truncated)
+    } else {
+        cast_strict(truncated.as_ref(), &out_ty)
+    }
 }
 
 fn extract_epoch(child: &ArrayRef) -> Result<ArrayRef> {
@@ -1118,5 +1154,28 @@ mod tests {
             err.to_string().contains("array_length requires list"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn date_trunc_day_zeros_time_of_day() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]));
+        let midday = 1_577_977_445_000_000; // 2020-01-02 15:04:05 UTC
+        let midnight = 1_577_923_200_000_000; // 2020-01-02 00:00:00 UTC
+        let batch = Batch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::TimestampMicrosecondArray::from(
+                vec![Some(midday), None],
+            ))],
+        )
+        .unwrap();
+        let trunc = Expr::Unary(UnaryOp::DateTruncDay, Box::new(Expr::column("ts")));
+        let out = trunc.eval(&batch).unwrap();
+        let arr = out.as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(arr.value(0), midnight);
+        assert!(arr.is_null(1));
     }
 }

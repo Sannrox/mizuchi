@@ -3,18 +3,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arrow::array::Array;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{Array, Date32Array, IntervalDayTimeArray, TimestampMicrosecondArray};
+use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, SchemaRef, TimeUnit};
 use sqlparser::ast::{
     Array as SqlArray, Assignment, AssignmentTarget, BinaryOperator, CastKind, CeilFloorKind, Cte,
     DateTimeField, Distinct, DuplicateTreatment, Expr as SqlExpr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
-    LimitClause, Merge as SqlMerge, MergeAction, MergeClauseKind, MergeInsertKind, MergeUpdateKind,
-    NamedWindowDefinition, NamedWindowExpr, ObjectName, ObjectNamePart, Offset, OrderByExpr,
-    OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator,
-    SetQuantifier, Statement, TableFactor, TableWithJoins, TrimWhereField, UnaryOperator, Value,
-    WildcardAdditionalOptions, WindowFrame as SqlWindowFrame, WindowFrameBound, WindowFrameUnits,
-    WindowType,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, IntervalFields, JoinConstraint,
+    JoinOperator, LimitClause, Merge as SqlMerge, MergeAction, MergeClauseKind, MergeInsertKind,
+    MergeUpdateKind, NamedWindowDefinition, NamedWindowExpr, ObjectName, ObjectNamePart, Offset,
+    OrderByExpr, OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
+    SetOperator, SetQuantifier, Statement, TableFactor, TableWithJoins, TimezoneInfo,
+    TrimWhereField, TypedString, UnaryOperator, Value, WildcardAdditionalOptions,
+    WindowFrame as SqlWindowFrame, WindowFrameBound, WindowFrameUnits, WindowType,
 };
 
 use super::{
@@ -35,6 +35,9 @@ struct BindCtx<'a> {
     ctes: BTreeMap<String, LogicalPlan>,
     /// Recursive working-table names visible only in the recursive step.
     work: BTreeMap<String, SchemaRef>,
+    /// Query-start clock in microseconds since the Unix epoch. `CURRENT_DATE`
+    /// and `NOW()` fold to literals of this instant.
+    now_micros: i64,
 }
 
 #[derive(Clone)]
@@ -49,6 +52,7 @@ struct Scope {
     columns: Vec<ScopeCol>,
     schema: SchemaRef,
     udafs: BTreeMap<String, Arc<dyn CombineAgg>>,
+    now_micros: i64,
 }
 
 impl Scope {
@@ -75,12 +79,19 @@ impl Scope {
             columns,
             schema,
             udafs,
+            now_micros: unix_micros_now(),
         }
+    }
+
+    fn with_now(mut self, now_micros: i64) -> Self {
+        self.now_micros = now_micros;
+        self
     }
 
     fn join(left: Scope, right: Scope) -> Self {
         let schema = join_schema(&left.schema, &right.schema);
         let udafs = left.udafs;
+        let now_micros = left.now_micros;
         let mut columns = left.columns;
         let offset = columns.len();
         for mut col in right.columns {
@@ -91,6 +102,7 @@ impl Scope {
             columns,
             schema,
             udafs,
+            now_micros,
         }
     }
 }
@@ -106,17 +118,36 @@ pub fn plan_sql_with_udafs(
     catalog: &Catalog,
     udafs: &BTreeMap<String, Arc<dyn CombineAgg>>,
 ) -> Result<LogicalPlan> {
+    plan_sql_at(sql, catalog, udafs, unix_micros_now())
+}
+
+/// [`plan_sql_with_udafs`] using a caller-supplied query-start clock.
+pub(crate) fn plan_sql_at(
+    sql: &str,
+    catalog: &Catalog,
+    udafs: &BTreeMap<String, Arc<dyn CombineAgg>>,
+    now_micros: i64,
+) -> Result<LogicalPlan> {
     let stmt = parse_statements(sql)?;
     let ctx = BindCtx {
         catalog,
         udafs,
         ctes: BTreeMap::new(),
         work: BTreeMap::new(),
+        now_micros,
     };
     match stmt {
         Statement::Query(query) => bind_query(&query, &ctx),
         other => Err(Error::NotImplemented(statement_kind(&other))),
     }
+}
+
+/// Microseconds since the Unix epoch according to the process clock.
+pub(crate) fn unix_micros_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 fn statement_kind(stmt: &Statement) -> &'static str {
@@ -241,9 +272,14 @@ pub fn merge_target_table(sql: &str) -> Result<String> {
 
 /// Bind a `MERGE` statement against `catalog`.
 pub fn bind_merge(sql: &str, catalog: &Catalog) -> Result<MergePlan> {
+    bind_merge_at(sql, catalog, unix_micros_now())
+}
+
+/// [`bind_merge`] using a caller-supplied query-start clock.
+pub(crate) fn bind_merge_at(sql: &str, catalog: &Catalog, now_micros: i64) -> Result<MergePlan> {
     let stmt = parse_statements(sql)?;
     match stmt {
-        Statement::Merge(merge) => bind_merge_stmt(&merge, catalog),
+        Statement::Merge(merge) => bind_merge_stmt(&merge, catalog, now_micros),
         other => Err(Error::Plan(format!(
             "expected MERGE, got {}",
             statement_kind(&other)
@@ -251,7 +287,7 @@ pub fn bind_merge(sql: &str, catalog: &Catalog) -> Result<MergePlan> {
     }
 }
 
-fn bind_merge_stmt(merge: &SqlMerge, catalog: &Catalog) -> Result<MergePlan> {
+fn bind_merge_stmt(merge: &SqlMerge, catalog: &Catalog, now_micros: i64) -> Result<MergePlan> {
     if !merge.optimizer_hints.is_empty() {
         return Err(Error::NotImplemented("MERGE hints"));
     }
@@ -266,11 +302,13 @@ fn bind_merge_stmt(merge: &SqlMerge, catalog: &Catalog) -> Result<MergePlan> {
         udafs: &empty,
         ctes: BTreeMap::new(),
         work: BTreeMap::new(),
+        now_micros,
     };
     let source = bind_table_factor(&merge.source, &ctx)?;
     let source_schema = source.plan.schema().clone();
     let target_qual = target_alias.unwrap_or_else(|| target.clone());
-    let target_scope = Scope::from_schema(Some(target_qual), target_schema.clone());
+    let target_scope =
+        Scope::from_schema(Some(target_qual), target_schema.clone()).with_now(now_micros);
     let ts_scope = Scope::join(target_scope.clone(), source.scope.clone());
     let st_scope = Scope::join(source.scope.clone(), target_scope.clone());
     let on_ts = bind_scalar(&merge.on, &ts_scope)?;
@@ -550,7 +588,7 @@ fn bind_query_body(query: &Query, ctx: &BindCtx<'_>) -> Result<LogicalPlan> {
     reject_query_extras(query)?;
     let mut plan = bind_set_expr(&query.body, ctx)?;
     if let Some(order_by) = &query.order_by {
-        plan = bind_order_by(plan, order_by)?;
+        plan = bind_order_by(plan, order_by, ctx.now_micros)?;
     }
     if let Some(limit) = &query.limit_clause {
         plan = bind_limit(plan, limit)?;
@@ -669,7 +707,7 @@ fn bind_recursive_cte(
         schema,
     };
     if let Some(order_by) = &query.order_by {
-        plan = bind_order_by(plan, order_by)?;
+        plan = bind_order_by(plan, order_by, ctx.now_micros)?;
     }
     if let Some(limit) = &query.limit_clause {
         plan = bind_limit(plan, limit)?;
@@ -989,7 +1027,8 @@ fn bind_select(select: &Select, ctx: &BindCtx<'_>) -> Result<LogicalPlan> {
     let grouped = is_grouped(select, ctx.udafs);
     if grouped {
         plan = bind_aggregate(plan, &scope, select)?;
-        scope = Scope::from_schema_udafs(None, plan.schema().clone(), scope.udafs.clone());
+        scope = Scope::from_schema_udafs(None, plan.schema().clone(), scope.udafs.clone())
+            .with_now(scope.now_micros);
         if let Some(having) = &select.having {
             let predicate = bind_having(having, &scope)?;
             require_boolean(expr_type(&predicate, &scope.schema)?, "HAVING")?;
@@ -1067,7 +1106,8 @@ fn bind_from(from: &[TableWithJoins], ctx: &BindCtx<'_>) -> Result<BoundFrom> {
             plan: LogicalPlan::Empty {
                 schema: schema.clone(),
             },
-            scope: Scope::from_schema_udafs(None, schema, ctx.udafs.clone()),
+            scope: Scope::from_schema_udafs(None, schema, ctx.udafs.clone())
+                .with_now(ctx.now_micros),
         });
     }
     let mut bound = bind_table_with_joins(&from[0], ctx)?;
@@ -1150,7 +1190,8 @@ fn bind_table_factor(factor: &TableFactor, ctx: &BindCtx<'_>) -> Result<BoundFro
                     let schema = plan.schema().clone();
                     return Ok(BoundFrom {
                         plan,
-                        scope: Scope::from_schema_udafs(Some(qualifier), schema, ctx.udafs.clone()),
+                        scope: Scope::from_schema_udafs(Some(qualifier), schema, ctx.udafs.clone())
+                            .with_now(ctx.now_micros),
                     });
                 }
                 if let Some(schema) = ctx.work.get(&cte_name) {
@@ -1161,7 +1202,8 @@ fn bind_table_factor(factor: &TableFactor, ctx: &BindCtx<'_>) -> Result<BoundFro
                             schema: schema.clone(),
                             alias: alias_name,
                         },
-                        scope: Scope::from_schema_udafs(Some(qualifier), schema, ctx.udafs.clone()),
+                        scope: Scope::from_schema_udafs(Some(qualifier), schema, ctx.udafs.clone())
+                            .with_now(ctx.now_micros),
                     });
                 }
             }
@@ -1175,7 +1217,8 @@ fn bind_table_factor(factor: &TableFactor, ctx: &BindCtx<'_>) -> Result<BoundFro
                     filters: Vec::new(),
                     stats: ctx.catalog.stats(&scan_name).cloned(),
                 },
-                scope: Scope::from_schema_udafs(Some(qualifier), schema, ctx.udafs.clone()),
+                scope: Scope::from_schema_udafs(Some(qualifier), schema, ctx.udafs.clone())
+                    .with_now(ctx.now_micros),
             })
         }
         TableFactor::Derived {
@@ -1195,7 +1238,8 @@ fn bind_table_factor(factor: &TableFactor, ctx: &BindCtx<'_>) -> Result<BoundFro
             let schema = plan.schema().clone();
             Ok(BoundFrom {
                 plan,
-                scope: Scope::from_schema_udafs(qualifier, schema, ctx.udafs.clone()),
+                scope: Scope::from_schema_udafs(qualifier, schema, ctx.udafs.clone())
+                    .with_now(ctx.now_micros),
             })
         }
         _ => Err(Error::NotImplemented("table factor")),
@@ -1565,7 +1609,8 @@ fn bind_window_project(
         fns,
         schema: window_schema.clone(),
     };
-    let window_scope = Scope::from_schema_udafs(None, window_schema, scope.udafs.clone());
+    let window_scope = Scope::from_schema_udafs(None, window_schema, scope.udafs.clone())
+        .with_now(scope.now_micros);
     bind_window_output_project(window, scope, &window_scope, items)
 }
 
@@ -1936,7 +1981,11 @@ fn reject_wildcard_opts(opts: &WildcardAdditionalOptions) -> Result<()> {
     Ok(())
 }
 
-fn bind_order_by(input: LogicalPlan, order_by: &sqlparser::ast::OrderBy) -> Result<LogicalPlan> {
+fn bind_order_by(
+    input: LogicalPlan,
+    order_by: &sqlparser::ast::OrderBy,
+    now_micros: i64,
+) -> Result<LogicalPlan> {
     if order_by.interpolate.is_some() {
         return Err(Error::NotImplemented("ORDER BY INTERPOLATE"));
     }
@@ -1944,7 +1993,7 @@ fn bind_order_by(input: LogicalPlan, order_by: &sqlparser::ast::OrderBy) -> Resu
         OrderByKind::Expressions(exprs) => exprs,
         OrderByKind::All(_) => return Err(Error::NotImplemented("ORDER BY ALL")),
     };
-    let scope = Scope::from_schema(None, input.schema().clone());
+    let scope = Scope::from_schema(None, input.schema().clone()).with_now(now_micros);
     let order = bind_order_exprs(exprs, &scope)?;
     Ok(LogicalPlan::Sort {
         input: Box::new(input),
@@ -2110,6 +2159,8 @@ fn bind_scalar(expr: &SqlExpr, scope: &Scope) -> Result<Expr> {
             })
         }
         SqlExpr::Function(func) => bind_function(func, scope),
+        SqlExpr::TypedString(ts) => bind_typed_string(ts),
+        SqlExpr::Interval(iv) => bind_interval(iv),
         SqlExpr::Extract { field, expr, .. } => bind_extract(field.clone(), expr, scope),
         SqlExpr::Ceil { expr, field } => bind_ceil_floor(UnaryOp::Ceil, expr, field, scope),
         SqlExpr::Floor { expr, field } => bind_ceil_floor(UnaryOp::Floor, expr, field, scope),
@@ -2218,6 +2269,9 @@ fn bind_function(func: &Function, scope: &Scope) -> Result<Expr> {
             ))
         }
         "date_part" if args.len() == 2 => bind_date_part(&args[0], args[1].clone()),
+        "date_trunc" if args.len() == 2 => bind_date_trunc(&args[0], args[1].clone()),
+        "current_date" if args.is_empty() => Ok(lit_date32(date32_from_micros(scope.now_micros))),
+        "now" | "current_timestamp" if args.is_empty() => Ok(lit_timestamp_us(scope.now_micros)),
         "nullif" if args.len() == 2 => {
             let mut args = args.into_iter();
             let a = args.next().unwrap();
@@ -2242,6 +2296,95 @@ fn bind_extract(field: DateTimeField, expr: &SqlExpr, scope: &Scope) -> Result<E
     let inner = bind_scalar(expr, scope)?;
     let op = extract_op(field)?;
     Ok(Expr::Unary(op, Box::new(inner)))
+}
+
+fn bind_date_trunc(unit: &Expr, value: Expr) -> Result<Expr> {
+    let Expr::Literal(arr) = unit else {
+        return Err(Error::Plan(
+            "date_trunc unit must be a string literal".into(),
+        ));
+    };
+    let name = arr
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .ok_or_else(|| Error::Plan("date_trunc unit must be a string literal".into()))?;
+    if name.len() != 1 || name.is_null(0) {
+        return Err(Error::Plan(
+            "date_trunc unit must be a string literal".into(),
+        ));
+    }
+    match name.value(0).to_ascii_lowercase().as_str() {
+        "day" | "dd" => Ok(Expr::Unary(UnaryOp::DateTruncDay, Box::new(value))),
+        _ => Err(Error::NotImplemented("date_trunc unit")),
+    }
+}
+
+fn bind_typed_string(ts: &TypedString) -> Result<Expr> {
+    let s = match &ts.value.value {
+        Value::SingleQuotedString(s)
+        | Value::DollarQuotedString(sqlparser::ast::DollarQuotedString { value: s, .. })
+        | Value::EscapedStringLiteral(s)
+        | Value::UnicodeStringLiteral(s) => s.clone(),
+        _ => return Err(Error::Plan("typed literal must be a string".into())),
+    };
+    Ok(Expr::Cast {
+        expr: Box::new(Expr::lit_utf8(s)),
+        data_type: map_type(&ts.data_type)?,
+    })
+}
+
+fn bind_interval(iv: &sqlparser::ast::Interval) -> Result<Expr> {
+    if iv.last_field.is_some()
+        || iv.leading_precision.is_some()
+        || iv.fractional_seconds_precision.is_some()
+    {
+        return Err(Error::NotImplemented("interval qualifier"));
+    }
+    let Some(field) = &iv.leading_field else {
+        return Err(Error::NotImplemented("interval qualifier"));
+    };
+    let n = interval_count(&iv.value)?;
+    match field {
+        DateTimeField::Day | DateTimeField::Days => {
+            Ok(Expr::Literal(Arc::new(IntervalDayTimeArray::from(vec![
+                arrow::datatypes::IntervalDayTimeType::make_value(n, 0),
+            ]))))
+        }
+        _ => Err(Error::NotImplemented("interval field")),
+    }
+}
+
+fn interval_count(expr: &SqlExpr) -> Result<i32> {
+    match expr {
+        SqlExpr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) | Value::Number(s, _) => s
+                .trim()
+                .parse::<i32>()
+                .map_err(|_| Error::Plan(format!("invalid interval value {s}"))),
+            _ => Err(Error::Plan("interval value must be a number".into())),
+        },
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => Ok(-interval_count(expr)?),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => interval_count(expr),
+        _ => Err(Error::NotImplemented("interval value")),
+    }
+}
+
+fn lit_date32(days: i32) -> Expr {
+    Expr::Literal(Arc::new(Date32Array::from(vec![days])))
+}
+
+fn lit_timestamp_us(micros: i64) -> Expr {
+    Expr::Literal(Arc::new(TimestampMicrosecondArray::from(vec![micros])))
+}
+
+fn date32_from_micros(micros: i64) -> i32 {
+    i32::try_from(micros.div_euclid(86_400_000_000)).unwrap_or(0)
 }
 
 fn bind_date_part(part: &Expr, value: Expr) -> Result<Expr> {
@@ -2472,6 +2615,13 @@ fn map_type(dt: &sqlparser::ast::DataType) -> Result<DataType> {
         | Sql::Nvarchar(_) => DataType::Utf8,
         Sql::Bytea => DataType::Binary,
         Sql::Decimal(info) | Sql::Numeric(info) => map_exact_number(*info)?,
+        Sql::Date | Sql::Date32 => DataType::Date32,
+        Sql::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone)
+        | Sql::TimestampNtz(_) => DataType::Timestamp(TimeUnit::Microsecond, None),
+        Sql::Interval {
+            fields: None | Some(IntervalFields::Day),
+            precision: None,
+        } => DataType::Interval(IntervalUnit::DayTime),
         _ => return Err(Error::NotImplemented("SQL type")),
     })
 }
@@ -2692,7 +2842,7 @@ fn apply_exists(
         };
     }
     if let Some(order_by) = &subquery.order_by {
-        inner = bind_order_by(inner, order_by)?;
+        inner = bind_order_by(inner, order_by, ctx.now_micros)?;
     }
     let on = fold_and(on_eqs);
     if let Some(limit) = &subquery.limit_clause {
@@ -2968,6 +3118,7 @@ fn apply_lateral(left: BoundFrom, factor: &TableFactor, ctx: &BindCtx<'_>) -> Re
             columns,
             schema,
             udafs: left.scope.udafs,
+            now_micros: left.scope.now_micros,
         },
     })
 }
