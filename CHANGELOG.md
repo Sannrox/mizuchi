@@ -26,3 +26,4 @@ All notable changes to this project are documented here.
 - Morsel work queue across a bounded thread pool for scan/filter/project and combinable aggregates, plus cooperative cancellation checked between morsels.
 - SQLLogicTest runner and corpus under `tests/slt`. CI runs the adopted subset; known gaps are listed in `gaps.slt` behind `skipif mizuchi`.
 - TPC-H and TPC-DS style decision-support harness: a tiny in-memory generator, a fixed query set, and JSON with per-query time and memory. Larger scales stay out of the default `cargo test` run.
+- Decision-support comparison against DuckDB and DataFusion: same SQL and tables, JSON with result diffs and timing ratios. CI uses committed goldens so the default test run stays offline.
