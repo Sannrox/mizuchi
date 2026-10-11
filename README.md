@@ -52,7 +52,10 @@ Arrow C stream, and pull result batches. Cooperative cancellation is a
 `CancelToken`. `execute_sql_reported` / `write_parquet_reported` return
 a `QueryReport` (inputs after partition prune, outputs, version, plan).
 `write_delta` / `write_iceberg` commit a new snapshot; `TimeTravel`
-reads a past version. `Session::merge_sql` runs `MERGE INTO`.
+reads a past version. The same commits run on a caller-supplied
+`ObjectStore` (`write_delta_store` / `write_iceberg_store`).
+`IcebergRestCatalog` is a `CatalogProvider` for the Iceberg REST
+protocol (TCP only with `allow_network`). `Session::merge_sql` runs `MERGE INTO`.
 `Session::stream_query` opens a continuous micro-batch query
 (`StreamQuery`) with event-time watermarks, windows, and a
 checkpointed Parquet sink (ADR 0009).
@@ -69,6 +72,8 @@ grant is denied. Optional Linux filesystem-limit tests use
 `--features sandbox` and `.github/workflows/sandbox.yml`
 (`workflow_dispatch` only). PostgreSQL source tests use
 `--features postgres` and `.github/workflows/postgres.yml`
+(`workflow_dispatch` only). Object-store lake and Iceberg REST catalog
+tests use `--features s3` and `.github/workflows/lake-store.yml`
 (`workflow_dispatch` only). `Cluster` sizes in-process workers, scales
 them, and may run speculative task copies. Layouts for a runner to
 deploy are under `deploy/`.

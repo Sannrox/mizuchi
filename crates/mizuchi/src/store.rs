@@ -301,11 +301,11 @@ fn next_part_index(store: &dyn ObjectStore, dir: &ObjectPath) -> Result<u32> {
     Ok(max.map_or(0, |m| m + 1))
 }
 
-fn object_path(s: &str) -> Result<ObjectPath> {
+pub(crate) fn object_path(s: &str) -> Result<ObjectPath> {
     ObjectPath::parse(s.trim_matches('/')).map_err(|e| Error::Io(e.to_string()))
 }
 
-fn join_path(base: &ObjectPath, rel: &str) -> Result<ObjectPath> {
+pub(crate) fn join_path(base: &ObjectPath, rel: &str) -> Result<ObjectPath> {
     let rel = rel.trim_matches('/');
     if rel.is_empty() {
         return Ok(base.clone());
@@ -318,7 +318,7 @@ fn join_path(base: &ObjectPath, rel: &str) -> Result<ObjectPath> {
     object_path(&joined)
 }
 
-fn relative_to(loc: &ObjectPath, prefix: &str) -> String {
+pub(crate) fn relative_to(loc: &ObjectPath, prefix: &str) -> String {
     let p = loc.as_ref();
     let prefix = prefix.trim_matches('/');
     p.strip_prefix(prefix)
@@ -425,7 +425,7 @@ fn i64_lit(expr: &Expr) -> Option<i64> {
     Some(a.value(0))
 }
 
-fn store_err(e: object_store::Error) -> Error {
+pub(crate) fn store_err(e: object_store::Error) -> Error {
     Error::Io(e.to_string())
 }
 

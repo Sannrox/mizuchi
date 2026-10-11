@@ -839,6 +839,116 @@ impl Session {
         })
     }
 
+    /// Write a registered table as Delta objects under `prefix`.
+    pub fn write_delta_store(
+        &self,
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
+        name: &str,
+        mode: crate::write::WriteMode,
+    ) -> Result<crate::lake::LakeSnapshot> {
+        let (_, batches) = self.table_data(name)?;
+        crate::lake::write_delta_store(store, prefix, &batches, mode)
+    }
+
+    /// Load a Delta snapshot from an object store prefix as an in-memory table.
+    pub fn register_delta_store(
+        &mut self,
+        name: impl Into<String>,
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
+        travel: crate::lake::TimeTravel,
+    ) -> Result<()> {
+        let batches = crate::lake::read_delta_store(store, prefix, travel)?;
+        let schema = match batches.first() {
+            Some(batch) => batch.schema(),
+            None => return Err(Error::Io(format!("{prefix} produced no batches"))),
+        };
+        self.register(name, schema, batches)
+    }
+
+    /// Merge into a Delta table on an object store prefix.
+    pub fn merge_delta_store(
+        &mut self,
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
+        sql: &str,
+    ) -> Result<crate::lake::LakeSnapshot> {
+        let target = crate::plan::merge_target_table(sql)?;
+        let head = crate::lake::delta_head_store(store, prefix)?;
+        let batches =
+            crate::lake::read_delta_store(store, prefix, crate::lake::TimeTravel::Latest)?;
+        let schema = match batches.first() {
+            Some(b) => b.schema(),
+            None => return Err(Error::Io(format!("{prefix} produced no batches"))),
+        };
+        self.merge_and_commit(sql, target, schema, batches, |session, name| {
+            let (_, out) = session.table_data(name)?;
+            crate::lake::write_delta_store_at(
+                store,
+                prefix,
+                &out,
+                crate::write::WriteMode::Overwrite,
+                Some(head.version),
+            )
+        })
+    }
+
+    /// Write a registered table as Iceberg objects under `prefix`.
+    pub fn write_iceberg_store(
+        &self,
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
+        name: &str,
+        mode: crate::write::WriteMode,
+    ) -> Result<crate::lake::LakeSnapshot> {
+        let (_, batches) = self.table_data(name)?;
+        crate::lake::write_iceberg_store(store, prefix, &batches, mode)
+    }
+
+    /// Load an Iceberg snapshot from an object store prefix as an in-memory table.
+    pub fn register_iceberg_store(
+        &mut self,
+        name: impl Into<String>,
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
+        travel: crate::lake::TimeTravel,
+    ) -> Result<()> {
+        let batches = crate::lake::read_iceberg_store(store, prefix, travel)?;
+        let schema = match batches.first() {
+            Some(batch) => batch.schema(),
+            None => return Err(Error::Io(format!("{prefix} produced no batches"))),
+        };
+        self.register(name, schema, batches)
+    }
+
+    /// Merge into an Iceberg table on an object store prefix.
+    pub fn merge_iceberg_store(
+        &mut self,
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
+        sql: &str,
+    ) -> Result<crate::lake::LakeSnapshot> {
+        let target = crate::plan::merge_target_table(sql)?;
+        let head = crate::lake::iceberg_head_store(store, prefix)?;
+        let batches =
+            crate::lake::read_iceberg_store(store, prefix, crate::lake::TimeTravel::Latest)?;
+        let schema = match batches.first() {
+            Some(b) => b.schema(),
+            None => return Err(Error::Io(format!("{prefix} produced no batches"))),
+        };
+        self.merge_and_commit(sql, target, schema, batches, |session, name| {
+            let (_, out) = session.table_data(name)?;
+            crate::lake::write_iceberg_store_at(
+                store,
+                prefix,
+                &out,
+                crate::write::WriteMode::Overwrite,
+                Some(head.version),
+            )
+        })
+    }
+
     fn merge_and_commit(
         &mut self,
         sql: &str,

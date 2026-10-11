@@ -40,17 +40,19 @@ pub use exec::{
 };
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lake::{
-    LakeSnapshot, SchemaEvolution, TimeTravel, delta_head, evolve_delta, evolve_iceberg,
-    iceberg_head, read_delta, read_iceberg, write_delta, write_delta_at, write_iceberg,
-    write_iceberg_at,
+    LakeSnapshot, SchemaEvolution, TimeTravel, delta_head, delta_head_store, evolve_delta,
+    evolve_delta_store, evolve_iceberg, evolve_iceberg_store, iceberg_head, iceberg_head_store,
+    read_delta, read_delta_store, read_iceberg, read_iceberg_store, write_delta, write_delta_at,
+    write_delta_store, write_delta_store_at, write_iceberg, write_iceberg_at, write_iceberg_store,
+    write_iceberg_store_at,
 };
 pub use object_store::ObjectStore;
 pub use opt::{estimate_rows, optimize};
 pub use plan::{
     AlterTable, Catalog, CatalogProvider, ColumnStats, DEFAULT_CATALOG, DEFAULT_NAMESPACE, Ddl,
-    JoinType, LogicalPlan, MergeActionPlan, MergeClausePlan, MergeMatch, MergePlan, NamespaceIdent,
-    TableIdent, TableMeta, TableStats, apply_alter, bind_ddl, bind_merge, merge_target_table,
-    plan_sql, plan_sql_with_udafs, table_stats_from_batches,
+    IcebergRestCatalog, JoinType, LogicalPlan, MergeActionPlan, MergeClausePlan, MergeMatch,
+    MergePlan, NamespaceIdent, TableIdent, TableMeta, TableStats, apply_alter, bind_ddl,
+    bind_merge, merge_target_table, plan_sql, plan_sql_with_udafs, table_stats_from_batches,
 };
 pub use postgres::{PostgresReadOptions, PostgresSource, postgres_scan_sql, read_postgres};
 pub use read::{
