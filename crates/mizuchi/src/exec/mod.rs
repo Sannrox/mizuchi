@@ -3,6 +3,7 @@
 //! See `docs/decisions/0004-pull-vectorized-execution.md`.
 
 mod agg;
+mod cache;
 mod engine;
 mod incremental;
 mod join;
@@ -15,6 +16,7 @@ mod stage;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::{Array, BooleanArray, RecordBatch, RecordBatchOptions};
@@ -62,7 +64,7 @@ impl CancelToken {
 }
 
 /// In-memory tables plus a batch-size policy.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Session {
     tables: BTreeMap<String, MemTable>,
     policy: BatchPolicy,
@@ -80,6 +82,8 @@ pub struct Session {
     skew_threshold: u64,
     /// Target size when splitting a skewed partition.
     advisory_partition_size: u64,
+    /// Results of executed plans, keyed by plan text and table generations.
+    cache: Mutex<cache::QueryCache>,
 }
 
 impl Default for Session {
@@ -95,6 +99,27 @@ impl Default for Session {
             budget: None,
             skew_threshold: 256 * 1024 * 1024,
             advisory_partition_size: 64 * 1024 * 1024,
+            cache: Mutex::new(cache::QueryCache::default()),
+        }
+    }
+}
+
+impl Clone for Session {
+    fn clone(&self) -> Self {
+        Self {
+            tables: self.tables.clone(),
+            policy: self.policy,
+            workers: self.workers,
+            shuffle_dir: self.shuffle_dir.clone(),
+            memory_limit: self.memory_limit,
+            spill_dir: self.spill_dir.clone(),
+            cancel: self.cancel.clone(),
+            budget: self.budget.clone(),
+            skew_threshold: self.skew_threshold,
+            advisory_partition_size: self.advisory_partition_size,
+            // A clone is a new session copy (forked worker counts, tests).
+            // It does not inherit cached results.
+            cache: Mutex::new(cache::QueryCache::default()),
         }
     }
 }
@@ -104,6 +129,8 @@ struct MemTable {
     schema: SchemaRef,
     batches: Vec<Batch>,
     stats: crate::plan::TableStats,
+    /// Bumped on every [`Session::register`] of this name.
+    generation: u64,
 }
 
 impl Session {
@@ -190,28 +217,44 @@ impl Session {
             }
         }
         let stats = crate::plan::table_stats_from_batches(schema.as_ref(), &batches);
+        let name = normalize_name(&name.into());
+        let generation = self
+            .tables
+            .get(&name)
+            .map(|t| t.generation.saturating_add(1))
+            .unwrap_or(1);
+        self.invalidate_cache(&name);
         self.tables.insert(
-            normalize_name(&name.into()),
+            name,
             MemTable {
                 schema,
                 batches,
                 stats,
+                generation,
             },
         );
         Ok(())
+    }
+
+    /// Times a later [`Self::execute_sql`] or [`Self::execute_staged`] reused a
+    /// stored result because the plan and table generations still matched.
+    pub fn cache_hits(&self) -> u64 {
+        self.cache.lock().map(|c| c.hits).unwrap_or(0)
     }
 
     /// Plan and run `sql` against registered tables.
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<Batch>> {
         self.cancel.check()?;
         let plan = self.bind_optimized(sql)?;
-        let pool = self.memory_pool()?;
-        if self.workers > 1
-            && let Some(out) = schedule::try_parallel(&plan, self, &pool)?
-        {
-            return Ok(out);
-        }
-        collect(physical(&plan, self, &pool)?, &self.cancel)
+        self.execute_cached(&plan, || {
+            let pool = self.memory_pool()?;
+            if self.workers > 1
+                && let Some(out) = schedule::try_parallel(&plan, self, &pool)?
+            {
+                return Ok(out);
+            }
+            collect(physical(&plan, self, &pool)?, &self.cancel)
+        })
     }
 
     /// Split the optimized plan into stages at hash-partition exchanges.
@@ -256,6 +299,41 @@ impl Session {
         }
         let plan = crate::plan::plan_sql(sql, &catalog)?;
         crate::opt::optimize(plan)
+    }
+
+    fn execute_cached(
+        &self,
+        plan: &LogicalPlan,
+        run: impl FnOnce() -> Result<Vec<Batch>>,
+    ) -> Result<Vec<Batch>> {
+        let key = cache::key(plan, &self.table_generations());
+        if let Some(hit) = self
+            .cache
+            .lock()
+            .map_err(|_| Error::Eval("query cache lock poisoned".into()))?
+            .lookup(&key)
+        {
+            return Ok(hit);
+        }
+        let out = run()?;
+        self.cache
+            .lock()
+            .map_err(|_| Error::Eval("query cache lock poisoned".into()))?
+            .store(key, &out);
+        Ok(out)
+    }
+
+    fn table_generations(&self) -> BTreeMap<String, u64> {
+        self.tables
+            .iter()
+            .map(|(name, table)| (name.clone(), table.generation))
+            .collect()
+    }
+
+    fn invalidate_cache(&self, table: &str) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.invalidate_table(table);
+        }
     }
 }
 
