@@ -1,0 +1,24 @@
+statement ok
+CREATE TABLE t (a INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1), (2), (2), (3), (NULL)
+
+statement ok
+CREATE TABLE u (id INTEGER, x INTEGER)
+
+statement ok
+INSERT INTO u VALUES (2, 10), (2, 30), (4, 40), (NULL, 99)
+
+# Inner join: two left 2s × two right 2s → four rows of (2, 2).
+query II rowsort
+SELECT t.a, u.id FROM t JOIN u ON t.a = u.id
+----
+2
+2
+2
+2
+2
+2
+2
+2
