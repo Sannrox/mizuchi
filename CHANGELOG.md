@@ -35,3 +35,4 @@ All notable changes to this project are documented here.
 - Python scalar and aggregate UDFs over Arrow arrays, plus zero-copy interchange through the Arrow C Data Interface (`register_arrow` / `to_arrow`).
 - ADR 0005: incremental execution as micro-batches on the same hash aggregate. `MicroBatchAgg` folds append-only batches and emits the complete group table.
 - Query result cache on `execute_sql`: identical plans reuse stored Arrow batches while scanned table generations match. Re-registering a table invalidates entries that used it.
+- ADR 0006: GPU operators are a no-go for this phase. The default decision-support suite is too small for device copy to pay off; revisit when inputs are gigabyte-scale and a runner grants a device.
