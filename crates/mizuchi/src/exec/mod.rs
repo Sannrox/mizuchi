@@ -4,6 +4,7 @@
 
 mod agg;
 mod cache;
+mod config;
 mod engine;
 mod incremental;
 mod join;
@@ -16,13 +17,13 @@ mod sort;
 mod stage;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use arrow::array::{Array, BooleanArray, RecordBatch, RecordBatchOptions};
+use arrow::array::{Array, BooleanArray, RecordBatch, RecordBatchOptions, RecordBatchReader};
 use arrow::compute::filter_record_batch;
 use arrow::compute::kernels::boolean::{and, is_not_null};
 use arrow::datatypes::SchemaRef;
@@ -32,6 +33,7 @@ use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::plan::{Catalog, LogicalPlan, NamedExpr, normalize_name};
 
+pub use config::SessionConfig;
 pub use engine::Engine;
 pub use incremental::MicroBatchAgg;
 pub use metrics::OperatorMetrics;
@@ -91,6 +93,8 @@ pub struct Session {
     cache: Mutex<cache::QueryCache>,
     /// Selects a physical implementation per operator. CPU by default.
     lowering: op::LoweringArc,
+    allowed_read_paths: Vec<PathBuf>,
+    allowed_write_paths: Vec<PathBuf>,
 }
 
 impl Default for Session {
@@ -108,6 +112,8 @@ impl Default for Session {
             advisory_partition_size: 64 * 1024 * 1024,
             cache: Mutex::new(cache::QueryCache::default()),
             lowering: op::LoweringArc::default(),
+            allowed_read_paths: Vec::new(),
+            allowed_write_paths: Vec::new(),
         }
     }
 }
@@ -129,6 +135,8 @@ impl Clone for Session {
             // It does not inherit cached results.
             cache: Mutex::new(cache::QueryCache::default()),
             lowering: self.lowering.clone(),
+            allowed_read_paths: self.allowed_read_paths.clone(),
+            allowed_write_paths: self.allowed_write_paths.clone(),
         }
     }
 }
@@ -146,6 +154,24 @@ impl Session {
     /// Empty session with the default morsel size.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open a session from runner-supplied resource and path limits.
+    pub fn from_config(cfg: SessionConfig) -> Result<Self> {
+        let workers = cfg.workers.unwrap_or(1);
+        let mut session = Self::new().with_workers(workers)?;
+        if let Some(bytes) = cfg.memory_limit {
+            session = session.with_memory_limit(bytes);
+        }
+        if let Some(dir) = cfg.spill_dir {
+            session = session.with_spill_dir(dir);
+        }
+        if let Some(dir) = cfg.shuffle_dir {
+            session = session.with_shuffle_dir(dir);
+        }
+        session.allowed_read_paths = config::resolve_roots(cfg.allowed_read_paths)?;
+        session.allowed_write_paths = config::resolve_roots(cfg.allowed_write_paths)?;
+        Ok(session)
     }
 
     pub(crate) fn with_owner_share(
@@ -251,6 +277,85 @@ impl Session {
         Ok(())
     }
 
+    /// Register a Parquet file or dataset directory as an in-memory table
+    /// after the read allow-list check.
+    pub fn register_parquet(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+        opts: crate::read::ParquetReadOptions<'_>,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        config::assert_allowed(path, &self.allowed_read_paths)?;
+        let batches = read_parquet_tree(path, opts)?;
+        let schema = match batches.first() {
+            Some(batch) => batch.schema(),
+            None => {
+                return Err(Error::Io(format!("{} produced no batches", path.display())));
+            }
+        };
+        self.register(name, schema, batches)
+    }
+
+    /// Register a CSV file as an in-memory table after the read allow-list
+    /// check.
+    pub fn register_csv(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+        opts: crate::read::CsvReadOptions<'_>,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        config::assert_allowed(path, &self.allowed_read_paths)?;
+        let batches = crate::read::read_csv(path, opts)?;
+        let schema = match batches.first() {
+            Some(batch) => batch.schema(),
+            None => {
+                return Err(Error::Io(format!("{} produced no batches", path.display())));
+            }
+        };
+        self.register(name, schema, batches)
+    }
+
+    /// Register batches from an Arrow C Data Interface stream.
+    pub fn register_arrow_stream(
+        &mut self,
+        name: impl Into<String>,
+        reader: arrow::ffi_stream::ArrowArrayStreamReader,
+    ) -> Result<()> {
+        let schema = crate::schema::from_arrow_schema(reader.schema())?;
+        let mut batches = Vec::new();
+        for item in reader {
+            let batch = item.map_err(|e| Error::Io(e.to_string()))?;
+            batches.push(Batch::from_arrow(batch)?);
+        }
+        self.register(name, schema, batches)
+    }
+
+    /// Write batches as Parquet after the write allow-list check.
+    pub fn write_parquet(
+        &self,
+        dest: impl AsRef<Path>,
+        batches: &[Batch],
+        opts: crate::write::ParquetWriteOptions<'_>,
+    ) -> Result<()> {
+        let dest = dest.as_ref();
+        config::assert_allowed(dest, &self.allowed_write_paths)?;
+        crate::write::write_parquet_cancel(dest, batches, opts, &self.cancel)
+    }
+
+    /// Bind and optimize `sql` against registered tables.
+    pub fn logical_plan(&self, sql: &str) -> Result<LogicalPlan> {
+        self.bind_optimized(sql)
+    }
+
+    /// Run an already-bound logical plan. Re-optimizes, then pulls batches.
+    pub fn execute(&self, plan: &LogicalPlan) -> Result<Vec<Batch>> {
+        self.cancel.check()?;
+        let plan = crate::opt::optimize(plan.clone())?;
+        self.execute_optimized(&plan)
+    }
+
     /// Times a later [`Self::execute_sql`] or [`Self::execute_staged`] reused a
     /// stored result because the plan and table generations still matched.
     pub fn cache_hits(&self) -> u64 {
@@ -269,14 +374,18 @@ impl Session {
             return plan_text_batch(&text);
         }
         let plan = self.bind_optimized(sql)?;
-        self.execute_cached(&plan, || {
+        self.execute_optimized(&plan)
+    }
+
+    fn execute_optimized(&self, plan: &LogicalPlan) -> Result<Vec<Batch>> {
+        self.execute_cached(plan, || {
             let pool = self.memory_pool()?;
             if self.workers > 1
-                && let Some(out) = schedule::try_parallel(&plan, self, &pool)?
+                && let Some(out) = schedule::try_parallel(plan, self, &pool)?
             {
                 return Ok(out);
             }
-            collect(physical(&plan, self, &pool)?, &self.cancel)
+            collect(physical(plan, self, &pool)?, &self.cancel)
         })
     }
 
@@ -389,6 +498,47 @@ impl Session {
             cache.invalidate_table(table);
         }
     }
+}
+
+fn read_parquet_tree(path: &Path, opts: crate::read::ParquetReadOptions<'_>) -> Result<Vec<Batch>> {
+    if !path.is_dir() {
+        return crate::read::read_parquet(path, opts);
+    }
+    let mut files = Vec::new();
+    collect_parquet_files(path, &mut files)?;
+    files.sort();
+    let mut out = Vec::new();
+    for file in &files {
+        out.extend(crate::read::read_parquet(
+            file,
+            crate::read::ParquetReadOptions {
+                projection: opts.projection,
+                prune_row_group: opts.prune_row_group,
+                filters: opts.filters,
+                policy: opts.policy,
+            },
+        )?);
+    }
+    Ok(out)
+}
+
+fn collect_parquet_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let ents = std::fs::read_dir(dir).map_err(|e| Error::Io(format!("{}: {e}", dir.display())))?;
+    for ent in ents {
+        let ent = ent.map_err(|e| Error::Io(format!("{}: {e}", dir.display())))?;
+        let name = ent.file_name();
+        let name_s = name.to_string_lossy();
+        if name_s.starts_with('.') {
+            continue;
+        }
+        let p = ent.path();
+        if p.is_dir() {
+            collect_parquet_files(&p, out)?;
+        } else if name_s.ends_with(".parquet") {
+            out.push(p);
+        }
+    }
+    Ok(())
 }
 
 /// Pull iterator of morsels. CPU default selected by [`CpuLowering`].

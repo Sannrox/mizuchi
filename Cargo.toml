@@ -12,7 +12,7 @@ repository = "https://github.com/Sannrox/mizuchi"
 publish = false
 
 [workspace.dependencies]
-arrow = { version = "60.0.0", default-features = false, features = ["csv", "ipc"] }
+arrow = { version = "60.0.0", default-features = false, features = ["csv", "ipc", "ffi"] }
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }
 sqlparser = { version = "0.63.0" }
 object_store = { version = "0.14.1", default-features = false }

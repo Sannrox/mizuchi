@@ -3,6 +3,11 @@
 //! Columnar memory is standard Apache Arrow record batches. See [`batch`] and
 //! [`schema`]. Planned layers, outside in:
 //! SQL / DataFrame -> logical plan -> optimizer -> physical plan -> execution.
+//!
+//! Embedding runners pass [`SessionConfig`] (memory, threads, spill, allowed
+//! paths), register Arrow batches, files, or an Arrow C stream, and pull
+//! results as batches. [`VERSION`] and [`Session::explain`] are the strings
+//! a runner records. See `crates/mizuchi/examples/embed.rs`.
 
 pub mod batch;
 mod error;
@@ -17,8 +22,8 @@ pub mod store;
 pub mod write;
 
 pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
-pub use error::Error;
-pub use exec::{CancelToken, Engine, MicroBatchAgg, OperatorMetrics, Session};
+pub use error::{Error, Result};
+pub use exec::{CancelToken, Engine, MicroBatchAgg, OperatorMetrics, Session, SessionConfig};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use object_store::ObjectStore;
 pub use opt::{estimate_rows, optimize};
@@ -36,6 +41,7 @@ pub use write::{ParquetWriteOptions, WriteMode, write_parquet, write_parquet_can
 
 pub use arrow::array::{ArrayRef, RecordBatch};
 pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+pub use arrow::ffi_stream::ArrowArrayStreamReader;
 
 /// Crate version, for receipts and diagnostics in embedding runners.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
