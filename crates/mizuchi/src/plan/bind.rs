@@ -2471,8 +2471,30 @@ fn map_type(dt: &sqlparser::ast::DataType) -> Result<DataType> {
         | Sql::CharVarying(_)
         | Sql::Nvarchar(_) => DataType::Utf8,
         Sql::Bytea => DataType::Binary,
+        Sql::Decimal(info) | Sql::Numeric(info) => map_exact_number(*info)?,
         _ => return Err(Error::NotImplemented("SQL type")),
     })
+}
+
+fn map_exact_number(info: sqlparser::ast::ExactNumberInfo) -> Result<DataType> {
+    use sqlparser::ast::ExactNumberInfo::*;
+    let (precision, scale) = match info {
+        None => (10, 0),
+        Precision(p) => (
+            i32::try_from(p).map_err(|_| {
+                Error::Plan(format!("DECIMAL precision {p} is out of range 1..=38"))
+            })?,
+            0,
+        ),
+        PrecisionAndScale(p, s) => (
+            i32::try_from(p).map_err(|_| {
+                Error::Plan(format!("DECIMAL precision {p} is out of range 1..=38"))
+            })?,
+            i32::try_from(s)
+                .map_err(|_| Error::Plan(format!("DECIMAL scale {s} is out of range")))?,
+        ),
+    };
+    crate::expr::decimal_arrow(precision, scale)
 }
 
 fn object_name(name: &ObjectName) -> Result<String> {

@@ -17,14 +17,15 @@ execute; skipped records are parsed and ignored.
 | Inner join | `join.slt` |
 | Uncorrelated `FROM` subquery (derived table) | `subquery.slt` |
 | `IN` lists, `IN`/`NOT IN (SELECT ...)`, `EXISTS`, scalar subquery, `LATERAL` | `subquery.slt` (#80) |
-| `CAST` of integer, float, and text | `decimal.slt` |
+| `CAST` of integer, float, and text; `DECIMAL` / `NUMERIC` casts and arithmetic | `decimal.slt` (#82) |
 | Window functions (`OVER`, `ROW_NUMBER`, ranking, frames, named `WINDOW`) | `window.slt` (#78) |
 | CTEs (`WITH`, `WITH RECURSIVE`) | `cte.slt` (#79) |
 | `UNION` / `UNION ALL` / `UNION DISTINCT`, `INTERSECT`, `EXCEPT` (DISTINCT and ALL) | `setops.slt` (#81) |
 | `MERGE INTO` match / update / insert / delete | `merge.slt` |
 
-Arrow `Decimal*`, Date, Timestamp, Duration, and Interval are accepted at the
-schema boundary (`schema.rs` unit tests). They have no SQL path yet.
+Arrow Date, Timestamp, Duration, and Interval are accepted at the schema
+boundary (`schema.rs` unit tests). They have no SQL path yet. `DECIMAL` /
+`NUMERIC` map onto Arrow `Decimal32` / `Decimal64` / `Decimal128`.
 
 ## Audited families
 
@@ -33,7 +34,7 @@ schema boundary (`schema.rs` unit tests). They have no SQL path yet.
 | `IN` lists, `IN`/`NOT IN (SELECT ...)`, `EXISTS`, scalar subquery, `LATERAL` | supported | `subquery.slt` | #80 |
 | `UNION` / `UNION ALL` / `UNION DISTINCT` | supported | `setops.slt` | #81 |
 | `INTERSECT` / `EXCEPT` (DISTINCT and ALL) | supported | `setops.slt` | #81 |
-| DECIMAL arithmetic and casts | skipped | `decimal.slt` | #82 |
+| DECIMAL arithmetic and casts | supported | `decimal.slt` | #82 |
 | DATE, TIMESTAMP, INTERVAL casts and functions | skipped | `datetime.slt` | #83 |
 
 Set operators keep left column names. Column counts must match. Compatible
