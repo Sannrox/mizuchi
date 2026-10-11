@@ -14,3 +14,14 @@ homepage = "https://github.com/Sannrox/mizuchi"
 arrow = { workspace = true }
 parquet = { workspace = true }
 sqlparser = { workspace = true }
+object_store = { workspace = true }
+futures = { workspace = true }
+
+[features]
+default = []
+# Optional Amazon S3 client for the ignored emulator test. The engine API takes
+# a caller-provided ObjectStore; it does not open S3 itself.
+s3 = ["object_store/aws"]
+
+[dev-dependencies]
+arrow = { workspace = true }

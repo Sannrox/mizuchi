@@ -136,7 +136,7 @@ fn write_inner(
     }
 }
 
-fn validate_partitions(batch: &Batch, partition_by: &[String]) -> Result<()> {
+pub(crate) fn validate_partitions(batch: &Batch, partition_by: &[String]) -> Result<()> {
     let mut seen = Vec::new();
     for name in partition_by {
         if seen.iter().any(|s: &String| s == name) {
@@ -215,7 +215,7 @@ fn stage_files(
     Ok(())
 }
 
-fn take_rows(batch: &Batch, rows: &[u32]) -> Result<arrow::array::RecordBatch> {
+pub(crate) fn take_rows(batch: &Batch, rows: &[u32]) -> Result<arrow::array::RecordBatch> {
     let indices = UInt32Array::from(rows.to_vec());
     let cols: Result<Vec<_>> = batch
         .as_arrow()
@@ -241,7 +241,10 @@ fn parquet_from_tmp(tmp: &Path) -> PathBuf {
     }
 }
 
-fn split_partitions(batch: &Batch, partition_by: &[String]) -> Result<BTreeMap<String, Vec<u32>>> {
+pub(crate) fn split_partitions(
+    batch: &Batch,
+    partition_by: &[String],
+) -> Result<BTreeMap<String, Vec<u32>>> {
     let mut groups: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     if partition_by.is_empty() {
         groups.insert(String::new(), (0..batch.num_rows() as u32).collect());

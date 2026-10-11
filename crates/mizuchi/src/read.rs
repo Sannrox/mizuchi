@@ -78,6 +78,18 @@ pub fn read_parquet(path: impl AsRef<Path>, opts: ParquetReadOptions<'_>) -> Res
     let file = File::open(path).map_err(|e| io_err(path, e))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+    read_parquet_from_builder(builder, &opts, &path.display().to_string())
+}
+
+/// Decode a Parquet builder (file or object bytes) with the same prune rules.
+pub(crate) fn read_parquet_from_builder<R>(
+    builder: ParquetRecordBatchReaderBuilder<R>,
+    opts: &ParquetReadOptions<'_>,
+    label: &str,
+) -> Result<Vec<Batch>>
+where
+    R: parquet::file::reader::ChunkReader + 'static,
+{
     let parquet_schema = builder.parquet_schema().clone();
     let arrow_schema = builder.schema().clone();
     from_arrow_schema(arrow_schema.clone())?;
@@ -137,7 +149,7 @@ pub fn read_parquet(path: impl AsRef<Path>, opts: ParquetReadOptions<'_>) -> Res
 
     let reader = builder
         .build()
-        .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+        .map_err(|e| Error::Io(format!("{label}: {e}")))?;
     collect_reader(reader, &opts.policy)
 }
 

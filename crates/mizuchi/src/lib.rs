@@ -13,12 +13,14 @@ pub mod plan;
 pub mod read;
 pub mod schema;
 pub mod sql;
+pub mod store;
 pub mod write;
 
 pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
 pub use error::Error;
 pub use exec::{CancelToken, Engine, MicroBatchAgg, Session};
 pub use expr::{BinaryOp, Expr, UnaryOp};
+pub use object_store::ObjectStore;
 pub use opt::{estimate_rows, optimize};
 pub use plan::{
     Catalog, ColumnStats, JoinType, LogicalPlan, TableStats, plan_sql, table_stats_from_batches,
@@ -29,6 +31,7 @@ pub use read::{
 };
 pub use schema::{from_arrow_schema, is_supported_data_type, to_arrow_schema};
 pub use sql::parse_sql;
+pub use store::{read_parquet_store, write_parquet_store};
 pub use write::{ParquetWriteOptions, WriteMode, write_parquet, write_parquet_cancel};
 
 pub use arrow::array::{ArrayRef, RecordBatch};
