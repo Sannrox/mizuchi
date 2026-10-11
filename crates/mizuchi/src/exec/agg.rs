@@ -24,6 +24,7 @@ use arrow::datatypes::{
 
 use super::Exec;
 use super::key::{Scalar, eval_all, extract_key, scalar_at};
+use super::memory::{self, MemoryPool, batch_bytes};
 use crate::batch::{Batch, BatchPolicy};
 use crate::error::{Error, Result};
 use crate::expr::Expr;
@@ -35,10 +36,101 @@ pub(super) fn run(
     aggs: &[(String, AggCall)],
     schema: SchemaRef,
     policy: &BatchPolicy,
+    pool: &MemoryPool,
 ) -> Result<Vec<Batch>> {
-    let mut table = HashAgg::new(group, aggs, schema)?;
+    let mut table = HashAgg::new(group, aggs, schema.clone())?;
+    let mut held: Vec<super::memory::Reservation<'_>> = Vec::new();
+    let mut partials: Vec<std::path::PathBuf> = Vec::new();
     while let Some(batch) = input.next_batch()? {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        if pool.has_limit() {
+            let sz = batch_bytes(&batch);
+            match pool.try_reserve(sz) {
+                Ok(r) => held.push(r),
+                Err(e) => {
+                    if !pool.can_spill() {
+                        return Err(e);
+                    }
+                    if !spill_ok(aggs) {
+                        return Err(Error::Memory("this aggregate cannot spill".into()));
+                    }
+                    let old =
+                        std::mem::replace(&mut table, HashAgg::new(group, aggs, schema.clone())?);
+                    spill_hash(old, schema.clone(), policy, pool, &mut partials)?;
+                    held.clear();
+                    let r = pool.try_reserve(sz).map_err(|_| {
+                        Error::Memory("a single aggregate batch exceeds the memory limit".into())
+                    })?;
+                    held.push(r);
+                }
+            }
+        }
         table.update(&batch)?;
+    }
+    if partials.is_empty() {
+        return table.finish(policy);
+    }
+    spill_hash(table, schema.clone(), policy, pool, &mut partials)?;
+    merge_partial_files(&partials, group, aggs, schema, policy)
+}
+
+fn spill_hash(
+    table: HashAgg,
+    schema: SchemaRef,
+    policy: &BatchPolicy,
+    pool: &MemoryPool,
+    partials: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
+    let finished = table.finish(policy)?;
+    if finished.is_empty() {
+        return Ok(());
+    }
+    let path = pool.spill_path()?;
+    memory::write_spill(&path, schema, &finished)?;
+    partials.push(path);
+    Ok(())
+}
+
+fn spill_ok(aggs: &[(String, AggCall)]) -> bool {
+    aggs.iter()
+        .all(|(_, c)| !matches!(c, AggCall::Avg(_) | AggCall::CountDistinct(_)))
+}
+
+fn merge_partial_files(
+    paths: &[std::path::PathBuf],
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+    policy: &BatchPolicy,
+) -> Result<Vec<Batch>> {
+    let group_n = group.len();
+    let merge_group: Vec<NamedExpr> = (0..group_n)
+        .map(|i| NamedExpr {
+            expr: Expr::nth(i),
+            name: schema.field(i).name().clone(),
+        })
+        .collect();
+    let merge_aggs: Vec<(String, AggCall)> = aggs
+        .iter()
+        .enumerate()
+        .map(|(i, (name, call))| {
+            let col = Expr::nth(group_n + i);
+            let call = match call {
+                AggCall::CountStar | AggCall::Count(_) | AggCall::Sum(_) => AggCall::Sum(col),
+                AggCall::Min(_) => AggCall::Min(col),
+                AggCall::Max(_) => AggCall::Max(col),
+                other => other.clone(),
+            };
+            (name.clone(), call)
+        })
+        .collect();
+    let mut table = HashAgg::new(&merge_group, &merge_aggs, schema.clone())?;
+    for path in paths {
+        for batch in memory::read_spill(path, schema.clone())? {
+            table.update(&batch)?;
+        }
     }
     table.finish(policy)
 }

@@ -19,6 +19,8 @@ pub enum Error {
     Plan(String),
     /// A caller-supplied path could not be read.
     Io(String),
+    /// A memory limit could not be honoured and spill was unavailable.
+    Memory(String),
 }
 
 impl std::fmt::Display for Error {
@@ -32,6 +34,7 @@ impl std::fmt::Display for Error {
             Error::Parse(reason) => write!(f, "sql parse: {reason}"),
             Error::Plan(reason) => write!(f, "plan: {reason}"),
             Error::Io(reason) => write!(f, "io: {reason}"),
+            Error::Memory(reason) => write!(f, "memory: {reason}"),
         }
     }
 }

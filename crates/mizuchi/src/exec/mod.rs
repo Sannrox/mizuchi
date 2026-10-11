@@ -5,6 +5,7 @@
 mod agg;
 mod join;
 mod key;
+mod memory;
 mod sort;
 mod stage;
 
@@ -30,6 +31,8 @@ pub struct Session {
     workers: usize,
     /// Caller-provided directory for Arrow IPC shuffle files.
     shuffle_dir: Option<PathBuf>,
+    memory_limit: Option<u64>,
+    spill_dir: Option<PathBuf>,
 }
 
 impl Default for Session {
@@ -39,6 +42,8 @@ impl Default for Session {
             policy: BatchPolicy::default(),
             workers: 1,
             shuffle_dir: None,
+            memory_limit: None,
+            spill_dir: None,
         }
     }
 }
@@ -72,6 +77,19 @@ impl Session {
         self
     }
 
+    /// Per-query working-set cap in bytes. Operators fail closed when the cap
+    /// cannot be met and no spill directory is set.
+    pub fn with_memory_limit(mut self, bytes: u64) -> Self {
+        self.memory_limit = Some(bytes);
+        self
+    }
+
+    /// Directory for operator spill files (Arrow IPC). Removed per query.
+    pub fn with_spill_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.spill_dir = Some(dir.into());
+        self
+    }
+
     /// Register an in-memory table. All batches must share `schema`.
     pub fn register(
         &mut self,
@@ -101,7 +119,8 @@ impl Session {
 
     /// Plan and run `sql` against registered tables.
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<Batch>> {
-        collect(physical(&self.bind_optimized(sql)?, self)?)
+        let pool = memory::MemoryPool::new(self.memory_limit, self.spill_dir.clone())?;
+        collect(physical(&self.bind_optimized(sql)?, self, &pool)?)
     }
 
     /// Split the optimized plan into stages at hash-partition exchanges.
@@ -222,7 +241,11 @@ fn limit_next(input: &mut Exec, skip: &mut u64, fetch: &mut Option<u64>) -> Resu
     }
 }
 
-pub(super) fn physical(plan: &LogicalPlan, session: &Session) -> Result<Exec> {
+pub(super) fn physical(
+    plan: &LogicalPlan,
+    session: &Session,
+    pool: &memory::MemoryPool,
+) -> Result<Exec> {
     match plan {
         LogicalPlan::Empty { schema } => Ok(Exec::Empty {
             schema: schema.clone(),
@@ -269,7 +292,7 @@ pub(super) fn physical(plan: &LogicalPlan, session: &Session) -> Result<Exec> {
             })
         }
         LogicalPlan::Filter { input, predicate } => Ok(Exec::Filter {
-            input: Box::new(physical(input, session)?),
+            input: Box::new(physical(input, session, pool)?),
             predicate: predicate.clone(),
         }),
         LogicalPlan::Project {
@@ -277,7 +300,7 @@ pub(super) fn physical(plan: &LogicalPlan, session: &Session) -> Result<Exec> {
             exprs,
             schema,
         } => Ok(Exec::Project {
-            input: Box::new(physical(input, session)?),
+            input: Box::new(physical(input, session, pool)?),
             exprs: exprs.clone(),
             schema: schema.clone(),
         }),
@@ -287,8 +310,8 @@ pub(super) fn physical(plan: &LogicalPlan, session: &Session) -> Result<Exec> {
             aggs,
             schema,
         } => {
-            let child = physical(input, session)?;
-            let batches = agg::run(child, group, aggs, schema.clone(), &session.policy)?;
+            let child = physical(input, session, pool)?;
+            let batches = agg::run(child, group, aggs, schema.clone(), &session.policy, pool)?;
             Ok(Exec::Scan { batches, index: 0 })
         }
         LogicalPlan::Join {
@@ -299,8 +322,8 @@ pub(super) fn physical(plan: &LogicalPlan, session: &Session) -> Result<Exec> {
             schema,
         } => {
             let batches = join::run(
-                physical(left, session)?,
-                physical(right, session)?,
+                physical(left, session, pool)?,
+                physical(right, session, pool)?,
                 join::JoinSpec {
                     join_type: *join_type,
                     on: on.as_ref(),
@@ -309,17 +332,19 @@ pub(super) fn physical(plan: &LogicalPlan, session: &Session) -> Result<Exec> {
                     schema: schema.clone(),
                 },
                 &session.policy,
+                pool,
             )?;
             Ok(Exec::Scan { batches, index: 0 })
         }
         LogicalPlan::Sort { input, order } => {
             let batches = sort::ordered(
-                physical(input, session)?,
+                physical(input, session, pool)?,
                 input.schema().clone(),
                 order,
                 0,
                 None,
                 &session.policy,
+                pool,
             )?;
             Ok(Exec::Scan { batches, index: 0 })
         }
@@ -329,17 +354,18 @@ pub(super) fn physical(plan: &LogicalPlan, session: &Session) -> Result<Exec> {
                 order,
             } => {
                 let batches = sort::ordered(
-                    physical(sorted, session)?,
+                    physical(sorted, session, pool)?,
                     sorted.schema().clone(),
                     order,
                     *skip,
                     *fetch,
                     &session.policy,
+                    pool,
                 )?;
                 Ok(Exec::Scan { batches, index: 0 })
             }
             _ => Ok(Exec::Limit {
-                input: Box::new(physical(input, session)?),
+                input: Box::new(physical(input, session, pool)?),
                 skip: *skip,
                 fetch: *fetch,
             }),
@@ -1268,5 +1294,186 @@ mod tests {
             col_i64(&desc, "a"),
             (n - 5..n).rev().map(Some).collect::<Vec<_>>()
         );
+    }
+
+    fn spill_root(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mizuchi-mem-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn leftover(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect()
+    }
+
+    fn numbered_batches(n_batches: usize, rows: usize, start: i64) -> (SchemaRef, Vec<Batch>) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("g", DataType::Int64, true),
+        ]));
+        let mut batches = Vec::new();
+        let mut k = start;
+        for _ in 0..n_batches {
+            let mut a = Vec::with_capacity(rows);
+            let mut g = Vec::with_capacity(rows);
+            for _ in 0..rows {
+                a.push(Some(k));
+                g.push(Some(k.rem_euclid(7)));
+                k += 1;
+            }
+            batches.push(
+                Batch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int64Array::from(a)), Arc::new(Int64Array::from(g))],
+                )
+                .unwrap(),
+            );
+        }
+        (schema, batches)
+    }
+
+    fn tight_limit(batches: &[Batch]) -> u64 {
+        let sz = batches[0].as_arrow().get_array_memory_size() as u64;
+        sz + sz / 2
+    }
+
+    fn register_numbered(n_batches: usize, rows: usize) -> (Session, u64) {
+        let (schema, batches) = numbered_batches(n_batches, rows, 0);
+        let cap = tight_limit(&batches);
+        let mut s = Session::new();
+        s.register("t", schema, batches).unwrap();
+        (s, cap)
+    }
+
+    #[test]
+    fn sort_spills_under_tiny_limit_and_matches() {
+        let (s, cap) = register_numbered(12, 32);
+        let sql = "SELECT a FROM t ORDER BY a";
+        let want = col_i64(&s.execute_sql(sql).unwrap(), "a");
+        let root = spill_root("sort");
+        let got = s
+            .clone()
+            .with_memory_limit(cap)
+            .with_spill_dir(root.clone())
+            .execute_sql(sql)
+            .unwrap();
+        assert_eq!(col_i64(&got, "a"), want);
+        let left = leftover(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn join_and_agg_spill_under_tiny_limit_and_match() {
+        let (t_schema, t_batches) = numbered_batches(12, 32, 0);
+        let (u_schema, u_batches) = numbered_batches(8, 16, 0);
+        let cap = tight_limit(&t_batches).max(tight_limit(&u_batches));
+        let mut s = Session::new();
+        s.register("t", t_schema, t_batches).unwrap();
+        s.register("u", u_schema, u_batches).unwrap();
+        let root = spill_root("join-agg");
+        let limited = s
+            .clone()
+            .with_memory_limit(cap)
+            .with_spill_dir(root.clone());
+
+        let join_sql = "SELECT t.a, u.a AS id FROM t JOIN u ON t.a = u.a";
+        let want_join = sorted_pairs(&s.execute_sql(join_sql).unwrap(), "a", "id");
+        let got_join = sorted_pairs(&limited.execute_sql(join_sql).unwrap(), "a", "id");
+        assert_eq!(got_join, want_join);
+
+        let semi_sql = "SELECT t.a FROM t LEFT SEMI JOIN u ON t.a = u.a";
+        let mut want_semi = col_i64(&s.execute_sql(semi_sql).unwrap(), "a");
+        let mut got_semi = col_i64(&limited.execute_sql(semi_sql).unwrap(), "a");
+        want_semi.sort();
+        got_semi.sort();
+        assert_eq!(got_semi, want_semi);
+
+        let agg_sql =
+            "SELECT g, COUNT(*) AS c, SUM(a) AS s, MIN(a) AS mn, MAX(a) AS mx FROM t GROUP BY g";
+        let want_agg = s.execute_sql(agg_sql).unwrap();
+        let got_agg = limited.execute_sql(agg_sql).unwrap();
+        let mut want_rows: Vec<_> = col_i64(&want_agg, "g")
+            .into_iter()
+            .zip(col_i64(&want_agg, "c"))
+            .zip(col_i64(&want_agg, "s"))
+            .collect();
+        let mut got_rows: Vec<_> = col_i64(&got_agg, "g")
+            .into_iter()
+            .zip(col_i64(&got_agg, "c"))
+            .zip(col_i64(&got_agg, "s"))
+            .collect();
+        want_rows.sort();
+        got_rows.sort();
+        assert_eq!(got_rows, want_rows);
+        assert_eq!(
+            col_i64(&got_agg, "mn").len(),
+            col_i64(&want_agg, "mn").len()
+        );
+
+        let left = leftover(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn memory_limit_without_spill_dir_fails_closed() {
+        let (s, cap) = register_numbered(12, 32);
+        let err = s
+            .clone()
+            .with_memory_limit(cap)
+            .execute_sql("SELECT a FROM t ORDER BY a");
+        assert!(matches!(err, Err(Error::Memory(_))), "{err:?}");
+        let err = s
+            .clone()
+            .with_memory_limit(cap)
+            .execute_sql("SELECT g, COUNT(*) AS c FROM t GROUP BY g");
+        assert!(matches!(err, Err(Error::Memory(_))), "{err:?}");
+    }
+
+    #[test]
+    fn avg_and_count_distinct_fail_closed_when_they_would_spill() {
+        let (s, cap) = register_numbered(12, 32);
+        let root = spill_root("avg");
+        let limited = s
+            .clone()
+            .with_memory_limit(cap)
+            .with_spill_dir(root.clone());
+        let avg = limited.execute_sql("SELECT AVG(a) AS av FROM t");
+        assert!(matches!(avg, Err(Error::Memory(_))), "{avg:?}");
+        let cd = limited.execute_sql("SELECT COUNT(DISTINCT a) AS cd FROM t");
+        assert!(matches!(cd, Err(Error::Memory(_))), "{cd:?}");
+        let left = leftover(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn outer_join_fails_closed_when_it_would_spill() {
+        let (t_schema, t_batches) = numbered_batches(12, 32, 0);
+        let (u_schema, u_batches) = numbered_batches(8, 16, 0);
+        let cap = tight_limit(&t_batches).max(tight_limit(&u_batches));
+        let mut s = Session::new();
+        s.register("t", t_schema, t_batches).unwrap();
+        s.register("u", u_schema, u_batches).unwrap();
+        let root = spill_root("outer");
+        let err = s
+            .with_memory_limit(cap)
+            .with_spill_dir(root.clone())
+            .execute_sql("SELECT t.a, u.a AS id FROM t LEFT JOIN u ON t.a = u.a");
+        let left = leftover(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(matches!(err, Err(Error::Memory(_))), "{err:?}");
+        assert!(left.is_empty(), "{left:?}");
     }
 }
