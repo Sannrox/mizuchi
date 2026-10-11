@@ -706,10 +706,7 @@ pub(super) fn execute_staged(logical: &LogicalPlan, session: &Session) -> Result
             dir: None,
         },
     };
-    let pool = Arc::new(super::memory::MemoryPool::new(
-        session.memory_limit,
-        session.spill_dir.clone(),
-    )?);
+    let pool = Arc::new(session.memory_pool()?);
     let mut result = Vec::new();
     for stage in &stages {
         let out = run_stage(stage, session, &job.store, workers, pool.clone())?;
