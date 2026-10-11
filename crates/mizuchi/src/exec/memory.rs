@@ -6,6 +6,7 @@
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::datatypes::SchemaRef;
@@ -20,10 +21,17 @@ pub(super) fn batch_bytes(batch: &Batch) -> u64 {
     batch.as_arrow().get_array_memory_size() as u64
 }
 
+/// Shared owner budget. Concurrent sessions of one owner draw from this cap.
+#[derive(Debug)]
+pub(crate) struct Budget {
+    pub limit: u64,
+    pub used: Arc<AtomicU64>,
+}
+
 /// Query-scoped pool. `used` is the live reservation, not a high-water mark.
 pub(crate) struct MemoryPool {
     limit: Option<u64>,
-    used: AtomicU64,
+    used: Arc<AtomicU64>,
     spill_dir: Option<PathBuf>,
     seq: AtomicU64,
 }
@@ -32,6 +40,19 @@ static JOB_SEQ: AtomicU64 = AtomicU64::new(1);
 
 impl MemoryPool {
     pub(super) fn new(limit: Option<u64>, spill_dir: Option<PathBuf>) -> Result<Self> {
+        Self::from_parts(limit, Arc::new(AtomicU64::new(0)), spill_dir)
+    }
+
+    /// Draw reservations from an owner budget shared by concurrent sessions.
+    pub(super) fn with_budget(budget: Arc<Budget>, spill_dir: Option<PathBuf>) -> Result<Self> {
+        Self::from_parts(Some(budget.limit), budget.used.clone(), spill_dir)
+    }
+
+    fn from_parts(
+        limit: Option<u64>,
+        used: Arc<AtomicU64>,
+        spill_dir: Option<PathBuf>,
+    ) -> Result<Self> {
         let spill_dir = match spill_dir {
             Some(root) => {
                 let dir = root.join(format!("mem-{}", JOB_SEQ.fetch_add(1, Ordering::Relaxed)));
@@ -42,7 +63,7 @@ impl MemoryPool {
         };
         Ok(Self {
             limit,
-            used: AtomicU64::new(0),
+            used,
             spill_dir,
             seq: AtomicU64::new(1),
         })

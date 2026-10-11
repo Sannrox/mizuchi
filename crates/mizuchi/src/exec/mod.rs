@@ -3,6 +3,7 @@
 //! See `docs/decisions/0004-pull-vectorized-execution.md`.
 
 mod agg;
+mod engine;
 mod join;
 mod key;
 mod memory;
@@ -24,6 +25,8 @@ use crate::batch::{Batch, BatchPolicy};
 use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::plan::{Catalog, LogicalPlan, NamedExpr, normalize_name};
+
+pub use engine::Engine;
 
 /// Cooperative cancellation flag. Operators check it between morsels.
 #[derive(Clone, Debug, Default)]
@@ -68,6 +71,8 @@ pub struct Session {
     memory_limit: Option<u64>,
     spill_dir: Option<PathBuf>,
     cancel: CancelToken,
+    /// Shared owner budget when this session was opened from [`Engine`].
+    budget: Option<std::sync::Arc<memory::Budget>>,
 }
 
 impl Default for Session {
@@ -80,6 +85,7 @@ impl Default for Session {
             memory_limit: None,
             spill_dir: None,
             cancel: CancelToken::new(),
+            budget: None,
         }
     }
 }
@@ -95,6 +101,19 @@ impl Session {
     /// Empty session with the default morsel size.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_owner_share(
+        workers: usize,
+        memory: u64,
+        budget: std::sync::Arc<memory::Budget>,
+    ) -> Self {
+        Self {
+            workers,
+            memory_limit: Some(memory),
+            budget: Some(budget),
+            ..Self::default()
+        }
     }
 
     /// Number of worker threads for morsel scheduling and staged execution.
@@ -164,7 +183,7 @@ impl Session {
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<Batch>> {
         self.cancel.check()?;
         let plan = self.bind_optimized(sql)?;
-        let pool = memory::MemoryPool::new(self.memory_limit, self.spill_dir.clone())?;
+        let pool = self.memory_pool()?;
         if self.workers > 1
             && let Some(out) = schedule::try_parallel(&plan, self, &pool)?
         {
@@ -181,6 +200,13 @@ impl Session {
     /// Run `sql` as shuffle-map and result stages on `workers` threads.
     pub fn execute_staged(&self, sql: &str) -> Result<Vec<Batch>> {
         stage::execute_staged(&self.bind_optimized(sql)?, self)
+    }
+
+    pub(super) fn memory_pool(&self) -> Result<memory::MemoryPool> {
+        match &self.budget {
+            Some(budget) => memory::MemoryPool::with_budget(budget.clone(), self.spill_dir.clone()),
+            None => memory::MemoryPool::new(self.memory_limit, self.spill_dir.clone()),
+        }
     }
 
     pub(super) fn table_morsels(&self, table: &str) -> Result<Vec<Batch>> {
