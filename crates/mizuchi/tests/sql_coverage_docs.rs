@@ -51,7 +51,7 @@ fn per_feature_slt_files_exist_with_skipif_gaps() {
     for (name, must_skip) in [
         ("window.slt", false),
         ("cte.slt", false),
-        ("subquery.slt", true),
+        ("subquery.slt", false),
         ("setops.slt", true),
         ("decimal.slt", true),
         ("datetime.slt", true),

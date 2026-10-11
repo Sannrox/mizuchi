@@ -48,7 +48,10 @@ pub(super) fn run(
     {
         return Err(Error::Memory("outer join exceeded the memory limit".into()));
     }
-    if matches!(spec.join_type, JoinType::Semi | JoinType::Anti) {
+    if matches!(
+        spec.join_type,
+        JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti
+    ) {
         return semi_anti_chunks(&left_chunks, &right_chunks, &spec, policy);
     }
     let mut parts = Vec::new();
@@ -158,6 +161,17 @@ fn semi_anti_chunks(
     policy: &BatchPolicy,
 ) -> Result<Vec<Batch>> {
     let keep_hit = spec.join_type == JoinType::Semi;
+    let naaj = spec.join_type == JoinType::NullAwareAnti;
+    let mut right_rows = 0usize;
+    if naaj {
+        for r in right_chunks {
+            let right = load_chunk(r, spec.right_schema.clone())?;
+            right_rows += right.num_rows();
+            if right_has_null_key(&right, spec)? {
+                return Ok(Vec::new());
+            }
+        }
+    }
     let mut parts = Vec::new();
     for l in left_chunks {
         let left = load_chunk(l, spec.left_schema.clone())?;
@@ -165,6 +179,9 @@ fn semi_anti_chunks(
         for r in right_chunks {
             let right = load_chunk(r, spec.right_schema.clone())?;
             or_left_hits(&left, &right, spec, &mut hits)?;
+        }
+        if naaj && right_rows > 0 {
+            mark_null_left_keys(&left, spec, &mut hits)?;
         }
         let indices: Vec<u32> = hits
             .iter()
@@ -183,6 +200,12 @@ fn semi_anti_chunks(
 }
 
 fn or_left_hits(left: &Batch, right: &Batch, spec: &JoinSpec<'_>, hits: &mut [bool]) -> Result<()> {
+    if spec.join_type == JoinType::NullAwareAnti {
+        let pairs = naaj_pairs(spec)?;
+        if !pairs.is_empty() {
+            return probe_equi_hits(left, right, &pairs, None, hits);
+        }
+    }
     let split = match spec.on {
         Some(pred) => split_equi(pred, left.num_columns())?,
         None => EquiSplit {
@@ -205,13 +228,21 @@ fn or_left_hits(left: &Batch, right: &Batch, spec: &JoinSpec<'_>, hits: &mut [bo
         }
         return Ok(());
     }
-    let left_keys: Vec<ArrayRef> = split
-        .keys
+    probe_equi_hits(left, right, &split.keys, split.residual.as_ref(), hits)
+}
+
+fn probe_equi_hits(
+    left: &Batch,
+    right: &Batch,
+    keys: &[(Expr, Expr)],
+    residual: Option<&Expr>,
+    hits: &mut [bool],
+) -> Result<()> {
+    let left_keys: Vec<ArrayRef> = keys
         .iter()
         .map(|(l, _)| l.eval(left))
         .collect::<Result<_>>()?;
-    let right_keys: Vec<ArrayRef> = split
-        .keys
+    let right_keys: Vec<ArrayRef> = keys
         .iter()
         .map(|(_, r)| r.eval(right))
         .collect::<Result<_>>()?;
@@ -233,11 +264,75 @@ fn or_left_hits(left: &Batch, right: &Batch, spec: &JoinSpec<'_>, hits: &mut [bo
         }
         if let Some(rows) = table.get(&key) {
             for &rrow in rows {
-                if residual_ok(left, right, lrow, rrow as usize, split.residual.as_ref())? {
+                if residual_ok(left, right, lrow, rrow as usize, residual)? {
                     *hit = true;
                     break;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn naaj_pairs(spec: &JoinSpec<'_>) -> Result<Vec<(Expr, Expr)>> {
+    let Some(pred) = spec.on else {
+        return Ok(Vec::new());
+    };
+    let left_ncols = spec.left_schema.fields().len();
+    let mut pairs = Vec::new();
+    for conjunct in flatten_and(pred) {
+        let Expr::Binary(BinaryOp::Eq, l, r) = conjunct else {
+            continue;
+        };
+        let sl = expr_side(l, left_ncols)?;
+        let sr = expr_side(r, left_ncols)?;
+        match (sl, sr) {
+            (Side::Left | Side::None, Side::Right) => {
+                pairs.push((l.as_ref().clone(), shift_right(r, left_ncols)));
+            }
+            (Side::Right, Side::Left | Side::None) => {
+                pairs.push((r.as_ref().clone(), shift_right(l, left_ncols)));
+            }
+            _ => {}
+        }
+    }
+    Ok(pairs)
+}
+
+fn right_has_null_key(right: &Batch, spec: &JoinSpec<'_>) -> Result<bool> {
+    let pairs = naaj_pairs(spec)?;
+    if pairs.is_empty() {
+        return Ok(false);
+    }
+    let right_keys: Vec<ArrayRef> = pairs
+        .iter()
+        .map(|(_, r)| r.eval(right))
+        .collect::<Result<_>>()?;
+    for row in 0..right.num_rows() {
+        let key = extract_key(&right_keys, row)?;
+        if key.contains(&Scalar::Null) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn mark_null_left_keys(left: &Batch, spec: &JoinSpec<'_>, hits: &mut [bool]) -> Result<()> {
+    let pairs = naaj_pairs(spec)?;
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let left_keys: Vec<ArrayRef> = pairs
+        .iter()
+        .map(|(l, _)| l.eval(left))
+        .collect::<Result<_>>()?;
+    for (lrow, hit) in hits.iter_mut().enumerate() {
+        if *hit {
+            continue;
+        }
+        let key = extract_key(&left_keys, lrow)?;
+        if key.contains(&Scalar::Null) {
+            *hit = true;
         }
     }
     Ok(())
@@ -372,6 +467,9 @@ fn hash_join(
             schema,
         ),
         JoinType::Anti => take_left(left, &unmatched_left, schema),
+        JoinType::NullAwareAnti => Err(Error::Eval(
+            "internal: null-aware anti used the hash path".into(),
+        )),
         JoinType::Cross => Err(Error::Eval(
             "internal: CROSS JOIN used the hash path".into(),
         )),
@@ -429,6 +527,9 @@ fn nested_loop(
             schema,
         ),
         JoinType::Anti => take_left(left, &unmatched_left, schema),
+        JoinType::NullAwareAnti => Err(Error::Eval(
+            "internal: null-aware anti used the nested-loop path".into(),
+        )),
     }
 }
 

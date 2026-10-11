@@ -111,6 +111,7 @@ pub fn estimate_rows(plan: &LogicalPlan) -> Option<f64> {
             Some(n.max(1.0))
         }
         LogicalPlan::WorkScan { .. } => None,
+        LogicalPlan::Scalar { .. } => Some(1.0),
     }
 }
 
@@ -307,6 +308,10 @@ fn map_children(
                 schema,
             })
         }
+        LogicalPlan::Scalar { input, schema } => Ok(LogicalPlan::Scalar {
+            input: Box::new(f(*input)?),
+            schema,
+        }),
         leaf @ (LogicalPlan::Empty { .. }
         | LogicalPlan::Scan { .. }
         | LogicalPlan::WorkScan { .. }) => Ok(leaf),

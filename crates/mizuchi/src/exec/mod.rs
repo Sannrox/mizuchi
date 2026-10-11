@@ -30,7 +30,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use arrow::array::{
-    Array, BooleanArray, RecordBatch, RecordBatchOptions, RecordBatchReader, StringArray,
+    Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, RecordBatchReader, StringArray,
+    new_null_array,
 };
 use arrow::compute::filter_record_batch;
 use arrow::compute::kernels::boolean::{and, is_not_null};
@@ -1211,6 +1212,7 @@ fn collect_scan_reports(plan: &LogicalPlan, session: &Session, out: &mut Vec<Inp
             collect_scan_reports(step, session, out);
         }
         LogicalPlan::Empty { .. } | LogicalPlan::WorkScan { .. } => {}
+        LogicalPlan::Scalar { input, .. } => collect_scan_reports(input, session, out),
     }
 }
 
@@ -1720,7 +1722,46 @@ fn build_physical(
             }
             Ok((op, node))
         }
+        LogicalPlan::Scalar { input, schema } => {
+            let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
+            let t0 = Instant::now();
+            let batches = collect(child, &session.cancel)?;
+            let out = scalar_one_row(batches, schema.clone())?;
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let (op, node) = metrics::finish(
+                "Scalar",
+                lowering.scan(vec![out])?,
+                vec![child_node],
+                analyze,
+                pool,
+            );
+            if analyze {
+                metrics::add_blocking(&node, ns, pool.peak());
+            }
+            Ok((op, node))
+        }
     }
+}
+
+pub(super) fn scalar_one_row(batches: Vec<Batch>, schema: SchemaRef) -> Result<Batch> {
+    let n: usize = batches.iter().map(Batch::num_rows).sum();
+    if n > 1 {
+        return Err(Error::Eval(
+            "scalar subquery returned more than one row".into(),
+        ));
+    }
+    if n == 0 {
+        let cols: Vec<ArrayRef> = schema
+            .fields()
+            .iter()
+            .map(|f| new_null_array(f.data_type(), 1))
+            .collect();
+        return Batch::try_new(schema, cols);
+    }
+    batches
+        .into_iter()
+        .find(|b| b.num_rows() > 0)
+        .ok_or_else(|| Error::Eval("scalar subquery row missing".into()))
 }
 
 fn explain_sql(sql: &str) -> Result<Option<(bool, String)>> {
@@ -2537,6 +2578,94 @@ mod tests {
             .execute_sql(r#"WITH "C" AS (SELECT 1 AS n) SELECT n FROM "C""#)
             .unwrap();
         assert_eq!(col_i64(&out, "n"), vec![Some(1)]);
+    }
+
+    #[test]
+    fn subquery_in_list_and_in_select() {
+        let out = session()
+            .execute_sql("SELECT a FROM t WHERE a IN (1, 2)")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2)]);
+        let out = session()
+            .execute_sql("SELECT a FROM t WHERE a IN (SELECT a FROM t)")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2), Some(3)]);
+        let out = session()
+            .execute_sql("SELECT a FROM t WHERE a NOT IN (SELECT a FROM t)")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), Vec::<Option<i64>>::new());
+        let out = session()
+            .execute_sql("SELECT a FROM t WHERE a NOT IN (SELECT a FROM t WHERE a = 1)")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(2), Some(3)]);
+        let out = session()
+            .execute_sql("SELECT a FROM t WHERE a NOT IN (SELECT a FROM t WHERE a = 99)")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2), Some(3), None]);
+        let out = session()
+            .execute_sql("SELECT a FROM t WHERE 99 NOT IN (SELECT a FROM t)")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), Vec::<Option<i64>>::new());
+        let out = session()
+            .execute_sql("SELECT a FROM t WHERE NULL NOT IN (SELECT a FROM t WHERE a IS NOT NULL)")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), Vec::<Option<i64>>::new());
+        let two = session().with_workers(2).unwrap();
+        let out = two
+            .execute_sql("SELECT a FROM t WHERE a NOT IN (SELECT a FROM t)")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), Vec::<Option<i64>>::new());
+    }
+
+    #[test]
+    fn subquery_exists_and_scalar() {
+        let out = session()
+            .execute_sql("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t u WHERE u.a = t.a)")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2), Some(3)]);
+        let out = session()
+            .execute_sql("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t LIMIT 0)")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), Vec::<Option<i64>>::new());
+        let err = session().execute_sql(
+            "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t u WHERE u.a = t.a LIMIT 1)",
+        );
+        assert!(matches!(err, Err(Error::NotImplemented(_))), "{err:?}");
+        let err = session().execute_sql("SELECT a FROM t WHERE EXISTS (SELECT nosuch FROM t)");
+        assert!(matches!(err, Err(Error::Plan(_))), "{err:?}");
+        let err =
+            session().execute_sql("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t HAVING false)");
+        assert!(matches!(err, Err(Error::NotImplemented(_))), "{err:?}");
+        let out = session()
+            .execute_sql(
+                "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t u WHERE u.a = CAST(t.a AS BIGINT))",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2), Some(3)]);
+        let out = session()
+            .execute_sql("SELECT (SELECT a FROM t WHERE a = 1)")
+            .unwrap();
+        assert_eq!(out[0].num_rows(), 1);
+        let col = out[0].column(0);
+        let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(arr.value(0), 1);
+        let out = session()
+            .execute_sql("SELECT (SELECT a FROM t WHERE a = 1) AS x, a FROM t WHERE a IS NOT NULL")
+            .unwrap();
+        assert_eq!(col_i64(&out, "x"), vec![Some(1), Some(1), Some(1)]);
+        assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2), Some(3)]);
+        let err = session().execute_sql("SELECT (SELECT a FROM t WHERE a IS NOT NULL)");
+        assert!(matches!(err, Err(Error::Eval(_))), "{err:?}");
+    }
+
+    #[test]
+    fn subquery_lateral_projects_outer() {
+        let out = session()
+            .execute_sql("SELECT a FROM t, LATERAL (SELECT a AS x) s WHERE t.a = s.x")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2), Some(3)]);
+        let err = session().execute_sql("SELECT a FROM t, LATERAL (SELECT a AS x LIMIT 0) s");
+        assert!(matches!(err, Err(Error::NotImplemented(_))), "{err:?}");
     }
 
     #[test]

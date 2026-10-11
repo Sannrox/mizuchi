@@ -1,5 +1,4 @@
-# Subqueries. Uncorrelated FROM (derived table) executes. IN, EXISTS, scalar,
-# correlated, and LATERAL fail closed.
+# Subqueries: derived tables, IN lists, IN (SELECT), EXISTS, scalar, LATERAL.
 
 statement ok
 CREATE TABLE t (a INTEGER, b TEXT)
@@ -14,14 +13,12 @@ SELECT a FROM (SELECT a FROM t) s WHERE a IS NOT NULL
 2
 3
 
-skipif mizuchi
 query I
 SELECT a FROM t WHERE a IN (1, 2)
 ----
 1
 2
 
-skipif mizuchi
 query I
 SELECT a FROM t WHERE a IN (SELECT a FROM t)
 ----
@@ -29,7 +26,6 @@ SELECT a FROM t WHERE a IN (SELECT a FROM t)
 2
 3
 
-skipif mizuchi
 query I
 SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t u WHERE u.a = t.a)
 ----
@@ -37,13 +33,40 @@ SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t u WHERE u.a = t.a)
 2
 3
 
-skipif mizuchi
 query I
 SELECT (SELECT a FROM t WHERE a = 1)
 ----
 1
 
-skipif mizuchi
+query I
+SELECT a FROM t WHERE a NOT IN (SELECT a FROM t)
+----
+
+query I
+SELECT a FROM t WHERE 99 NOT IN (SELECT a FROM t)
+----
+
+query I
+SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t LIMIT 0)
+----
+
+query II
+SELECT (SELECT a FROM t WHERE a = 1) AS x, a FROM t WHERE a IS NOT NULL
+----
+1
+1
+1
+2
+1
+3
+
+query I
+SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t u WHERE u.a = CAST(t.a AS BIGINT))
+----
+1
+2
+3
+
 query I
 SELECT a FROM t, LATERAL (SELECT a AS x) s WHERE t.a = s.x
 ----

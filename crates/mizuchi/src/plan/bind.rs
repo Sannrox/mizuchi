@@ -859,12 +859,7 @@ fn bind_select(select: &Select, ctx: &BindCtx<'_>) -> Result<LogicalPlan> {
     let mut scope = from.scope;
 
     if let Some(pred) = &select.selection {
-        let predicate = bind_scalar(pred, &scope)?;
-        require_boolean(expr_type(&predicate, &scope.schema)?, "WHERE")?;
-        plan = LogicalPlan::Filter {
-            input: Box::new(plan),
-            predicate,
-        };
+        plan = apply_where(plan, &scope, pred, ctx)?;
         scope.schema = plan.schema().clone();
     }
 
@@ -886,7 +881,7 @@ fn bind_select(select: &Select, ctx: &BindCtx<'_>) -> Result<LogicalPlan> {
                 "HAVING requires GROUP BY or an aggregate".into(),
             ));
         }
-        plan = bind_project(plan, &scope, &select.projection, &select.named_window)?;
+        plan = bind_project(plan, &scope, &select.projection, &select.named_window, ctx)?;
     }
     Ok(plan)
 }
@@ -954,10 +949,28 @@ fn bind_from(from: &[TableWithJoins], ctx: &BindCtx<'_>) -> Result<BoundFrom> {
     }
     let mut bound = bind_table_with_joins(&from[0], ctx)?;
     for extra in &from[1..] {
-        let right = bind_table_with_joins(extra, ctx)?;
-        bound = cross_join(bound, right)?;
+        bound = append_from_item(bound, extra, ctx)?;
     }
     Ok(bound)
+}
+
+fn append_from_item(
+    left: BoundFrom,
+    extra: &TableWithJoins,
+    ctx: &BindCtx<'_>,
+) -> Result<BoundFrom> {
+    if is_lateral(&extra.relation) {
+        if !extra.joins.is_empty() {
+            return Err(Error::NotImplemented("join after LATERAL"));
+        }
+        return apply_lateral(left, &extra.relation, ctx);
+    }
+    let right = bind_table_with_joins(extra, ctx)?;
+    cross_join(left, right)
+}
+
+fn is_lateral(factor: &TableFactor) -> bool {
+    matches!(factor, TableFactor::Derived { lateral: true, .. })
 }
 
 fn bind_table_with_joins(twj: &TableWithJoins, ctx: &BindCtx<'_>) -> Result<BoundFrom> {
@@ -1049,7 +1062,7 @@ fn bind_table_factor(factor: &TableFactor, ctx: &BindCtx<'_>) -> Result<BoundFro
             sample,
         } => {
             if *lateral {
-                return Err(Error::NotImplemented("LATERAL"));
+                return Err(Error::NotImplemented("LATERAL without a left input"));
             }
             if sample.is_some() {
                 return Err(Error::NotImplemented("TABLESAMPLE"));
@@ -1095,7 +1108,9 @@ fn bind_join(left: BoundFrom, right: BoundFrom, op: &JoinOperator) -> Result<Bou
         return Err(Error::Plan("join requires ON".into()));
     }
     let (schema, scope) = match join_type {
-        JoinType::Semi | JoinType::Anti => (left.plan.schema().clone(), left.scope),
+        JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti => {
+            (left.plan.schema().clone(), left.scope)
+        }
         _ => (concat.schema.clone(), concat),
     };
     Ok(BoundFrom {
@@ -1337,6 +1352,7 @@ fn bind_project(
     scope: &Scope,
     items: &[SelectItem],
     named: &[NamedWindowDefinition],
+    ctx: &BindCtx<'_>,
 ) -> Result<LogicalPlan> {
     if projection_has_window(items) {
         return bind_window_project(input, scope, items, named);
@@ -1346,7 +1362,7 @@ fn bind_project(
             "WINDOW clause requires a window function".into(),
         ));
     }
-    bind_scalar_project(input, scope, items)
+    bind_scalar_project(input, scope, items, ctx)
 }
 
 fn projection_has_window(items: &[SelectItem]) -> bool {
@@ -1714,7 +1730,10 @@ fn bind_scalar_project(
     input: LogicalPlan,
     scope: &Scope,
     items: &[SelectItem],
+    ctx: &BindCtx<'_>,
 ) -> Result<LogicalPlan> {
+    let mut plan = input;
+    let mut scope = scope.clone();
     let mut exprs = Vec::new();
     for item in items {
         match item {
@@ -1750,18 +1769,18 @@ fn bind_scalar_project(
                 }
             }
             SelectItem::UnnamedExpr(expr) => {
-                let bound = bind_scalar(expr, scope)?;
-                exprs.push(NamedExpr {
-                    name: infer_sql_name(expr),
-                    expr: bound,
-                });
+                let name = infer_sql_name(expr);
+                let (next, bound, next_scope) = bind_scalar_or_subquery(plan, scope, expr, ctx)?;
+                plan = next;
+                scope = next_scope;
+                exprs.push(NamedExpr { name, expr: bound });
             }
             SelectItem::ExprWithAlias { expr, alias } => {
-                let bound = bind_scalar(expr, scope)?;
-                exprs.push(NamedExpr {
-                    name: ident_key(alias),
-                    expr: bound,
-                });
+                let name = ident_key(alias);
+                let (next, bound, next_scope) = bind_scalar_or_subquery(plan, scope, expr, ctx)?;
+                plan = next;
+                scope = next_scope;
+                exprs.push(NamedExpr { name, expr: bound });
             }
             _ => return Err(Error::NotImplemented("select item")),
         }
@@ -1771,11 +1790,11 @@ fn bind_scalar_project(
     }
     let mut fields = Vec::new();
     for e in &exprs {
-        let dt = expr_type(&e.expr, input.schema())?;
+        let dt = expr_type(&e.expr, plan.schema())?;
         fields.push(Field::new(&e.name, dt, true));
     }
     Ok(LogicalPlan::Project {
-        input: Box::new(input),
+        input: Box::new(plan),
         exprs,
         schema: schema_from_fields(fields)?,
     })
@@ -2013,8 +2032,14 @@ fn bind_scalar(expr: &SqlExpr, scope: &Scope) -> Result<Expr> {
                 length,
             })
         }
-        SqlExpr::Subquery(_) => Err(Error::NotImplemented("scalar subquery")),
-        SqlExpr::Exists { .. } => Err(Error::NotImplemented("EXISTS")),
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => bind_in_list(expr, list, *negated, scope),
+        SqlExpr::InSubquery { .. } => Err(Error::NotImplemented("IN subquery in expression")),
+        SqlExpr::Subquery(_) => Err(Error::NotImplemented("scalar subquery in expression")),
+        SqlExpr::Exists { .. } => Err(Error::NotImplemented("EXISTS in expression")),
         SqlExpr::Like { .. } | SqlExpr::ILike { .. } => Err(Error::NotImplemented("LIKE")),
         _ => Err(Error::NotImplemented("expression")),
     }
@@ -2341,6 +2366,465 @@ fn object_name(name: &ObjectName) -> Result<String> {
         }
     }
     Ok(parts.join("."))
+}
+
+fn flatten_and(expr: &SqlExpr) -> Vec<&SqlExpr> {
+    match expr {
+        SqlExpr::Nested(inner) => flatten_and(inner),
+        SqlExpr::BinaryOp {
+            op: BinaryOperator::And,
+            left,
+            right,
+        } => {
+            let mut out = flatten_and(left);
+            out.extend(flatten_and(right));
+            out
+        }
+        other => vec![other],
+    }
+}
+
+fn unwrap_subquery(expr: &SqlExpr) -> Option<&Query> {
+    match expr {
+        SqlExpr::Nested(inner) => unwrap_subquery(inner),
+        SqlExpr::Subquery(q) => Some(q),
+        _ => None,
+    }
+}
+
+fn bind_in_list(expr: &SqlExpr, list: &[SqlExpr], negated: bool, scope: &Scope) -> Result<Expr> {
+    if list.is_empty() {
+        let pred = Expr::lit_bool(false);
+        return Ok(if negated {
+            Expr::Unary(UnaryOp::Not, Box::new(pred))
+        } else {
+            pred
+        });
+    }
+    let left = bind_scalar(expr, scope)?;
+    let mut acc = Expr::Binary(
+        BinaryOp::Eq,
+        Box::new(left.clone()),
+        Box::new(bind_scalar(&list[0], scope)?),
+    );
+    for item in &list[1..] {
+        let eq = Expr::Binary(
+            BinaryOp::Eq,
+            Box::new(left.clone()),
+            Box::new(bind_scalar(item, scope)?),
+        );
+        acc = Expr::Binary(BinaryOp::Or, Box::new(acc), Box::new(eq));
+    }
+    let pred = acc;
+    let _ = expr_type(&pred, &scope.schema)?;
+    if negated {
+        Ok(Expr::Unary(UnaryOp::Not, Box::new(pred)))
+    } else {
+        Ok(pred)
+    }
+}
+
+fn apply_where(
+    mut plan: LogicalPlan,
+    scope: &Scope,
+    pred: &SqlExpr,
+    ctx: &BindCtx<'_>,
+) -> Result<LogicalPlan> {
+    let mut leftover: Option<Expr> = None;
+    for conjunct in flatten_and(pred) {
+        match conjunct {
+            SqlExpr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                plan = apply_in_subquery(plan, scope, expr, subquery, *negated, ctx)?;
+            }
+            SqlExpr::Exists { subquery, negated } => {
+                plan = apply_exists(plan, scope, subquery, *negated, ctx)?;
+            }
+            other => {
+                let bound = bind_scalar(other, scope)?;
+                require_boolean(expr_type(&bound, &scope.schema)?, "WHERE")?;
+                leftover = Some(match leftover {
+                    None => bound,
+                    Some(prev) => Expr::Binary(BinaryOp::And, Box::new(prev), Box::new(bound)),
+                });
+            }
+        }
+    }
+    if let Some(predicate) = leftover {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate,
+        };
+    }
+    Ok(plan)
+}
+
+fn apply_in_subquery(
+    plan: LogicalPlan,
+    scope: &Scope,
+    expr: &SqlExpr,
+    subquery: &Query,
+    negated: bool,
+    ctx: &BindCtx<'_>,
+) -> Result<LogicalPlan> {
+    let needle = bind_scalar(expr, scope)?;
+    let inner = bind_query(subquery, ctx)?;
+    if inner.schema().fields().len() != 1 {
+        return Err(Error::Plan("IN subquery must return one column".into()));
+    }
+    let left_len = plan.schema().fields().len();
+    let on = Expr::Binary(
+        BinaryOp::Eq,
+        Box::new(needle),
+        Box::new(Expr::nth(left_len)),
+    );
+    let join_schema = join_schema(plan.schema(), inner.schema());
+    let _ = expr_type(&on, join_schema.as_ref())?;
+    Ok(LogicalPlan::Join {
+        schema: plan.schema().clone(),
+        left: Box::new(plan),
+        right: Box::new(inner),
+        join_type: if negated {
+            JoinType::NullAwareAnti
+        } else {
+            JoinType::Semi
+        },
+        on: Some(on),
+    })
+}
+
+fn apply_exists(
+    plan: LogicalPlan,
+    outer: &Scope,
+    subquery: &Query,
+    negated: bool,
+    ctx: &BindCtx<'_>,
+) -> Result<LogicalPlan> {
+    if subquery.with.is_some() {
+        return Err(Error::NotImplemented("WITH inside EXISTS"));
+    }
+    reject_query_extras(subquery)?;
+    let select = match unwrap_set(&subquery.body) {
+        SetExpr::Select(s) => s,
+        _ => return Err(Error::NotImplemented("EXISTS set operation")),
+    };
+    reject_select_extras(select)?;
+    if is_grouped(select, ctx.udafs) {
+        return Err(Error::NotImplemented("EXISTS aggregate"));
+    }
+    if select.having.is_some() {
+        return Err(Error::NotImplemented("EXISTS HAVING"));
+    }
+    let inner_from = bind_from(&select.from, ctx)?;
+    let outer_len = outer.schema.fields().len();
+    let left_len = plan.schema().fields().len();
+    let combined = Scope::join(outer.clone(), inner_from.scope.clone());
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                let _ = bind_scalar(expr, &combined)?;
+            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {}
+            _ => return Err(Error::NotImplemented("EXISTS select item")),
+        }
+    }
+    let mut on_eqs: Vec<Expr> = Vec::new();
+    let mut inner_preds: Vec<Expr> = Vec::new();
+    if let Some(pred) = &select.selection {
+        for conjunct in flatten_and(pred) {
+            let bound = bind_scalar(conjunct, &combined)?;
+            classify_corr(bound, outer_len, left_len, &mut on_eqs, &mut inner_preds)?;
+        }
+    }
+    let mut inner = inner_from.plan;
+    if let Some(predicate) = fold_and(inner_preds) {
+        inner = LogicalPlan::Filter {
+            input: Box::new(inner),
+            predicate,
+        };
+    }
+    if let Some(order_by) = &subquery.order_by {
+        inner = bind_order_by(inner, order_by)?;
+    }
+    let on = fold_and(on_eqs);
+    if let Some(limit) = &subquery.limit_clause {
+        let uses_inner = on
+            .as_ref()
+            .is_some_and(|e| nth_bounds(e).1.is_some_and(|m| m >= left_len));
+        if uses_inner {
+            return Err(Error::NotImplemented("LIMIT in correlated EXISTS"));
+        }
+        inner = bind_limit(inner, limit)?;
+    }
+    Ok(LogicalPlan::Join {
+        schema: plan.schema().clone(),
+        left: Box::new(plan),
+        right: Box::new(inner),
+        join_type: if negated {
+            JoinType::Anti
+        } else {
+            JoinType::Semi
+        },
+        on,
+    })
+}
+
+fn fold_and(mut parts: Vec<Expr>) -> Option<Expr> {
+    let mut acc = parts.pop()?;
+    while let Some(next) = parts.pop() {
+        acc = Expr::Binary(BinaryOp::And, Box::new(next), Box::new(acc));
+    }
+    Some(acc)
+}
+
+fn classify_corr(
+    expr: Expr,
+    outer_len: usize,
+    left_len: usize,
+    on_eqs: &mut Vec<Expr>,
+    inner_preds: &mut Vec<Expr>,
+) -> Result<()> {
+    let (min, max) = nth_bounds(&expr);
+    if min.is_some_and(|m| m >= outer_len) {
+        inner_preds.push(map_nths(expr, &|i| i - outer_len));
+    } else if max.is_none_or(|m| m < outer_len) {
+        on_eqs.push(expr);
+    } else {
+        on_eqs.push(map_nths(expr, &|i| {
+            if i >= outer_len {
+                left_len + (i - outer_len)
+            } else {
+                i
+            }
+        }));
+    }
+    Ok(())
+}
+
+fn nth_bounds(expr: &Expr) -> (Option<usize>, Option<usize>) {
+    let mut min = None;
+    let mut max = None;
+    walk_nth(expr, &mut |i| {
+        min = Some(min.map_or(i, |m: usize| m.min(i)));
+        max = Some(max.map_or(i, |m: usize| m.max(i)));
+    });
+    (min, max)
+}
+
+fn walk_nth(expr: &Expr, f: &mut impl FnMut(usize)) {
+    match expr {
+        Expr::Nth(i) => f(*i),
+        Expr::Column(_) | Expr::Literal(_) => {}
+        Expr::Binary(_, l, r) => {
+            walk_nth(l, f);
+            walk_nth(r, f);
+        }
+        Expr::Unary(_, e) | Expr::Cast { expr: e, .. } | Expr::Substring { expr: e, .. } => {
+            walk_nth(e, f);
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(o) = operand {
+                walk_nth(o, f);
+            }
+            for (w, t) in when_then {
+                walk_nth(w, f);
+                walk_nth(t, f);
+            }
+            if let Some(e) = else_expr {
+                walk_nth(e, f);
+            }
+        }
+        Expr::Coalesce(args) | Expr::Concat(args) | Expr::Array(args) => {
+            for a in args {
+                walk_nth(a, f);
+            }
+        }
+    }
+}
+
+fn map_nths(expr: Expr, f: &impl Fn(usize) -> usize) -> Expr {
+    match expr {
+        Expr::Nth(i) => Expr::Nth(f(i)),
+        Expr::Column(_) | Expr::Literal(_) => expr,
+        Expr::Binary(op, l, r) => {
+            Expr::Binary(op, Box::new(map_nths(*l, f)), Box::new(map_nths(*r, f)))
+        }
+        Expr::Unary(op, e) => Expr::Unary(op, Box::new(map_nths(*e, f))),
+        Expr::Cast { expr, data_type } => Expr::Cast {
+            expr: Box::new(map_nths(*expr, f)),
+            data_type,
+        },
+        Expr::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => Expr::Case {
+            operand: operand.map(|e| Box::new(map_nths(*e, f))),
+            when_then: when_then
+                .into_iter()
+                .map(|(w, t)| (map_nths(w, f), map_nths(t, f)))
+                .collect(),
+            else_expr: else_expr.map(|e| Box::new(map_nths(*e, f))),
+        },
+        Expr::Coalesce(args) => Expr::Coalesce(args.into_iter().map(|e| map_nths(e, f)).collect()),
+        Expr::Concat(args) => Expr::Concat(args.into_iter().map(|e| map_nths(e, f)).collect()),
+        Expr::Substring {
+            expr,
+            start,
+            length,
+        } => Expr::Substring {
+            expr: Box::new(map_nths(*expr, f)),
+            start,
+            length,
+        },
+        Expr::Array(args) => Expr::Array(args.into_iter().map(|e| map_nths(e, f)).collect()),
+    }
+}
+
+fn bind_scalar_or_subquery(
+    plan: LogicalPlan,
+    scope: Scope,
+    expr: &SqlExpr,
+    ctx: &BindCtx<'_>,
+) -> Result<(LogicalPlan, Expr, Scope)> {
+    if let Some(query) = unwrap_subquery(expr) {
+        attach_scalar(plan, scope, query, ctx)
+    } else {
+        let bound = bind_scalar(expr, &scope)?;
+        Ok((plan, bound, scope))
+    }
+}
+
+fn attach_scalar(
+    plan: LogicalPlan,
+    scope: Scope,
+    query: &Query,
+    ctx: &BindCtx<'_>,
+) -> Result<(LogicalPlan, Expr, Scope)> {
+    let inner = bind_query(query, ctx)?;
+    if inner.schema().fields().len() != 1 {
+        return Err(Error::Plan("scalar subquery must return one column".into()));
+    }
+    let schema = inner.schema().clone();
+    let scalar = LogicalPlan::Scalar {
+        input: Box::new(inner),
+        schema: schema.clone(),
+    };
+    let nth = plan.schema().fields().len();
+    let joined = join_schema(plan.schema(), &schema);
+    let plan = LogicalPlan::Join {
+        left: Box::new(plan),
+        right: Box::new(scalar),
+        join_type: JoinType::Cross,
+        on: None,
+        schema: joined.clone(),
+    };
+    let mut next_scope = scope;
+    next_scope.schema = joined;
+    Ok((plan, Expr::nth(nth), next_scope))
+}
+
+fn apply_lateral(left: BoundFrom, factor: &TableFactor, ctx: &BindCtx<'_>) -> Result<BoundFrom> {
+    let TableFactor::Derived {
+        subquery,
+        alias,
+        sample,
+        ..
+    } = factor
+    else {
+        return Err(Error::NotImplemented("LATERAL"));
+    };
+    if sample.is_some() {
+        return Err(Error::NotImplemented("TABLESAMPLE"));
+    }
+    if subquery.with.is_some() {
+        return Err(Error::NotImplemented("WITH inside LATERAL"));
+    }
+    if subquery.order_by.is_some() {
+        return Err(Error::NotImplemented("LATERAL ORDER BY"));
+    }
+    if subquery.limit_clause.is_some() {
+        return Err(Error::NotImplemented("LATERAL LIMIT"));
+    }
+    reject_query_extras(subquery)?;
+    let select = match unwrap_set(&subquery.body) {
+        SetExpr::Select(s) => s,
+        _ => return Err(Error::NotImplemented("LATERAL set operation")),
+    };
+    reject_select_extras(select)?;
+    if !select.from.is_empty() {
+        return Err(Error::NotImplemented("LATERAL with FROM"));
+    }
+    if select.selection.is_some() {
+        return Err(Error::NotImplemented("LATERAL WHERE"));
+    }
+    if is_grouped(select, ctx.udafs) {
+        return Err(Error::NotImplemented("LATERAL aggregate"));
+    }
+    let qualifier = alias.as_ref().map(|a| ident_key(&a.name));
+    let mut exprs = Vec::new();
+    for col in &left.scope.columns {
+        exprs.push(NamedExpr {
+            expr: Expr::nth(col.index),
+            name: col.name.clone(),
+        });
+    }
+    let mut extra_cols = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) => {
+                extra_cols.push(NamedExpr {
+                    name: infer_sql_name(expr),
+                    expr: bind_scalar(expr, &left.scope)?,
+                });
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                extra_cols.push(NamedExpr {
+                    name: ident_key(alias),
+                    expr: bind_scalar(expr, &left.scope)?,
+                });
+            }
+            _ => return Err(Error::NotImplemented("LATERAL select item")),
+        }
+    }
+    if extra_cols.is_empty() {
+        return Err(Error::Plan("empty LATERAL projection".into()));
+    }
+    let extra_start = exprs.len();
+    exprs.extend(extra_cols.iter().cloned());
+    let mut fields = Vec::new();
+    for e in &exprs {
+        let dt = expr_type(&e.expr, left.plan.schema())?;
+        fields.push(Field::new(&e.name, dt, true));
+    }
+    let schema = schema_from_fields(fields)?;
+    let mut columns = left.scope.columns.clone();
+    for (i, extra) in extra_cols.iter().enumerate() {
+        columns.push(ScopeCol {
+            qualifier: qualifier.clone(),
+            name: extra.name.clone(),
+            index: extra_start + i,
+        });
+    }
+    Ok(BoundFrom {
+        plan: LogicalPlan::Project {
+            input: Box::new(left.plan),
+            exprs,
+            schema: schema.clone(),
+        },
+        scope: Scope {
+            columns,
+            schema,
+            udafs: left.scope.udafs,
+        },
+    })
 }
 
 fn ident_key(id: &Ident) -> String {
