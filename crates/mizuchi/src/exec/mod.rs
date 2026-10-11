@@ -12,6 +12,7 @@ mod key;
 mod memory;
 mod metrics;
 mod op;
+mod report;
 mod schedule;
 mod sort;
 mod stage;
@@ -38,6 +39,7 @@ pub use engine::Engine;
 pub use incremental::MicroBatchAgg;
 pub use metrics::OperatorMetrics;
 pub use op::{CpuLowering, Lowering, Operator};
+pub use report::{InputScan, OutputWrite, QueryReport, QueryResult};
 
 /// Cooperative cancellation flag. Operators check it between morsels.
 #[derive(Clone, Debug, Default)]
@@ -141,6 +143,14 @@ impl Clone for Session {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct TableSource {
+    path: Option<PathBuf>,
+    partitions: Vec<String>,
+    mtime_ms: Option<u64>,
+    etag: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct MemTable {
     schema: SchemaRef,
@@ -148,6 +158,7 @@ struct MemTable {
     stats: crate::plan::TableStats,
     /// Bumped on every [`Session::register`] of this name.
     generation: u64,
+    source: TableSource,
 }
 
 impl Session {
@@ -272,6 +283,7 @@ impl Session {
                 batches,
                 stats,
                 generation,
+                source: TableSource::default(),
             },
         );
         Ok(())
@@ -287,14 +299,19 @@ impl Session {
     ) -> Result<()> {
         let path = path.as_ref();
         config::assert_allowed(path, &self.allowed_read_paths)?;
-        let batches = read_parquet_tree(path, opts)?;
+        let (batches, source) = read_parquet_tree(path, opts)?;
         let schema = match batches.first() {
             Some(batch) => batch.schema(),
             None => {
                 return Err(Error::Io(format!("{} produced no batches", path.display())));
             }
         };
-        self.register(name, schema, batches)
+        let name = name.into();
+        self.register(name.clone(), schema, batches)?;
+        if let Some(table) = self.tables.get_mut(&normalize_name(&name)) {
+            table.source = source;
+        }
+        Ok(())
     }
 
     /// Register a CSV file as an in-memory table after the read allow-list
@@ -339,9 +356,28 @@ impl Session {
         batches: &[Batch],
         opts: crate::write::ParquetWriteOptions<'_>,
     ) -> Result<()> {
+        let _ = self.write_parquet_reported(dest, batches, opts)?;
+        Ok(())
+    }
+
+    /// [`Self::write_parquet`] plus the output side of a [`QueryReport`].
+    pub fn write_parquet_reported(
+        &self,
+        dest: impl AsRef<Path>,
+        batches: &[Batch],
+        opts: crate::write::ParquetWriteOptions<'_>,
+    ) -> Result<QueryReport> {
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
-        crate::write::write_parquet_cancel(dest, batches, opts, &self.cancel)
+        let stats = crate::write::write_parquet_stats(dest, batches, opts, &self.cancel)?;
+        Ok(QueryReport::from_write(OutputWrite {
+            path: stats.path,
+            partitions: stats.partitions,
+            mode: stats.mode,
+            rows: stats.rows,
+            bytes: stats.bytes,
+            commit_id: stats.commit_id,
+        }))
     }
 
     /// Bind and optimize `sql` against registered tables.
@@ -351,9 +387,18 @@ impl Session {
 
     /// Run an already-bound logical plan. Re-optimizes, then pulls batches.
     pub fn execute(&self, plan: &LogicalPlan) -> Result<Vec<Batch>> {
+        Ok(self.execute_reported(plan)?.batches)
+    }
+
+    /// [`Self::execute`] plus a [`QueryReport`].
+    pub fn execute_reported(&self, plan: &LogicalPlan) -> Result<QueryResult> {
         self.cancel.check()?;
         let plan = crate::opt::optimize(plan.clone())?;
-        self.execute_optimized(&plan)
+        let batches = self.execute_optimized(&plan)?;
+        Ok(QueryResult {
+            report: self.report_for(&plan),
+            batches,
+        })
     }
 
     /// Times a later [`Self::execute_sql`] or [`Self::execute_staged`] reused a
@@ -375,6 +420,35 @@ impl Session {
         }
         let plan = self.bind_optimized(sql)?;
         self.execute_optimized(&plan)
+    }
+
+    /// [`Self::execute_sql`] plus a [`QueryReport`].
+    pub fn execute_sql_reported(&self, sql: &str) -> Result<QueryResult> {
+        self.cancel.check()?;
+        if let Some((analyze, inner)) = explain_sql(sql)? {
+            let text = if analyze {
+                self.explain_analyze(&inner)?
+            } else {
+                self.explain(&inner)?
+            };
+            let batches = plan_text_batch(&text)?;
+            return Ok(QueryResult {
+                batches,
+                report: QueryReport::new(text, Vec::new()),
+            });
+        }
+        let plan = self.bind_optimized(sql)?;
+        let batches = self.execute_optimized(&plan)?;
+        Ok(QueryResult {
+            report: self.report_for(&plan),
+            batches,
+        })
+    }
+
+    fn report_for(&self, plan: &LogicalPlan) -> QueryReport {
+        let mut inputs = Vec::new();
+        collect_scan_reports(plan, self, &mut inputs);
+        QueryReport::new(report::plan_text(plan), inputs)
     }
 
     fn execute_optimized(&self, plan: &LogicalPlan) -> Result<Vec<Batch>> {
@@ -500,13 +574,17 @@ impl Session {
     }
 }
 
-fn read_parquet_tree(path: &Path, opts: crate::read::ParquetReadOptions<'_>) -> Result<Vec<Batch>> {
-    if !path.is_dir() {
-        return crate::read::read_parquet(path, opts);
-    }
+fn read_parquet_tree(
+    path: &Path,
+    opts: crate::read::ParquetReadOptions<'_>,
+) -> Result<(Vec<Batch>, TableSource)> {
     let mut files = Vec::new();
-    collect_parquet_files(path, &mut files)?;
-    files.sort();
+    if path.is_dir() {
+        collect_parquet_files(path, &mut files)?;
+        files.sort();
+    } else {
+        files.push(path.to_path_buf());
+    }
     let mut out = Vec::new();
     for file in &files {
         out.extend(crate::read::read_parquet(
@@ -519,7 +597,88 @@ fn read_parquet_tree(path: &Path, opts: crate::read::ParquetReadOptions<'_>) -> 
             },
         )?);
     }
-    Ok(out)
+    Ok((out, table_source_from_files(path, &files)))
+}
+
+fn table_source_from_files(root: &Path, files: &[PathBuf]) -> TableSource {
+    let mut partitions: Vec<String> = files
+        .iter()
+        .filter_map(|file| {
+            let rel = file.strip_prefix(root).ok()?;
+            let parent = rel.parent()?;
+            if parent.as_os_str().is_empty() {
+                None
+            } else {
+                Some(parent.to_string_lossy().replace('\\', "/"))
+            }
+        })
+        .collect();
+    partitions.sort();
+    partitions.dedup();
+    let mtime_ms = files
+        .iter()
+        .filter_map(|f| std::fs::metadata(f).ok()?.modified().ok())
+        .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .max();
+    TableSource {
+        path: Some(root.to_path_buf()),
+        partitions,
+        mtime_ms,
+        etag: None,
+    }
+}
+
+fn collect_scan_reports(plan: &LogicalPlan, session: &Session, out: &mut Vec<InputScan>) {
+    match plan {
+        LogicalPlan::Scan {
+            table,
+            schema,
+            projection,
+            filters,
+            ..
+        } => {
+            let mut columns = match projection {
+                Some(names) => names.clone(),
+                None => schema.fields().iter().map(|f| f.name().clone()).collect(),
+            };
+            columns.sort();
+            let source = session
+                .tables
+                .get(&normalize_name(table))
+                .map(|t| t.source.clone())
+                .unwrap_or_default();
+            let mut partitions = source.partitions;
+            if !filters.is_empty() {
+                partitions
+                    .retain(|p| !crate::store::hive_path_cannot_match(p, Some(filters.as_slice())));
+            }
+            partitions.sort();
+            out.push(InputScan {
+                dataset: table.clone(),
+                path: source.path.map(|p| p.display().to_string()),
+                partitions,
+                columns,
+                mtime_ms: source.mtime_ms,
+                etag: source.etag,
+            });
+        }
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. } => collect_scan_reports(input, session, out),
+        LogicalPlan::Join { left, right, .. } => {
+            collect_scan_reports(left, session, out);
+            collect_scan_reports(right, session, out);
+        }
+        LogicalPlan::Union { inputs, .. } => {
+            for input in inputs {
+                collect_scan_reports(input, session, out);
+            }
+        }
+        LogicalPlan::Empty { .. } => {}
+    }
 }
 
 fn collect_parquet_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {

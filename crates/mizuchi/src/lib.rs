@@ -23,7 +23,10 @@ pub mod write;
 
 pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
 pub use error::{Error, Result};
-pub use exec::{CancelToken, Engine, MicroBatchAgg, OperatorMetrics, Session, SessionConfig};
+pub use exec::{
+    CancelToken, Engine, InputScan, MicroBatchAgg, OperatorMetrics, OutputWrite, QueryReport,
+    QueryResult, Session, SessionConfig,
+};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use object_store::ObjectStore;
 pub use opt::{estimate_rows, optimize};
@@ -36,8 +39,11 @@ pub use read::{
 };
 pub use schema::{from_arrow_schema, is_supported_data_type, to_arrow_schema};
 pub use sql::parse_sql;
-pub use store::{read_parquet_store, write_parquet_store};
-pub use write::{ParquetWriteOptions, WriteMode, write_parquet, write_parquet_cancel};
+pub use store::{read_parquet_store, read_parquet_store_reported, write_parquet_store};
+pub use write::{
+    ParquetWriteOptions, WriteMode, WriteStats, write_parquet, write_parquet_cancel,
+    write_parquet_stats,
+};
 
 pub use arrow::array::{ArrayRef, RecordBatch};
 pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};

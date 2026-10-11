@@ -33,24 +33,43 @@ pub fn read_parquet_store(
     prefix: &str,
     opts: ParquetReadOptions<'_>,
 ) -> Result<Vec<Batch>> {
-    Ok(read_parquet_store_counted(store, prefix, opts)?.0)
+    Ok(read_parquet_store_reported(store, prefix, opts)?.0)
+}
+
+/// [`read_parquet_store`] plus the scan record (partitions actually fetched).
+pub fn read_parquet_store_reported(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    opts: ParquetReadOptions<'_>,
+) -> Result<(Vec<Batch>, crate::exec::InputScan)> {
+    let (batches, scan, _fetched) = read_parquet_store_counted(store, prefix, opts)?;
+    Ok((batches, scan))
 }
 
 fn read_parquet_store_counted(
     store: &dyn ObjectStore,
     prefix: &str,
     opts: ParquetReadOptions<'_>,
-) -> Result<(Vec<Batch>, usize)> {
+) -> Result<(Vec<Batch>, crate::exec::InputScan, usize)> {
     let root = object_path(prefix)?;
     let objects = list_parquet(store, &root)?;
     let mut kept = Vec::new();
+    let mut partitions = Vec::new();
     for loc in objects {
         let rel = relative_to(&loc, prefix);
         if hive_path_cannot_match(&rel, opts.filters) {
             continue;
         }
+        if let Some(parent) = std::path::Path::new(&rel).parent() {
+            let p = parent.to_string_lossy().replace('\\', "/");
+            if !p.is_empty() && p != "." {
+                partitions.push(p);
+            }
+        }
         kept.push(loc);
     }
+    partitions.sort();
+    partitions.dedup();
     let fetched = kept.len();
     let mut out = Vec::new();
     for loc in kept {
@@ -60,7 +79,27 @@ fn read_parquet_store_counted(
             .map_err(|e| Error::Io(format!("{loc}: {e}")))?;
         out.extend(read_parquet_from_builder(builder, &opts, loc.as_ref())?);
     }
-    Ok((out, fetched))
+    let mut columns: Vec<String> = opts.projection.map(|p| p.to_vec()).unwrap_or_else(|| {
+        out.first()
+            .map(|b| {
+                b.schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    columns.sort();
+    let scan = crate::exec::InputScan {
+        dataset: prefix.to_string(),
+        path: Some(prefix.to_string()),
+        partitions,
+        columns,
+        mtime_ms: None,
+        etag: None,
+    };
+    Ok((out, scan, fetched))
 }
 
 /// Write `batches` as Parquet objects under `prefix`. Staging objects are
@@ -288,7 +327,7 @@ fn relative_to(loc: &ObjectPath, prefix: &str) -> String {
 }
 
 /// True when Hive path segments prove `filters` cannot hold for this object.
-fn hive_path_cannot_match(rel: &str, filters: Option<&[Expr]>) -> bool {
+pub(crate) fn hive_path_cannot_match(rel: &str, filters: Option<&[Expr]>) -> bool {
     let Some(preds) = filters else {
         return false;
     };
@@ -458,7 +497,7 @@ mod tests {
             filters: Some(std::slice::from_ref(&pred)),
             ..ParquetReadOptions::default()
         };
-        let (out, fetched) = read_parquet_store_counted(&store, "ds", opts).unwrap();
+        let (out, _scan, fetched) = read_parquet_store_counted(&store, "ds", opts).unwrap();
         assert_eq!(ids(&out), vec![1, 2]);
         assert_eq!(fetched, 1, "year=2021 object must not be fetched");
     }
