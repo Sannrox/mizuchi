@@ -337,6 +337,10 @@ struct EquiSplit {
     residual: Option<Expr>,
 }
 
+pub(super) fn equi_key_pairs(pred: &Expr, left_ncols: usize) -> Result<Vec<(Expr, Expr)>> {
+    Ok(split_equi(pred, left_ncols)?.keys)
+}
+
 fn split_equi(pred: &Expr, left_ncols: usize) -> Result<EquiSplit> {
     let mut keys = Vec::new();
     let mut residuals = Vec::new();
