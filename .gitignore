@@ -1,4 +1,8 @@
 /target
+/python/target
+/python/dist
+/python/*.egg-info
+/python/.venv
 .state/
 /.worktrees/
 /bench-data/
