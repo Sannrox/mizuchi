@@ -41,3 +41,4 @@ All notable changes to this project are documented here.
 - Partitioned Parquet writer: Hive-style directories, append or overwrite, staging then rename so a failed or cancelled job leaves committed files unchanged. Part files round-trip through `read_parquet`.
 - Object-store datasets: the runner supplies an `ObjectStore`. Hive-style partition paths are pruned before fetch; Parquet footer stats prune row groups after. Default tests use in-memory storage. An ignored `s3` feature talks to a local emulator.
 - `EXPLAIN` prints logical and physical plans. `EXPLAIN ANALYZE` and `Session::query_metrics` add per-operator rows, batches, elapsed time, and peak pool bytes as text and JSON. Ordinary `execute_sql` does not wrap operators.
+- ADR 0007: crate-root re-exports are the public API. 0.y may break; after 1.0, deprecations last at least one minor. Tag `v*` dry-runs `cargo publish` and builds Linux/macOS/Windows wheels.
