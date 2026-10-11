@@ -31,6 +31,9 @@ pub struct SessionConfig {
     /// host the runner supplied. Default is false. An empty path allow-list
     /// does not grant network.
     pub allow_network: bool,
+    /// Query-start clock in microseconds since the Unix epoch. `CURRENT_DATE`
+    /// and `NOW()` bind to this instant. `None` uses the process clock.
+    pub now_micros: Option<i64>,
 }
 
 pub(super) fn resolve_roots(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
