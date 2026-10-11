@@ -79,6 +79,13 @@ fn collect_tables(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
                 collect_tables(input, out);
             }
         }
+        LogicalPlan::Recursive { anchors, step, .. } => {
+            for anchor in anchors {
+                collect_tables(anchor, out);
+            }
+            collect_tables(step, out);
+        }
+        LogicalPlan::WorkScan { .. } => {}
     }
 }
 

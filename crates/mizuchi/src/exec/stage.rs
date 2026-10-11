@@ -117,6 +117,16 @@ enum PhysicalPlan {
         fns: Vec<WindowCall>,
         schema: SchemaRef,
     },
+    Recursive {
+        name: String,
+        anchors: Vec<LogicalPlan>,
+        step: Box<LogicalPlan>,
+        schema: SchemaRef,
+    },
+    WorkScan {
+        name: String,
+        schema: SchemaRef,
+    },
     Exchange {
         input: Box<PhysicalPlan>,
         keys: Vec<Expr>,
@@ -141,6 +151,8 @@ impl PhysicalPlan {
             | Self::Join { schema, .. }
             | Self::Union { schema, .. }
             | Self::Window { schema, .. }
+            | Self::Recursive { schema, .. }
+            | Self::WorkScan { schema, .. }
             | Self::Exchange { schema, .. }
             | Self::ShuffleRead { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Sort { input, .. } | Self::Limit { input, .. } => {
@@ -159,7 +171,11 @@ impl PhysicalPlan {
             | Self::Limit { input, .. }
             | Self::Window { input, .. } => input.output_partitions(),
             Self::Join { left, .. } => left.output_partitions(),
-            Self::Empty { .. } | Self::Scan { .. } | Self::Union { .. } => 1,
+            Self::Empty { .. }
+            | Self::Scan { .. }
+            | Self::WorkScan { .. }
+            | Self::Union { .. }
+            | Self::Recursive { .. } => 1,
         }
     }
 }
@@ -180,6 +196,10 @@ fn from_logical(plan: &LogicalPlan) -> PhysicalPlan {
             schema: schema.clone(),
             projection: projection.clone(),
             filters: filters.clone(),
+        },
+        LogicalPlan::WorkScan { name, schema, .. } => PhysicalPlan::WorkScan {
+            name: name.clone(),
+            schema: schema.clone(),
         },
         LogicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
             input: Box::new(from_logical(input)),
@@ -249,6 +269,17 @@ fn from_logical(plan: &LogicalPlan) -> PhysicalPlan {
             order: order.clone(),
             frame: *frame,
             fns: fns.clone(),
+            schema: schema.clone(),
+        },
+        LogicalPlan::Recursive {
+            name,
+            anchors,
+            step,
+            schema,
+        } => PhysicalPlan::Recursive {
+            name: name.clone(),
+            anchors: anchors.clone(),
+            step: step.clone(),
             schema: schema.clone(),
         },
     }
@@ -549,6 +580,9 @@ fn explain_physical(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         PhysicalPlan::Scan { table, schema, .. } => {
             out.push_str(&format!("{pad}Scan {table} {}\n", schema));
         }
+        PhysicalPlan::WorkScan { name, schema } => {
+            out.push_str(&format!("{pad}WorkScan {name} {}\n", schema));
+        }
         PhysicalPlan::Filter { input, predicate } => {
             out.push_str(&format!(
                 "{pad}Filter {}\n",
@@ -586,6 +620,9 @@ fn explain_physical(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         PhysicalPlan::Window { input, schema, .. } => {
             out.push_str(&format!("{pad}Window {schema}\n"));
             explain_physical(input, indent + 1, out);
+        }
+        PhysicalPlan::Recursive { name, schema, .. } => {
+            out.push_str(&format!("{pad}Recursive {name} {schema}\n"));
         }
         PhysicalPlan::Limit { input, skip, fetch } => {
             out.push_str(&format!("{pad}Limit skip={skip} fetch={fetch:?}\n"));
@@ -1471,6 +1508,9 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
                 ctx.partitions,
             )?)
         }
+        PhysicalPlan::WorkScan { name, .. } => {
+            Err(Error::Plan(format!("working table {name} is not in scope")))
+        }
         PhysicalPlan::ShuffleRead {
             shuffle_id, schema, ..
         } => {
@@ -1562,6 +1602,23 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
             _ => lowering.limit(execute_physical(input, ctx)?, *skip, *fetch),
         },
         PhysicalPlan::Union { .. } => Err(Error::NotImplemented("physical union")),
+        PhysicalPlan::Recursive {
+            name,
+            anchors,
+            step,
+            schema,
+        } => {
+            let batches = super::recursive::run(
+                name,
+                anchors,
+                step.as_ref(),
+                schema,
+                &ctx.session,
+                ctx.pool.as_ref(),
+                false,
+            )?;
+            lowering.scan(batches)
+        }
         PhysicalPlan::Window {
             input,
             partition,

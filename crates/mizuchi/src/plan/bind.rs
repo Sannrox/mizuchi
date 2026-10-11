@@ -1,12 +1,12 @@
 //! Bind parsed SQL to a resolved [`LogicalPlan`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use sqlparser::ast::{
-    Array as SqlArray, Assignment, AssignmentTarget, BinaryOperator, CastKind, CeilFloorKind,
+    Array as SqlArray, Assignment, AssignmentTarget, BinaryOperator, CastKind, CeilFloorKind, Cte,
     DateTimeField, Distinct, DuplicateTreatment, Expr as SqlExpr, Function, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
     LimitClause, Merge as SqlMerge, MergeAction, MergeClauseKind, MergeInsertKind, MergeUpdateKind,
@@ -27,9 +27,14 @@ use crate::error::{Error, Result};
 use crate::expr::{BinaryOp, Expr, UnaryOp};
 use crate::udaf::CombineAgg;
 
+#[derive(Clone)]
 struct BindCtx<'a> {
     catalog: &'a Catalog,
     udafs: &'a BTreeMap<String, Arc<dyn CombineAgg>>,
+    /// Non-recursive CTE names inlined as plans later CTEs and the body can scan.
+    ctes: BTreeMap<String, LogicalPlan>,
+    /// Recursive working-table names visible only in the recursive step.
+    work: BTreeMap<String, SchemaRef>,
 }
 
 #[derive(Clone)]
@@ -102,7 +107,12 @@ pub fn plan_sql_with_udafs(
     udafs: &BTreeMap<String, Arc<dyn CombineAgg>>,
 ) -> Result<LogicalPlan> {
     let stmt = parse_statements(sql)?;
-    let ctx = BindCtx { catalog, udafs };
+    let ctx = BindCtx {
+        catalog,
+        udafs,
+        ctes: BTreeMap::new(),
+        work: BTreeMap::new(),
+    };
     match stmt {
         Statement::Query(query) => bind_query(&query, &ctx),
         other => Err(Error::NotImplemented(statement_kind(&other))),
@@ -254,6 +264,8 @@ fn bind_merge_stmt(merge: &SqlMerge, catalog: &Catalog) -> Result<MergePlan> {
     let ctx = BindCtx {
         catalog,
         udafs: &empty,
+        ctes: BTreeMap::new(),
+        work: BTreeMap::new(),
     };
     let source = bind_table_factor(&merge.source, &ctx)?;
     let source_schema = source.plan.schema().clone();
@@ -519,6 +531,22 @@ fn bind_merge_insert(
 }
 
 fn bind_query(query: &Query, ctx: &BindCtx<'_>) -> Result<LogicalPlan> {
+    if let Some(with) = &query.with {
+        let mut inner = ctx.clone();
+        let mut seen = BTreeSet::new();
+        for cte in &with.cte_tables {
+            let name = ident_key(&cte.alias.name);
+            if !seen.insert(name.clone()) {
+                return Err(Error::Plan(format!("duplicate CTE name {name}")));
+            }
+            bind_cte(&mut inner, cte, with.recursive)?;
+        }
+        return bind_query_body(query, &inner);
+    }
+    bind_query_body(query, ctx)
+}
+
+fn bind_query_body(query: &Query, ctx: &BindCtx<'_>) -> Result<LogicalPlan> {
     reject_query_extras(query)?;
     let mut plan = bind_set_expr(&query.body, ctx)?;
     if let Some(order_by) = &query.order_by {
@@ -530,10 +558,229 @@ fn bind_query(query: &Query, ctx: &BindCtx<'_>) -> Result<LogicalPlan> {
     Ok(plan)
 }
 
-fn reject_query_extras(query: &Query) -> Result<()> {
-    if query.with.is_some() {
-        return Err(Error::NotImplemented("WITH"));
+fn bind_cte(ctx: &mut BindCtx<'_>, cte: &Cte, recursive: bool) -> Result<()> {
+    if !cte.alias.columns.is_empty() {
+        return Err(Error::NotImplemented("column aliases on CTE"));
     }
+    if cte.from.is_some() {
+        return Err(Error::NotImplemented("CTE FROM"));
+    }
+    let name = ident_key(&cte.alias.name);
+    let plan = if recursive {
+        match split_recursive_union(&cte.query, &name)? {
+            Some((seeds, step)) => bind_recursive_cte(ctx, &name, &cte.query, seeds, step)?,
+            None => bind_query(&cte.query, ctx)?,
+        }
+    } else {
+        bind_query(&cte.query, ctx)?
+    };
+    ctx.ctes.insert(name, plan);
+    Ok(())
+}
+
+fn split_recursive_union<'a>(
+    query: &'a Query,
+    name: &str,
+) -> Result<Option<(Vec<&'a SetExpr>, &'a SetExpr)>> {
+    match unwrap_set(&query.body) {
+        SetExpr::SetOperation {
+            left,
+            op,
+            set_quantifier,
+            right,
+        } if *op == SetOperator::Union => match set_quantifier {
+            SetQuantifier::All => {
+                let step = unwrap_set(right);
+                if !set_expr_refs_name(step, name) {
+                    return Ok(None);
+                }
+                let seeds = flatten_union_all(left)?;
+                for seed in seeds.iter().skip(1) {
+                    if set_expr_refs_name(seed, name) {
+                        return Err(Error::Plan(
+                            "recursive reference in non-recursive term".into(),
+                        ));
+                    }
+                }
+                Ok(Some((seeds, step)))
+            }
+            _ if query_refs_name(query, name) => {
+                Err(Error::NotImplemented("recursive UNION DISTINCT"))
+            }
+            _ => Ok(None),
+        },
+        _ if query_refs_name(query, name) => {
+            Err(Error::NotImplemented("recursive CTE without UNION ALL"))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn flatten_union_all(expr: &SetExpr) -> Result<Vec<&SetExpr>> {
+    match unwrap_set(expr) {
+        SetExpr::SetOperation {
+            left,
+            op,
+            set_quantifier,
+            right,
+        } if *op == SetOperator::Union => match set_quantifier {
+            SetQuantifier::All => {
+                let mut terms = flatten_union_all(left)?;
+                terms.extend(flatten_union_all(right)?);
+                Ok(terms)
+            }
+            _ => Err(Error::NotImplemented("recursive UNION DISTINCT")),
+        },
+        other => Ok(vec![other]),
+    }
+}
+
+fn bind_recursive_cte(
+    ctx: &BindCtx<'_>,
+    name: &str,
+    query: &Query,
+    seeds: Vec<&SetExpr>,
+    step: &SetExpr,
+) -> Result<LogicalPlan> {
+    if query.with.is_some() {
+        return Err(Error::NotImplemented("WITH inside recursive CTE"));
+    }
+    if !ctx.work.is_empty() {
+        return Err(Error::NotImplemented("nested recursive CTE"));
+    }
+    reject_query_extras(query)?;
+    let mut anchors = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        anchors.push(bind_set_expr(seed, ctx)?);
+    }
+    let schema = anchors[0].schema().clone();
+    let mut aligned = Vec::with_capacity(anchors.len());
+    for plan in anchors {
+        aligned.push(align_schema(plan, &schema)?);
+    }
+    let mut step_ctx = ctx.clone();
+    step_ctx.ctes.remove(name);
+    step_ctx.work.insert(name.to_string(), schema.clone());
+    let step = align_schema(bind_set_expr(step, &step_ctx)?, &schema)?;
+    let mut plan = LogicalPlan::Recursive {
+        name: name.to_string(),
+        anchors: aligned,
+        step: Box::new(step),
+        schema,
+    };
+    if let Some(order_by) = &query.order_by {
+        plan = bind_order_by(plan, order_by)?;
+    }
+    if let Some(limit) = &query.limit_clause {
+        plan = bind_limit(plan, limit)?;
+    }
+    Ok(plan)
+}
+
+fn align_schema(plan: LogicalPlan, target: &SchemaRef) -> Result<LogicalPlan> {
+    let src = plan.schema();
+    if src.fields().len() != target.fields().len() {
+        return Err(Error::Plan("recursive CTE column count mismatch".into()));
+    }
+    for (a, b) in src.fields().iter().zip(target.fields()) {
+        if a.data_type() != b.data_type() {
+            return Err(Error::Plan(format!(
+                "recursive CTE type mismatch: {} vs {}",
+                a.data_type(),
+                b.data_type()
+            )));
+        }
+    }
+    let names_match = src
+        .fields()
+        .iter()
+        .zip(target.fields())
+        .all(|(a, b)| a.name() == b.name());
+    if names_match {
+        return Ok(plan);
+    }
+    let exprs = (0..target.fields().len())
+        .map(|i| NamedExpr {
+            expr: Expr::nth(i),
+            name: target.field(i).name().clone(),
+        })
+        .collect();
+    Ok(LogicalPlan::Project {
+        input: Box::new(plan),
+        exprs,
+        schema: target.clone(),
+    })
+}
+
+fn unwrap_set(expr: &SetExpr) -> &SetExpr {
+    match expr {
+        SetExpr::Query(q)
+            if q.with.is_none()
+                && q.order_by.is_none()
+                && q.limit_clause.is_none()
+                && q.fetch.is_none() =>
+        {
+            unwrap_set(&q.body)
+        }
+        other => other,
+    }
+}
+
+fn query_refs_name(query: &Query, name: &str) -> bool {
+    if let Some(with) = &query.with
+        && with
+            .cte_tables
+            .iter()
+            .any(|cte| query_refs_name(&cte.query, name))
+    {
+        return true;
+    }
+    set_expr_refs_name(&query.body, name)
+}
+
+fn set_expr_refs_name(expr: &SetExpr, name: &str) -> bool {
+    match expr {
+        SetExpr::Select(select) => select
+            .from
+            .iter()
+            .any(|twj| table_with_joins_refs(twj, name)),
+        SetExpr::Query(q) => query_refs_name(q, name),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_refs_name(left, name) || set_expr_refs_name(right, name)
+        }
+        _ => false,
+    }
+}
+
+fn table_with_joins_refs(twj: &TableWithJoins, name: &str) -> bool {
+    factor_refs(&twj.relation, name) || twj.joins.iter().any(|j| factor_refs(&j.relation, name))
+}
+
+fn factor_refs(factor: &TableFactor, name: &str) -> bool {
+    match factor {
+        TableFactor::Table { name: n, .. } => object_name(n)
+            .ok()
+            .is_some_and(|t| table_name_matches(&t, name)),
+        TableFactor::Derived { subquery, .. } => query_refs_name(subquery, name),
+        _ => false,
+    }
+}
+
+fn table_name_matches(resolved: &str, cte: &str) -> bool {
+    !resolved.contains('.') && resolved == cte
+}
+
+fn cte_from_factor_name(name: &ObjectName) -> Option<String> {
+    if name.0.len() != 1 {
+        return None;
+    }
+    match &name.0[0] {
+        ObjectNamePart::Identifier(id) => Some(ident_key(id)),
+        ObjectNamePart::Function(_) => None,
+    }
+}
+
+fn reject_query_extras(query: &Query) -> Result<()> {
     if query.fetch.is_some() {
         return Err(Error::NotImplemented("FETCH"));
     }
@@ -754,7 +1001,6 @@ fn bind_table_factor(factor: &TableFactor, ctx: &BindCtx<'_>) -> Result<BoundFro
             let table = object_name(name)?;
             let ident = TableIdent::parse(&table)?;
             let scan_name = ident.sql_name();
-            let schema = ctx.catalog.table(&scan_name)?.clone();
             let alias_name = alias.as_ref().map(|a| ident_key(&a.name));
             if let Some(alias) = alias
                 && !alias.columns.is_empty()
@@ -762,6 +1008,28 @@ fn bind_table_factor(factor: &TableFactor, ctx: &BindCtx<'_>) -> Result<BoundFro
                 return Err(Error::NotImplemented("column aliases on table"));
             }
             let qualifier = alias_name.clone().unwrap_or_else(|| ident.table.clone());
+            if let Some(cte_name) = cte_from_factor_name(name) {
+                if let Some(plan) = ctx.ctes.get(&cte_name) {
+                    let plan = plan.clone();
+                    let schema = plan.schema().clone();
+                    return Ok(BoundFrom {
+                        plan,
+                        scope: Scope::from_schema_udafs(Some(qualifier), schema, ctx.udafs.clone()),
+                    });
+                }
+                if let Some(schema) = ctx.work.get(&cte_name) {
+                    let schema = schema.clone();
+                    return Ok(BoundFrom {
+                        plan: LogicalPlan::WorkScan {
+                            name: cte_name,
+                            schema: schema.clone(),
+                            alias: alias_name,
+                        },
+                        scope: Scope::from_schema_udafs(Some(qualifier), schema, ctx.udafs.clone()),
+                    });
+                }
+            }
+            let schema = ctx.catalog.table(&scan_name)?.clone();
             Ok(BoundFrom {
                 plan: LogicalPlan::Scan {
                     table: scan_name.clone(),

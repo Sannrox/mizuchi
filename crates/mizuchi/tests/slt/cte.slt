@@ -1,18 +1,15 @@
-# Common table expressions. Binder rejects WITH, including WITH RECURSIVE.
+# Common table expressions, including WITH RECURSIVE.
 
-skipif mizuchi
 query I
 WITH c AS (SELECT 1 AS n) SELECT n FROM c
 ----
 1
 
-skipif mizuchi
 query I
 WITH c AS (SELECT 1 AS n), d AS (SELECT n + 1 AS n FROM c) SELECT n FROM d
 ----
 2
 
-skipif mizuchi
 query I
 WITH RECURSIVE c AS (
   SELECT 1 AS n

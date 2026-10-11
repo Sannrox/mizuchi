@@ -372,6 +372,28 @@ pub enum LogicalPlan {
         /// Output schema: input fields then window results.
         schema: SchemaRef,
     },
+    /// Recursive CTE: concatenate the seeds with successive evaluations of
+    /// `step` over a working table named `name` until the step is empty.
+    Recursive {
+        /// Working-table name the recursive step scans.
+        name: String,
+        /// Non-recursive UNION ALL seeds, in query order.
+        anchors: Vec<LogicalPlan>,
+        /// Recursive branch; [`WorkScan`] of `name` reads the previous iteration.
+        step: Box<LogicalPlan>,
+        /// Output schema, taken from the first seed.
+        schema: SchemaRef,
+    },
+    /// Previous iteration of a recursive CTE. Distinct from [`Scan`] so a
+    /// catalog table of the same name is not overlaid.
+    WorkScan {
+        /// Working-table name of the recursive CTE.
+        name: String,
+        /// Output schema, matching the recursive CTE.
+        schema: SchemaRef,
+        /// Optional alias used in name resolution.
+        alias: Option<String>,
+    },
 }
 
 impl LogicalPlan {
@@ -384,7 +406,9 @@ impl LogicalPlan {
             | Self::Aggregate { schema, .. }
             | Self::Join { schema, .. }
             | Self::Union { schema, .. }
-            | Self::Window { schema, .. } => schema,
+            | Self::Window { schema, .. }
+            | Self::Recursive { schema, .. }
+            | Self::WorkScan { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Sort { input, .. } | Self::Limit { input, .. } => {
                 input.schema()
             }
@@ -553,6 +577,31 @@ fn explain_into(plan: &LogicalPlan, indent: usize, out: &mut String) {
             ));
             explain_into(input, indent + 1, out);
         }
+        LogicalPlan::Recursive {
+            name,
+            anchors,
+            step,
+            schema,
+        } => {
+            out.push_str(&format!("{pad}Recursive {name} {}\n", fmt_schema(schema)));
+            for anchor in anchors {
+                explain_into(anchor, indent + 1, out);
+            }
+            explain_into(step, indent + 1, out);
+        }
+        LogicalPlan::WorkScan {
+            name,
+            schema,
+            alias,
+        } => match alias {
+            Some(alias) if alias != name => {
+                out.push_str(&format!(
+                    "{pad}WorkScan {name} AS {alias} {}\n",
+                    fmt_schema(schema)
+                ));
+            }
+            _ => out.push_str(&format!("{pad}WorkScan {name} {}\n", fmt_schema(schema))),
+        },
     }
 }
 
@@ -916,6 +965,49 @@ mod tests {
         assert!(window.contains("Window"), "{window}");
         assert!(window.contains("Project"), "{window}");
 
+        let cte = explain("WITH c AS (SELECT 1 AS n) SELECT n FROM c");
+        assert!(cte.contains("Project"), "{cte}");
+        assert!(cte.contains("Empty"), "{cte}");
+
+        let rec = plan_sql(
+            "WITH RECURSIVE c AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c",
+            &Catalog::new(),
+        )
+        .unwrap()
+        .explain();
+        assert!(rec.contains("Recursive c"), "{rec}");
+        assert!(rec.contains("WorkScan c"), "{rec}");
+
+        let err = plan_sql(
+            "WITH t AS (SELECT 1 AS n) SELECT n FROM sales.t",
+            &Catalog::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Plan(_)), "{err:?}");
+        let err = plan_sql(
+            "WITH t AS (SELECT 1 AS n) SELECT n FROM public.t",
+            &Catalog::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Plan(_)), "{err:?}");
+        let err = plan_sql(
+            "WITH RECURSIVE c AS (\
+             SELECT 1 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 3 \
+             UNION ALL SELECT n FROM c WHERE n < 0) SELECT n FROM c",
+            &Catalog::new(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("non-recursive term"), "{err}");
+        assert!(matches!(
+            plan_sql(
+                "WITH RECURSIVE c AS (\
+                 SELECT 1 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 3 \
+                 FETCH FIRST 1 ROWS ONLY) SELECT n FROM c",
+                &Catalog::new(),
+            ),
+            Err(Error::NotImplemented(_))
+        ));
+
         let having = explain("SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 1");
         assert!(having.contains("Filter"), "{having}");
         assert!(having.contains("Aggregate"), "{having}");
@@ -955,7 +1047,7 @@ mod tests {
             Err(Error::NotImplemented(_))
         ));
         assert!(matches!(
-            plan_sql("WITH c AS (SELECT 1) SELECT * FROM c", &Catalog::new()),
+            plan_sql("WITH c (n) AS (SELECT 1) SELECT * FROM c", &Catalog::new()),
             Err(Error::NotImplemented(_))
         ));
     }

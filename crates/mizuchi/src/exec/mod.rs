@@ -14,6 +14,7 @@ mod memory;
 mod merge;
 mod metrics;
 mod op;
+mod recursive;
 mod report;
 mod schedule;
 mod sort;
@@ -958,7 +959,7 @@ impl Session {
     pub fn query_metrics(&self, sql: &str) -> Result<OperatorMetrics> {
         let plan = self.bind_optimized(sql)?;
         let pool = self.memory_pool()?;
-        let (op, tree) = build_physical(&plan, self, &pool, true)?;
+        let (op, tree) = build_physical(&plan, self, &pool, true, None)?;
         let _ = collect(op, &self.cancel)?;
         Ok(tree.snapshot())
     }
@@ -979,7 +980,7 @@ impl Session {
     pub fn explain_analyze(&self, sql: &str) -> Result<String> {
         let plan = self.bind_optimized(sql)?;
         let pool = self.memory_pool()?;
-        let (op, tree) = build_physical(&plan, self, &pool, true)?;
+        let (op, tree) = build_physical(&plan, self, &pool, true, None)?;
         let _batches = collect(op, &self.cancel)?;
         let mut text = format!(
             "== Logical Plan ==\n{}== Physical Plan ==\n{}",
@@ -1203,7 +1204,13 @@ fn collect_scan_reports(plan: &LogicalPlan, session: &Session, out: &mut Vec<Inp
                 collect_scan_reports(input, session, out);
             }
         }
-        LogicalPlan::Empty { .. } => {}
+        LogicalPlan::Recursive { anchors, step, .. } => {
+            for anchor in anchors {
+                collect_scan_reports(anchor, session, out);
+            }
+            collect_scan_reports(step, session, out);
+        }
+        LogicalPlan::Empty { .. } | LogicalPlan::WorkScan { .. } => {}
     }
 }
 
@@ -1403,7 +1410,17 @@ pub(super) fn physical(
     session: &Session,
     pool: &memory::MemoryPool,
 ) -> Result<Box<dyn Operator>> {
-    Ok(build_physical(plan, session, pool, false)?.0)
+    Ok(build_physical(plan, session, pool, false, None)?.0)
+}
+
+pub(super) fn physical_with_work(
+    plan: &LogicalPlan,
+    session: &Session,
+    pool: &memory::MemoryPool,
+    analyze: bool,
+    work: Option<(&str, &[Batch])>,
+) -> Result<Box<dyn Operator>> {
+    Ok(build_physical(plan, session, pool, analyze, work)?.0)
 }
 
 fn build_physical(
@@ -1411,6 +1428,7 @@ fn build_physical(
     session: &Session,
     pool: &memory::MemoryPool,
     analyze: bool,
+    work: Option<(&str, &[Batch])>,
 ) -> Result<(Box<dyn Operator>, metrics::PhysNode)> {
     let lowering = session.lowering.0.as_ref();
     match plan {
@@ -1421,6 +1439,25 @@ fn build_physical(
             analyze,
             pool,
         )),
+        LogicalPlan::WorkScan { name, .. } => {
+            let batches = match work {
+                Some((wname, batches)) if wname == name.as_str() => batches,
+                _ => {
+                    return Err(Error::Plan(format!("working table {name} is not in scope")));
+                }
+            };
+            let mut morsels = Vec::new();
+            for batch in batches {
+                morsels.extend(batch.split_by_policy(&session.policy));
+            }
+            Ok(metrics::finish(
+                "WorkScan",
+                lowering.scan(morsels)?,
+                Vec::new(),
+                analyze,
+                pool,
+            ))
+        }
         LogicalPlan::Scan {
             table,
             projection,
@@ -1431,8 +1468,9 @@ fn build_physical(
                 .tables
                 .get(&normalize_name(table))
                 .ok_or_else(|| Error::Plan(format!("table not found at execution: {table}")))?;
+            let source: Vec<&Batch> = table.batches.iter().collect();
             let mut morsels = Vec::new();
-            for batch in &table.batches {
+            for batch in source {
                 let mut batch = batch.clone();
                 for pred in filters {
                     match filter_batch(&batch, pred)? {
@@ -1465,7 +1503,7 @@ fn build_physical(
             ))
         }
         LogicalPlan::Filter { input, predicate } => {
-            let (child, child_node) = build_physical(input, session, pool, analyze)?;
+            let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
             Ok(metrics::finish(
                 "Filter",
                 lowering.filter(child, predicate.clone())?,
@@ -1479,7 +1517,7 @@ fn build_physical(
             exprs,
             schema,
         } => {
-            let (child, child_node) = build_physical(input, session, pool, analyze)?;
+            let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
             Ok(metrics::finish(
                 "Project",
                 lowering.project(child, exprs.clone(), schema.clone())?,
@@ -1494,7 +1532,7 @@ fn build_physical(
             aggs,
             schema,
         } => {
-            let (child, child_node) = build_physical(input, session, pool, analyze)?;
+            let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
             let t0 = Instant::now();
             let batches = agg::run(
                 child,
@@ -1525,8 +1563,8 @@ fn build_physical(
             on,
             schema,
         } => {
-            let (left_op, left_node) = build_physical(left, session, pool, analyze)?;
-            let (right_op, right_node) = build_physical(right, session, pool, analyze)?;
+            let (left_op, left_node) = build_physical(left, session, pool, analyze, work)?;
+            let (right_op, right_node) = build_physical(right, session, pool, analyze, work)?;
             let t0 = Instant::now();
             let batches = join::run(
                 left_op,
@@ -1556,7 +1594,7 @@ fn build_physical(
             Ok((op, node))
         }
         LogicalPlan::Sort { input, order } => {
-            let (child, child_node) = build_physical(input, session, pool, analyze)?;
+            let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
             let t0 = Instant::now();
             let batches = sort::ordered(
                 child,
@@ -1586,7 +1624,7 @@ fn build_physical(
                 input: sorted,
                 order,
             } => {
-                let (child, child_node) = build_physical(sorted, session, pool, analyze)?;
+                let (child, child_node) = build_physical(sorted, session, pool, analyze, work)?;
                 let t0 = Instant::now();
                 let batches = sort::ordered(
                     child,
@@ -1612,7 +1650,7 @@ fn build_physical(
                 Ok((op, node))
             }
             _ => {
-                let (child, child_node) = build_physical(input, session, pool, analyze)?;
+                let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
                 Ok(metrics::finish(
                     "Limit",
                     lowering.limit(child, *skip, *fetch)?,
@@ -1623,6 +1661,30 @@ fn build_physical(
             }
         },
         LogicalPlan::Union { .. } => Err(Error::NotImplemented("physical union")),
+        LogicalPlan::Recursive {
+            name,
+            anchors,
+            step,
+            schema,
+        } => {
+            let t0 = Instant::now();
+            let batches = recursive::run(name, anchors, step, schema, session, pool, analyze)?;
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let mut children: Vec<metrics::PhysNode> =
+                anchors.iter().map(metrics::physical_shape).collect();
+            children.push(metrics::physical_shape(step));
+            let (op, node) = metrics::finish(
+                "Recursive",
+                lowering.scan(batches)?,
+                children,
+                analyze,
+                pool,
+            );
+            if analyze {
+                metrics::add_blocking(&node, ns, pool.peak());
+            }
+            Ok((op, node))
+        }
         LogicalPlan::Window {
             input,
             partition,
@@ -1631,7 +1693,7 @@ fn build_physical(
             fns,
             schema,
         } => {
-            let (child, child_node) = build_physical(input, session, pool, analyze)?;
+            let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
             let t0 = Instant::now();
             let batches = window::run(
                 child,
@@ -2372,6 +2434,122 @@ mod tests {
             .with_memory_limit(cap)
             .execute_sql("SELECT COUNT(*) OVER () AS c FROM t");
         assert!(matches!(err, Err(Error::Memory(_))), "{err:?}");
+    }
+
+    #[test]
+    fn cte_inline_and_chained() {
+        let out = Session::new()
+            .execute_sql("WITH c AS (SELECT 1 AS n) SELECT n FROM c")
+            .unwrap();
+        assert_eq!(col_i64(&out, "n"), vec![Some(1)]);
+        let out = Session::new()
+            .execute_sql(
+                "WITH c AS (SELECT 1 AS n), d AS (SELECT n + 1 AS n FROM c) SELECT n FROM d",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&out, "n"), vec![Some(2)]);
+    }
+
+    #[test]
+    fn recursive_cte_working_table() {
+        let out = Session::new()
+            .execute_sql(
+                "WITH RECURSIVE c AS (\
+                 SELECT 1 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 3\
+                 ) SELECT n FROM c",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&out, "n"), vec![Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn recursive_cte_iteration_limit() {
+        let err = Session::new().execute_sql(
+            "WITH RECURSIVE c AS (SELECT 1 AS n UNION ALL SELECT n FROM c) SELECT n FROM c",
+        );
+        assert!(matches!(err, Err(Error::Eval(_))), "{err:?}");
+        assert!(
+            err.unwrap_err().to_string().contains("iteration limit"),
+            "expected iteration limit"
+        );
+    }
+
+    #[test]
+    fn recursive_cte_fails_closed_without_spill() {
+        let (s, cap) = register_numbered(12, 32);
+        let err = s.with_memory_limit(cap).execute_sql(
+            "WITH RECURSIVE c AS (SELECT a FROM t UNION ALL SELECT a FROM c WHERE a < 0) SELECT a FROM c",
+        );
+        assert!(matches!(err, Err(Error::Memory(_))), "{err:?}");
+    }
+
+    #[test]
+    fn recursive_cte_seed_can_scan_same_named_table() {
+        let out = session()
+            .execute_sql(
+                "WITH RECURSIVE t AS (\
+                 SELECT a FROM t UNION ALL SELECT a FROM t WHERE a < 0\
+                 ) SELECT a FROM t",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2), Some(3), None]);
+    }
+
+    #[test]
+    fn recursive_cte_step_joins_qualified_base_table() {
+        let out = session()
+            .execute_sql(
+                "WITH RECURSIVE t AS (\
+                 SELECT a FROM t WHERE a = 1 UNION ALL \
+                 SELECT p.a FROM public.t p INNER JOIN t ON p.a = t.a + 1\
+                 ) SELECT a FROM t",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn nested_with_shadows_outer_cte() {
+        let out = Session::new()
+            .execute_sql(
+                "WITH c AS (SELECT 1 AS n) SELECT n FROM (WITH c AS (SELECT 2 AS n) SELECT n FROM c) s",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&out, "n"), vec![Some(2)]);
+    }
+
+    #[test]
+    fn nested_recursive_cte_shadows_outer_name() {
+        let out = Session::new()
+            .execute_sql(
+                "WITH c AS (SELECT 1 AS n) SELECT n FROM (\
+                 WITH RECURSIVE c AS (\
+                 SELECT 2 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 4\
+                 ) SELECT n FROM c) s",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&out, "n"), vec![Some(2), Some(3), Some(4)]);
+    }
+
+    #[test]
+    fn quoted_cte_name_round_trips() {
+        let out = Session::new()
+            .execute_sql(r#"WITH "C" AS (SELECT 1 AS n) SELECT n FROM "C""#)
+            .unwrap();
+        assert_eq!(col_i64(&out, "n"), vec![Some(1)]);
+    }
+
+    #[test]
+    fn recursive_cte_multiple_seeds() {
+        let out = Session::new()
+            .execute_sql(
+                "WITH RECURSIVE c AS (\
+                 SELECT 1 AS n UNION ALL SELECT 10 AS n UNION ALL \
+                 SELECT n + 1 FROM c WHERE n < 2\
+                 ) SELECT n FROM c",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&out, "n"), vec![Some(1), Some(10), Some(2)]);
     }
 
     #[test]
