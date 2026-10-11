@@ -14,6 +14,7 @@ use arrow::compute::{concat_batches, take};
 use arrow::datatypes::SchemaRef;
 
 use super::key::{Scalar, extract_key};
+use super::memory::{self, MemoryPool, batch_bytes};
 use super::{Exec, filter_batch};
 use crate::batch::{Batch, BatchPolicy};
 use crate::error::{Error, Result};
@@ -33,9 +34,215 @@ pub(super) fn run(
     mut right: Exec,
     spec: JoinSpec<'_>,
     policy: &BatchPolicy,
+    pool: &MemoryPool,
 ) -> Result<Vec<Batch>> {
-    let left_batch = concat_exec(&mut left, spec.left_schema)?;
-    let right_batch = concat_exec(&mut right, spec.right_schema)?;
+    let left_chunks = collect_chunks(&mut left, spec.left_schema.clone(), pool)?;
+    let right_chunks = collect_chunks(&mut right, spec.right_schema.clone(), pool)?;
+    let spilled = left_chunks.len() > 1 || right_chunks.len() > 1;
+    if spilled
+        && matches!(
+            spec.join_type,
+            JoinType::Left | JoinType::Right | JoinType::Full
+        )
+    {
+        return Err(Error::Memory("outer join exceeded the memory limit".into()));
+    }
+    if matches!(spec.join_type, JoinType::Semi | JoinType::Anti) {
+        return semi_anti_chunks(&left_chunks, &right_chunks, &spec, policy);
+    }
+    let mut parts = Vec::new();
+    for l in &left_chunks {
+        let l = load_chunk(l, spec.left_schema.clone())?;
+        for r in &right_chunks {
+            let r = load_chunk(r, spec.right_schema.clone())?;
+            parts.push(join_pair(&l, &r, &spec, policy)?);
+        }
+    }
+    Ok(parts
+        .into_iter()
+        .flatten()
+        .filter(|b| b.num_rows() > 0)
+        .collect())
+}
+
+enum Chunk {
+    Mem(Batch),
+    File(std::path::PathBuf),
+}
+
+fn load_chunk(chunk: &Chunk, schema: SchemaRef) -> Result<Batch> {
+    match chunk {
+        Chunk::Mem(b) => Ok(b.clone()),
+        Chunk::File(p) => {
+            let batches = memory::read_spill(p, schema.clone())?;
+            concat_chunk(&batches, schema)
+        }
+    }
+}
+
+fn collect_chunks(exec: &mut Exec, schema: SchemaRef, pool: &MemoryPool) -> Result<Vec<Chunk>> {
+    if !pool.has_limit() {
+        return Ok(vec![Chunk::Mem(concat_exec(exec, schema)?)]);
+    }
+    let mut out = Vec::new();
+    let mut cur: Vec<Batch> = Vec::new();
+    let mut held: Vec<super::memory::Reservation<'_>> = Vec::new();
+    while let Some(batch) = exec.next_batch()? {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let sz = batch_bytes(&batch);
+        match pool.try_reserve(sz) {
+            Ok(r) => {
+                cur.push(batch);
+                held.push(r);
+            }
+            Err(e) => {
+                if !pool.can_spill() {
+                    return Err(e);
+                }
+                if cur.is_empty() {
+                    return Err(Error::Memory(
+                        "a single join batch exceeds the memory limit".into(),
+                    ));
+                }
+                out.push(spill_chunk(&cur, schema.clone(), pool)?);
+                held.clear();
+                cur.clear();
+                let r = pool.try_reserve(sz).map_err(|_| {
+                    Error::Memory("a single join batch exceeds the memory limit".into())
+                })?;
+                cur.push(batch);
+                held.push(r);
+            }
+        }
+    }
+    if !cur.is_empty() {
+        if out.is_empty() {
+            out.push(Chunk::Mem(concat_chunk(&cur, schema)?));
+        } else {
+            out.push(spill_chunk(&cur, schema, pool)?);
+        }
+    } else if out.is_empty() {
+        out.push(Chunk::Mem(Batch::empty(schema)?));
+    }
+    Ok(out)
+}
+
+fn spill_chunk(cur: &[Batch], schema: SchemaRef, pool: &MemoryPool) -> Result<Chunk> {
+    let batch = concat_chunk(cur, schema.clone())?;
+    let path = pool.spill_path()?;
+    memory::write_spill(&path, schema, std::slice::from_ref(&batch))?;
+    Ok(Chunk::File(path))
+}
+
+fn concat_chunk(batches: &[Batch], schema: SchemaRef) -> Result<Batch> {
+    if batches.is_empty() {
+        return Batch::empty(schema);
+    }
+    let arrows: Vec<RecordBatch> = batches.iter().map(|b| b.as_arrow().clone()).collect();
+    let inner = concat_batches(&schema, &arrows).map_err(|e| Error::Eval(e.to_string()))?;
+    Batch::from_arrow(inner)
+}
+
+fn semi_anti_chunks(
+    left_chunks: &[Chunk],
+    right_chunks: &[Chunk],
+    spec: &JoinSpec<'_>,
+    policy: &BatchPolicy,
+) -> Result<Vec<Batch>> {
+    let keep_hit = spec.join_type == JoinType::Semi;
+    let mut parts = Vec::new();
+    for l in left_chunks {
+        let left = load_chunk(l, spec.left_schema.clone())?;
+        let mut hits = vec![false; left.num_rows()];
+        for r in right_chunks {
+            let right = load_chunk(r, spec.right_schema.clone())?;
+            or_left_hits(&left, &right, spec, &mut hits)?;
+        }
+        let indices: Vec<u32> = hits
+            .iter()
+            .enumerate()
+            .filter(|(_, hit)| **hit == keep_hit)
+            .map(|(i, _)| i as u32)
+            .collect();
+        let out = take_left(&left, &indices, spec.schema.clone())?;
+        parts.extend(
+            out.split_by_policy(policy)
+                .into_iter()
+                .filter(|b| b.num_rows() > 0),
+        );
+    }
+    Ok(parts)
+}
+
+fn or_left_hits(left: &Batch, right: &Batch, spec: &JoinSpec<'_>, hits: &mut [bool]) -> Result<()> {
+    let split = match spec.on {
+        Some(pred) => split_equi(pred, left.num_columns())?,
+        None => EquiSplit {
+            keys: Vec::new(),
+            residual: None,
+        },
+    };
+    if split.keys.is_empty() {
+        let cartesian = split.residual.is_none();
+        for (lrow, hit) in hits.iter_mut().enumerate() {
+            if *hit {
+                continue;
+            }
+            for rrow in 0..right.num_rows() {
+                if cartesian || residual_ok(left, right, lrow, rrow, split.residual.as_ref())? {
+                    *hit = true;
+                    break;
+                }
+            }
+        }
+        return Ok(());
+    }
+    let left_keys: Vec<ArrayRef> = split
+        .keys
+        .iter()
+        .map(|(l, _)| l.eval(left))
+        .collect::<Result<_>>()?;
+    let right_keys: Vec<ArrayRef> = split
+        .keys
+        .iter()
+        .map(|(_, r)| r.eval(right))
+        .collect::<Result<_>>()?;
+    let mut table: HashMap<Vec<Scalar>, Vec<u32>> = HashMap::new();
+    for row in 0..right.num_rows() {
+        let key = extract_key(&right_keys, row)?;
+        if key.contains(&Scalar::Null) {
+            continue;
+        }
+        table.entry(key).or_default().push(row as u32);
+    }
+    for (lrow, hit) in hits.iter_mut().enumerate() {
+        if *hit {
+            continue;
+        }
+        let key = extract_key(&left_keys, lrow)?;
+        if key.contains(&Scalar::Null) {
+            continue;
+        }
+        if let Some(rows) = table.get(&key) {
+            for &rrow in rows {
+                if residual_ok(left, right, lrow, rrow as usize, split.residual.as_ref())? {
+                    *hit = true;
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn join_pair(
+    left_batch: &Batch,
+    right_batch: &Batch,
+    spec: &JoinSpec<'_>,
+    policy: &BatchPolicy,
+) -> Result<Vec<Batch>> {
     let left_ncols = left_batch.num_columns();
     let split = match spec.on {
         Some(pred) => split_equi(pred, left_ncols)?,
@@ -46,20 +253,20 @@ pub(super) fn run(
     };
     let out = if split.keys.is_empty() {
         nested_loop(
-            &left_batch,
-            &right_batch,
+            left_batch,
+            right_batch,
             spec.join_type,
             split.residual.as_ref(),
-            spec.schema,
+            spec.schema.clone(),
         )?
     } else {
         hash_join(
-            &left_batch,
-            &right_batch,
+            left_batch,
+            right_batch,
             spec.join_type,
             &split.keys,
             split.residual.as_ref(),
-            spec.schema,
+            spec.schema.clone(),
         )?
     };
     Ok(out

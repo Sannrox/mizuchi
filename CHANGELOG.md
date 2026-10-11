@@ -22,3 +22,4 @@ All notable changes to this project are documented here.
 - Table and column statistics (row count, NDV, Int64 min/max) and cost-based inner-join reordering. Dynamic programming for up to 12 tables; greedy above that.
 - Stage planning: hash-partition exchanges at equi-joins and grouped aggregates, shuffle-map and result stages, and a single-process worker pool.
 - Shuffle blocks written as Arrow IPC files in a caller-provided directory; job subdirectories are removed when the query finishes.
+- Per-query memory pool with reservations. Sort, join, and aggregate spill Arrow IPC runs to a caller-provided directory and fail closed when the limit cannot be honoured.

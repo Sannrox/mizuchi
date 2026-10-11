@@ -686,6 +686,7 @@ struct TaskCtx {
     partition: usize,
     partitions: usize,
     shuffle: Arc<ShuffleStore>,
+    pool: Arc<super::memory::MemoryPool>,
 }
 
 pub(super) fn execute_staged(logical: &LogicalPlan, session: &Session) -> Result<Vec<Batch>> {
@@ -705,9 +706,13 @@ pub(super) fn execute_staged(logical: &LogicalPlan, session: &Session) -> Result
             dir: None,
         },
     };
+    let pool = Arc::new(super::memory::MemoryPool::new(
+        session.memory_limit,
+        session.spill_dir.clone(),
+    )?);
     let mut result = Vec::new();
     for stage in &stages {
-        let out = run_stage(stage, session, &job.store, workers)?;
+        let out = run_stage(stage, session, &job.store, workers, pool.clone())?;
         if stage.kind == StageKind::Result {
             result = out;
         }
@@ -720,6 +725,7 @@ fn run_stage(
     session: &Session,
     shuffle: &Arc<ShuffleStore>,
     workers: usize,
+    pool: Arc<super::memory::MemoryPool>,
 ) -> Result<Vec<Batch>> {
     let n = stage.partitions.max(1);
     let workers = workers.min(n).max(1);
@@ -731,6 +737,7 @@ fn run_stage(
         let session = session.clone();
         let plan = stage.plan.clone();
         let write = stage.write.clone();
+        let pool = pool.clone();
         handles.push(thread::spawn(move || -> Result<Vec<Batch>> {
             let mut local = Vec::new();
             loop {
@@ -748,6 +755,7 @@ fn run_stage(
                     partition: p,
                     partitions: n,
                     shuffle: shuffle.clone(),
+                    pool: pool.clone(),
                 };
                 let batches = collect(execute_physical(&plan, &ctx)?)?;
                 if let Some(write) = &write {
@@ -793,7 +801,7 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
                 filters: filters.clone(),
                 stats: None,
             };
-            let batches = collect(physical(&logical, &ctx.session)?)?;
+            let batches = collect(physical(&logical, &ctx.session, ctx.pool.as_ref())?)?;
             Ok(Exec::Scan {
                 batches: slice_partition(
                     batches,
@@ -832,7 +840,14 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
             schema,
         } => {
             let child = execute_physical(input, ctx)?;
-            let batches = super::agg::run(child, group, aggs, schema.clone(), &ctx.session.policy)?;
+            let batches = super::agg::run(
+                child,
+                group,
+                aggs,
+                schema.clone(),
+                &ctx.session.policy,
+                ctx.pool.as_ref(),
+            )?;
             Ok(Exec::Scan { batches, index: 0 })
         }
         PhysicalPlan::Join {
@@ -853,6 +868,7 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
                     schema: schema.clone(),
                 },
                 &ctx.session.policy,
+                ctx.pool.as_ref(),
             )?;
             Ok(Exec::Scan { batches, index: 0 })
         }
@@ -864,6 +880,7 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
                 0,
                 None,
                 &ctx.session.policy,
+                ctx.pool.as_ref(),
             )?;
             Ok(Exec::Scan { batches, index: 0 })
         }
@@ -879,6 +896,7 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Exec> {
                     *skip,
                     *fetch,
                     &ctx.session.policy,
+                    ctx.pool.as_ref(),
                 )?;
                 Ok(Exec::Scan { batches, index: 0 })
             }
