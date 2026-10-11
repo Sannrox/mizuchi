@@ -38,3 +38,4 @@ All notable changes to this project are documented here.
 - ADR 0006: GPU operators are a no-go for this phase. The default decision-support suite is too small for device copy to pay off; revisit when inputs are gigabyte-scale and a runner grants a device.
 - Gigabyte-scale decision-support baseline: SF1 and SF10 TPC-H/TPC-DS-style queries versus DuckDB and DataFusion on the same Snappy Parquet. Reproduce with `scripts/bench-gb.sh`; committed times and method in `docs/bench/`. Optional `workflow_dispatch` smoke at `--sf tiny`; default `cargo test` is unchanged.
 - Physical operators implement a pull `Operator` trait. `Session::with_lowering` selects an implementation per operator; CPU scan/filter/project/limit stay the default. Dispatch is once per batch.
+- Partitioned Parquet writer: Hive-style directories, append or overwrite, staging then rename so a failed or cancelled job leaves committed files unchanged. Part files round-trip through `read_parquet`.

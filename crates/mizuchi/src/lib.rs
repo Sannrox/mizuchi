@@ -13,6 +13,7 @@ pub mod plan;
 pub mod read;
 pub mod schema;
 pub mod sql;
+pub mod write;
 
 pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
 pub use error::Error;
@@ -28,6 +29,7 @@ pub use read::{
 };
 pub use schema::{from_arrow_schema, is_supported_data_type, to_arrow_schema};
 pub use sql::parse_sql;
+pub use write::{ParquetWriteOptions, WriteMode, write_parquet, write_parquet_cancel};
 
 pub use arrow::array::{ArrayRef, RecordBatch};
 pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
