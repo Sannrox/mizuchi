@@ -10,15 +10,18 @@ use sqlparser::ast::{
     DateTimeField, Distinct, DuplicateTreatment, Expr as SqlExpr, Function, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
     LimitClause, Merge as SqlMerge, MergeAction, MergeClauseKind, MergeInsertKind, MergeUpdateKind,
-    ObjectName, ObjectNamePart, Offset, OrderByKind, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
-    TableWithJoins, TrimWhereField, UnaryOperator, Value, WildcardAdditionalOptions,
+    NamedWindowDefinition, NamedWindowExpr, ObjectName, ObjectNamePart, Offset, OrderByExpr,
+    OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator,
+    SetQuantifier, Statement, TableFactor, TableWithJoins, TrimWhereField, UnaryOperator, Value,
+    WildcardAdditionalOptions, WindowFrame as SqlWindowFrame, WindowFrameBound, WindowFrameUnits,
+    WindowType,
 };
 
 use super::{
-    AggCall, AlterTable, Catalog, Ddl, JoinType, LogicalPlan, MergeActionPlan, MergeClausePlan,
-    MergeMatch, MergePlan, NamedExpr, SortExpr, TableIdent, expr_type, join_schema,
-    parse_statements, require_boolean, schema_from_fields,
+    AggCall, AlterTable, Catalog, Ddl, FrameBound, FrameUnits, JoinType, LogicalPlan,
+    MergeActionPlan, MergeClausePlan, MergeMatch, MergePlan, NamedExpr, SortExpr, TableIdent,
+    WindowCall, WindowFn, WindowFrame, expr_type, join_schema, parse_statements, require_boolean,
+    schema_from_fields,
 };
 use crate::error::{Error, Result};
 use crate::expr::{BinaryOp, Expr, UnaryOp};
@@ -636,7 +639,7 @@ fn bind_select(select: &Select, ctx: &BindCtx<'_>) -> Result<LogicalPlan> {
                 "HAVING requires GROUP BY or an aggregate".into(),
             ));
         }
-        plan = bind_project(plan, &scope, &select.projection)?;
+        plan = bind_project(plan, &scope, &select.projection, &select.named_window)?;
     }
     Ok(plan)
 }
@@ -656,9 +659,6 @@ fn reject_select_extras(select: &Select) -> Result<()> {
     }
     if !select.lateral_views.is_empty() {
         return Err(Error::NotImplemented("LATERAL VIEW"));
-    }
-    if !select.named_window.is_empty() {
-        return Err(Error::NotImplemented("WINDOW"));
     }
     if !select.cluster_by.is_empty()
         || !select.distribute_by.is_empty()
@@ -963,9 +963,6 @@ fn bind_aggregate(input: LogicalPlan, scope: &Scope, select: &Select) -> Result<
                 if let SqlExpr::Function(func) = expr
                     && let Some(kind) = classify_agg(func, &scope.udafs)
                 {
-                    if func.over.is_some() {
-                        return Err(Error::NotImplemented("window function"));
-                    }
                     let arg = agg_arg(func, scope)?;
                     let distinct = agg_distinct(func)?;
                     let call = make_agg(kind, arg, distinct)?;
@@ -1067,7 +1064,389 @@ fn agg_distinct(func: &Function) -> Result<bool> {
     }
 }
 
-fn bind_project(input: LogicalPlan, scope: &Scope, items: &[SelectItem]) -> Result<LogicalPlan> {
+fn bind_project(
+    input: LogicalPlan,
+    scope: &Scope,
+    items: &[SelectItem],
+    named: &[NamedWindowDefinition],
+) -> Result<LogicalPlan> {
+    if projection_has_window(items) {
+        return bind_window_project(input, scope, items, named);
+    }
+    if !named.is_empty() {
+        return Err(Error::Plan(
+            "WINDOW clause requires a window function".into(),
+        ));
+    }
+    bind_scalar_project(input, scope, items)
+}
+
+fn projection_has_window(items: &[SelectItem]) -> bool {
+    items.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+            as_window_func(e).is_some()
+        }
+        _ => false,
+    })
+}
+
+fn as_window_func(expr: &SqlExpr) -> Option<&Function> {
+    match expr {
+        SqlExpr::Function(func) if func.over.is_some() => Some(func),
+        SqlExpr::Nested(inner) => as_window_func(inner),
+        _ => None,
+    }
+}
+
+fn bind_window_project(
+    input: LogicalPlan,
+    scope: &Scope,
+    items: &[SelectItem],
+    named: &[NamedWindowDefinition],
+) -> Result<LogicalPlan> {
+    let names = bind_named_windows(named)?;
+    let mut fns = Vec::new();
+    let mut spec: Option<(Vec<Expr>, Vec<SortExpr>, WindowFrame)> = None;
+    for item in items {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => continue,
+        };
+        let Some(func) = as_window_func(expr) else {
+            continue;
+        };
+        let bound = bind_window_func(func, scope, &names)?;
+        let name = match item {
+            SelectItem::ExprWithAlias { alias, .. } => ident_key(alias),
+            _ => infer_sql_name(expr),
+        };
+        let this = (bound.partition, bound.order, bound.frame);
+        match &spec {
+            None => spec = Some(this),
+            Some(prev) => {
+                if !same_window_spec(prev, &this) {
+                    return Err(Error::NotImplemented("mixed window specifications"));
+                }
+            }
+        }
+        fns.push(WindowCall {
+            name,
+            func: bound.func,
+        });
+    }
+    if fns.is_empty() {
+        return Err(Error::Plan("window function required".into()));
+    }
+    let (partition, order, frame) =
+        spec.ok_or_else(|| Error::Plan("window function required".into()))?;
+    let mut fields: Vec<Field> = input
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    for call in &fns {
+        let dt = window_result_type(&call.func, input.schema())?;
+        fields.push(Field::new(&call.name, dt, true));
+    }
+    let window_schema = schema_from_fields(fields)?;
+    let window = LogicalPlan::Window {
+        input: Box::new(input),
+        partition,
+        order,
+        frame,
+        fns,
+        schema: window_schema.clone(),
+    };
+    let window_scope = Scope::from_schema_udafs(None, window_schema, scope.udafs.clone());
+    bind_window_output_project(window, scope, &window_scope, items)
+}
+
+fn same_window_spec(
+    a: &(Vec<Expr>, Vec<SortExpr>, WindowFrame),
+    b: &(Vec<Expr>, Vec<SortExpr>, WindowFrame),
+) -> bool {
+    a.2 == b.2
+        && a.0.len() == b.0.len()
+        && a.1.len() == b.1.len()
+        && a.0
+            .iter()
+            .zip(&b.0)
+            .all(|(l, r)| format!("{l:?}") == format!("{r:?}"))
+        && a.1.iter().zip(&b.1).all(|(l, r)| {
+            l.asc == r.asc
+                && l.nulls_first == r.nulls_first
+                && format!("{:?}", l.expr) == format!("{:?}", r.expr)
+        })
+}
+
+struct BoundWindow {
+    func: WindowFn,
+    partition: Vec<Expr>,
+    order: Vec<SortExpr>,
+    frame: WindowFrame,
+}
+
+fn bind_named_windows(
+    named: &[NamedWindowDefinition],
+) -> Result<BTreeMap<String, sqlparser::ast::WindowSpec>> {
+    let mut raw: BTreeMap<String, NamedWindowExpr> = BTreeMap::new();
+    for NamedWindowDefinition(id, expr) in named {
+        let name = ident_key(id);
+        if raw.insert(name.clone(), expr.clone()).is_some() {
+            return Err(Error::Plan(format!("duplicate window name {name}")));
+        }
+    }
+    let mut out = BTreeMap::new();
+    for name in raw.keys() {
+        out.insert(name.clone(), resolve_named_window(name, &raw, 0)?);
+    }
+    Ok(out)
+}
+
+fn resolve_named_window(
+    name: &str,
+    raw: &BTreeMap<String, NamedWindowExpr>,
+    depth: usize,
+) -> Result<sqlparser::ast::WindowSpec> {
+    if depth > 8 {
+        return Err(Error::Plan("WINDOW name cycle".into()));
+    }
+    match raw.get(name) {
+        Some(NamedWindowExpr::WindowSpec(spec)) => Ok(spec.clone()),
+        Some(NamedWindowExpr::NamedWindow(id)) => {
+            resolve_named_window(&ident_key(id), raw, depth + 1)
+        }
+        None => Err(Error::Plan(format!("unknown window name {name}"))),
+    }
+}
+
+fn bind_window_func(
+    func: &Function,
+    scope: &Scope,
+    named: &BTreeMap<String, sqlparser::ast::WindowSpec>,
+) -> Result<BoundWindow> {
+    if func.filter.is_some() {
+        return Err(Error::NotImplemented("FILTER on window function"));
+    }
+    if func.null_treatment.is_some() {
+        return Err(Error::NotImplemented("null treatment on window function"));
+    }
+    if !func.within_group.is_empty() {
+        return Err(Error::NotImplemented("WITHIN GROUP"));
+    }
+    let over = func
+        .over
+        .as_ref()
+        .ok_or_else(|| Error::Plan("window function requires OVER".into()))?;
+    let spec = match over {
+        WindowType::WindowSpec(spec) => spec.clone(),
+        WindowType::NamedWindow(id) => named
+            .get(&ident_key(id))
+            .cloned()
+            .ok_or_else(|| Error::Plan(format!("unknown window name {}", ident_key(id))))?,
+    };
+    if spec.window_name.is_some() {
+        return Err(Error::NotImplemented("inherited window name"));
+    }
+    let partition = spec
+        .partition_by
+        .iter()
+        .map(|e| bind_scalar(e, scope))
+        .collect::<Result<Vec<_>>>()?;
+    let order = bind_order_exprs(&spec.order_by, scope)?;
+    let frame = bind_frame(spec.window_frame.as_ref(), !order.is_empty())?;
+    let name = func_name(func).ok_or(Error::NotImplemented("function name"))?;
+    let wfn = match name.as_str() {
+        "row_number" => {
+            require_window_no_args(func, &name)?;
+            WindowFn::RowNumber
+        }
+        "rank" => {
+            require_window_no_args(func, &name)?;
+            WindowFn::Rank
+        }
+        "dense_rank" => {
+            require_window_no_args(func, &name)?;
+            WindowFn::DenseRank
+        }
+        "count" | "sum" => {
+            let kind = classify_window_agg(func, scope)?;
+            let arg = agg_arg(func, scope)?;
+            let distinct = agg_distinct(func)?;
+            WindowFn::Agg(make_agg(kind, arg, distinct)?)
+        }
+        _ => return Err(Error::NotImplemented("window function")),
+    };
+    Ok(BoundWindow {
+        func: wfn,
+        partition,
+        order,
+        frame,
+    })
+}
+
+fn require_window_no_args(func: &Function, name: &str) -> Result<()> {
+    match &func.args {
+        FunctionArguments::None => Ok(()),
+        FunctionArguments::List(list) if list.args.is_empty() => Ok(()),
+        _ => Err(Error::Plan(format!("{name} does not take arguments"))),
+    }
+}
+
+fn classify_window_agg(func: &Function, scope: &Scope) -> Result<AggKind> {
+    let name = func_name(func).ok_or(Error::NotImplemented("function name"))?;
+    Ok(match name.as_str() {
+        "count" => AggKind::Count,
+        "sum" => AggKind::Sum,
+        other => {
+            if let Some(agg) = scope.udafs.get(other) {
+                AggKind::User(agg.clone())
+            } else {
+                return Err(Error::NotImplemented("window function"));
+            }
+        }
+    })
+}
+
+fn bind_frame(frame: Option<&SqlWindowFrame>, ordered: bool) -> Result<WindowFrame> {
+    let Some(frame) = frame else {
+        return Ok(if ordered {
+            WindowFrame {
+                units: FrameUnits::Range,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::CurrentRow,
+            }
+        } else {
+            WindowFrame {
+                units: FrameUnits::Range,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::UnboundedFollowing,
+            }
+        });
+    };
+    let units = match frame.units {
+        WindowFrameUnits::Rows => FrameUnits::Rows,
+        WindowFrameUnits::Range => FrameUnits::Range,
+        WindowFrameUnits::Groups => return Err(Error::NotImplemented("GROUPS frame")),
+    };
+    Ok(WindowFrame {
+        units,
+        start: bind_frame_bound(&frame.start_bound)?,
+        end: match &frame.end_bound {
+            Some(b) => bind_frame_bound(b)?,
+            None => FrameBound::CurrentRow,
+        },
+    })
+}
+
+fn bind_frame_bound(bound: &WindowFrameBound) -> Result<FrameBound> {
+    match bound {
+        WindowFrameBound::CurrentRow => Ok(FrameBound::CurrentRow),
+        WindowFrameBound::Preceding(None) => Ok(FrameBound::UnboundedPreceding),
+        WindowFrameBound::Following(None) => Ok(FrameBound::UnboundedFollowing),
+        WindowFrameBound::Preceding(Some(_)) | WindowFrameBound::Following(Some(_)) => {
+            Err(Error::NotImplemented("offset window bound"))
+        }
+    }
+}
+
+fn window_result_type(func: &WindowFn, schema: &Schema) -> Result<DataType> {
+    match func {
+        WindowFn::RowNumber | WindowFn::Rank | WindowFn::DenseRank => Ok(DataType::Int64),
+        WindowFn::Agg(call) => {
+            let dt = call.result_type(schema)?;
+            if matches!(call, AggCall::Sum(_)) && !matches!(dt, DataType::Int32 | DataType::Int64) {
+                return Err(Error::NotImplemented("SUM window type"));
+            }
+            Ok(dt)
+        }
+    }
+}
+
+fn bind_window_output_project(
+    window: LogicalPlan,
+    input_scope: &Scope,
+    window_scope: &Scope,
+    items: &[SelectItem],
+) -> Result<LogicalPlan> {
+    let input_width = input_scope.schema.fields().len();
+    let mut exprs = Vec::new();
+    let mut window_i = 0usize;
+    for item in items {
+        match item {
+            SelectItem::Wildcard(opts) => {
+                reject_wildcard_opts(opts)?;
+                for col in &input_scope.columns {
+                    exprs.push(NamedExpr {
+                        expr: Expr::nth(col.index),
+                        name: col.name.clone(),
+                    });
+                }
+            }
+            SelectItem::QualifiedWildcard(kind, opts) => {
+                reject_wildcard_opts(opts)?;
+                let qualifier = match kind {
+                    SelectItemQualifiedWildcardKind::ObjectName(name) => object_name(name)?,
+                    SelectItemQualifiedWildcardKind::Expr(_) => {
+                        return Err(Error::NotImplemented("expression.*"));
+                    }
+                };
+                let mut found = false;
+                for col in &input_scope.columns {
+                    if col.qualifier.as_deref() == Some(qualifier.as_str()) {
+                        found = true;
+                        exprs.push(NamedExpr {
+                            expr: Expr::nth(col.index),
+                            name: col.name.clone(),
+                        });
+                    }
+                }
+                if !found {
+                    return Err(Error::Plan(format!("relation not found for {qualifier}.*")));
+                }
+            }
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                let name = match item {
+                    SelectItem::ExprWithAlias { alias, .. } => ident_key(alias),
+                    _ => infer_sql_name(expr),
+                };
+                if as_window_func(expr).is_some() {
+                    exprs.push(NamedExpr {
+                        expr: Expr::nth(input_width + window_i),
+                        name,
+                    });
+                    window_i += 1;
+                } else {
+                    exprs.push(NamedExpr {
+                        expr: bind_scalar(expr, input_scope)?,
+                        name,
+                    });
+                }
+            }
+            _ => return Err(Error::NotImplemented("select item")),
+        }
+    }
+    if exprs.is_empty() {
+        return Err(Error::Plan("empty projection".into()));
+    }
+    let mut fields = Vec::new();
+    for e in &exprs {
+        let dt = expr_type(&e.expr, window_scope.schema.as_ref())?;
+        fields.push(Field::new(&e.name, dt, true));
+    }
+    Ok(LogicalPlan::Project {
+        input: Box::new(window),
+        exprs,
+        schema: schema_from_fields(fields)?,
+    })
+}
+
+fn bind_scalar_project(
+    input: LogicalPlan,
+    scope: &Scope,
+    items: &[SelectItem],
+) -> Result<LogicalPlan> {
     let mut exprs = Vec::new();
     for item in items {
         match item {
@@ -1156,12 +1535,20 @@ fn bind_order_by(input: LogicalPlan, order_by: &sqlparser::ast::OrderBy) -> Resu
         OrderByKind::All(_) => return Err(Error::NotImplemented("ORDER BY ALL")),
     };
     let scope = Scope::from_schema(None, input.schema().clone());
+    let order = bind_order_exprs(exprs, &scope)?;
+    Ok(LogicalPlan::Sort {
+        input: Box::new(input),
+        order,
+    })
+}
+
+fn bind_order_exprs(exprs: &[OrderByExpr], scope: &Scope) -> Result<Vec<SortExpr>> {
     let mut order = Vec::new();
     for e in exprs {
         if e.with_fill.is_some() {
             return Err(Error::NotImplemented("WITH FILL"));
         }
-        let expr = bind_scalar(&e.expr, &scope)?;
+        let expr = bind_scalar(&e.expr, scope)?;
         let asc = match &e.options.sort {
             None | Some(sqlparser::ast::OrderBySort::Asc) => true,
             Some(sqlparser::ast::OrderBySort::Desc) => false,
@@ -1176,10 +1563,7 @@ fn bind_order_by(input: LogicalPlan, order_by: &sqlparser::ast::OrderBy) -> Resu
             nulls_first,
         });
     }
-    Ok(LogicalPlan::Sort {
-        input: Box::new(input),
-        order,
-    })
+    Ok(order)
 }
 
 fn bind_limit(input: LogicalPlan, limit: &LimitClause) -> Result<LogicalPlan> {

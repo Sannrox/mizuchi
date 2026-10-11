@@ -36,7 +36,9 @@ use super::{Operator, Session, collect, physical};
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::expr::Expr;
-use crate::plan::{AggCall, JoinType, LogicalPlan, NamedExpr, SortExpr, fmt_expr};
+use crate::plan::{
+    AggCall, JoinType, LogicalPlan, NamedExpr, SortExpr, WindowCall, WindowFrame, fmt_expr,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StageKind {
@@ -107,6 +109,14 @@ enum PhysicalPlan {
         schema: SchemaRef,
         all: bool,
     },
+    Window {
+        input: Box<PhysicalPlan>,
+        partition: Vec<Expr>,
+        order: Vec<SortExpr>,
+        frame: WindowFrame,
+        fns: Vec<WindowCall>,
+        schema: SchemaRef,
+    },
     Exchange {
         input: Box<PhysicalPlan>,
         keys: Vec<Expr>,
@@ -130,6 +140,7 @@ impl PhysicalPlan {
             | Self::Aggregate { schema, .. }
             | Self::Join { schema, .. }
             | Self::Union { schema, .. }
+            | Self::Window { schema, .. }
             | Self::Exchange { schema, .. }
             | Self::ShuffleRead { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Sort { input, .. } | Self::Limit { input, .. } => {
@@ -145,7 +156,8 @@ impl PhysicalPlan {
             | Self::Project { input, .. }
             | Self::Aggregate { input, .. }
             | Self::Sort { input, .. }
-            | Self::Limit { input, .. } => input.output_partitions(),
+            | Self::Limit { input, .. }
+            | Self::Window { input, .. } => input.output_partitions(),
             Self::Join { left, .. } => left.output_partitions(),
             Self::Empty { .. } | Self::Scan { .. } | Self::Union { .. } => 1,
         }
@@ -223,6 +235,21 @@ fn from_logical(plan: &LogicalPlan) -> PhysicalPlan {
             inputs: inputs.iter().map(from_logical).collect(),
             schema: schema.clone(),
             all: *all,
+        },
+        LogicalPlan::Window {
+            input,
+            partition,
+            order,
+            frame,
+            fns,
+            schema,
+        } => PhysicalPlan::Window {
+            input: Box::new(from_logical(input)),
+            partition: partition.clone(),
+            order: order.clone(),
+            frame: *frame,
+            fns: fns.clone(),
+            schema: schema.clone(),
         },
     }
 }
@@ -313,6 +340,29 @@ fn ensure_distribution(plan: PhysicalPlan, n: usize, next_id: &mut usize) -> Phy
             PhysicalPlan::Sort {
                 input: Box::new(input),
                 order,
+            }
+        }
+        PhysicalPlan::Window {
+            input,
+            partition,
+            order,
+            frame,
+            fns,
+            schema,
+        } => {
+            let input = ensure_distribution(*input, n, next_id);
+            let input = if input.output_partitions() == 1 {
+                input
+            } else {
+                exchange(input, Vec::new(), 1, next_id)
+            };
+            PhysicalPlan::Window {
+                input: Box::new(input),
+                partition,
+                order,
+                frame,
+                fns,
+                schema,
             }
         }
         PhysicalPlan::Limit { input, skip, fetch } => {
@@ -425,6 +475,21 @@ fn fragment(plan: PhysicalPlan, stages: &mut Vec<Stage>) -> PhysicalPlan {
             input: Box::new(fragment(*input, stages)),
             order,
         },
+        PhysicalPlan::Window {
+            input,
+            partition,
+            order,
+            frame,
+            fns,
+            schema,
+        } => PhysicalPlan::Window {
+            input: Box::new(fragment(*input, stages)),
+            partition,
+            order,
+            frame,
+            fns,
+            schema,
+        },
         PhysicalPlan::Limit { input, skip, fetch } => PhysicalPlan::Limit {
             input: Box::new(fragment(*input, stages)),
             skip,
@@ -516,6 +581,10 @@ fn explain_physical(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         }
         PhysicalPlan::Sort { input, .. } => {
             out.push_str(&format!("{pad}Sort\n"));
+            explain_physical(input, indent + 1, out);
+        }
+        PhysicalPlan::Window { input, schema, .. } => {
+            out.push_str(&format!("{pad}Window {schema}\n"));
             explain_physical(input, indent + 1, out);
         }
         PhysicalPlan::Limit { input, skip, fetch } => {
@@ -1040,7 +1109,8 @@ fn join_shuffle_reads(plan: &PhysicalPlan) -> Option<(usize, usize, usize, JoinT
         PhysicalPlan::Filter { input, .. }
         | PhysicalPlan::Project { input, .. }
         | PhysicalPlan::Sort { input, .. }
-        | PhysicalPlan::Limit { input, .. } => join_shuffle_reads(input),
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::Window { input, .. } => join_shuffle_reads(input),
         _ => None,
     }
 }
@@ -1492,6 +1562,29 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
             _ => lowering.limit(execute_physical(input, ctx)?, *skip, *fetch),
         },
         PhysicalPlan::Union { .. } => Err(Error::NotImplemented("physical union")),
+        PhysicalPlan::Window {
+            input,
+            partition,
+            order,
+            frame,
+            fns,
+            schema,
+        } => {
+            let child = execute_physical(input, ctx)?;
+            let batches = super::window::run(
+                child,
+                input.schema().clone(),
+                partition,
+                order,
+                *frame,
+                fns,
+                schema.clone(),
+                &ctx.session.policy,
+                ctx.pool.as_ref(),
+                &ctx.session.cancel,
+            )?;
+            lowering.scan(batches)
+        }
         PhysicalPlan::Exchange { .. } => {
             Err(Error::Plan("exchange survived stage fragmentation".into()))
         }

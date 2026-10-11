@@ -216,6 +216,59 @@ pub struct SortExpr {
     pub nulls_first: bool,
 }
 
+/// Window function evaluated after partitioning and ordering.
+#[derive(Clone, Debug)]
+pub enum WindowFn {
+    /// `ROW_NUMBER()`
+    RowNumber,
+    /// `RANK()`
+    Rank,
+    /// `DENSE_RANK()`
+    DenseRank,
+    /// Aggregate with `OVER`.
+    Agg(AggCall),
+}
+
+/// One window function in a [`LogicalPlan::Window`].
+#[derive(Clone, Debug)]
+pub struct WindowCall {
+    /// Output field name.
+    pub name: String,
+    /// Function.
+    pub func: WindowFn,
+}
+
+/// Frame units for a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameUnits {
+    /// Physical row offsets.
+    Rows,
+    /// Peer groups on the order keys.
+    Range,
+}
+
+/// One end of a window frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameBound {
+    /// Unbounded start of the partition.
+    UnboundedPreceding,
+    /// The current row (or peer group for RANGE).
+    CurrentRow,
+    /// Unbounded end of the partition.
+    UnboundedFollowing,
+}
+
+/// Frame of a window function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowFrame {
+    /// Rows vs range.
+    pub units: FrameUnits,
+    /// Inclusive start.
+    pub start: FrameBound,
+    /// Inclusive end.
+    pub end: FrameBound,
+}
+
 /// Resolved logical plan.
 #[derive(Clone, Debug)]
 pub enum LogicalPlan {
@@ -304,6 +357,21 @@ pub enum LogicalPlan {
         /// `true` for `UNION ALL`.
         all: bool,
     },
+    /// Window functions: input columns plus one column per function.
+    Window {
+        /// Child plan.
+        input: Box<LogicalPlan>,
+        /// Partition expressions; empty is one partition.
+        partition: Vec<Expr>,
+        /// Order keys within each partition.
+        order: Vec<SortExpr>,
+        /// Frame shared by every function in `fns`.
+        frame: WindowFrame,
+        /// Window functions, in output-column order after the input fields.
+        fns: Vec<WindowCall>,
+        /// Output schema: input fields then window results.
+        schema: SchemaRef,
+    },
 }
 
 impl LogicalPlan {
@@ -315,7 +383,8 @@ impl LogicalPlan {
             | Self::Project { schema, .. }
             | Self::Aggregate { schema, .. }
             | Self::Join { schema, .. }
-            | Self::Union { schema, .. } => schema,
+            | Self::Union { schema, .. }
+            | Self::Window { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Sort { input, .. } | Self::Limit { input, .. } => {
                 input.schema()
             }
@@ -456,6 +525,33 @@ fn explain_into(plan: &LogicalPlan, indent: usize, out: &mut String) {
             for input in inputs {
                 explain_into(input, indent + 1, out);
             }
+        }
+        LogicalPlan::Window {
+            input,
+            partition,
+            order,
+            fns,
+            ..
+        } => {
+            let p = partition
+                .iter()
+                .map(|e| fmt_expr(e, input.schema()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let o = order
+                .iter()
+                .map(|s| fmt_expr(&s.expr, input.schema()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let f = fns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "{pad}Window partition=[{p}] order=[{o}] fns=[{f}]\n"
+            ));
+            explain_into(input, indent + 1, out);
         }
     }
 }
@@ -816,6 +912,10 @@ mod tests {
         let union = explain("SELECT a FROM t UNION ALL SELECT a FROM t");
         assert!(union.contains("Union all"), "{union}");
 
+        let window = explain("SELECT ROW_NUMBER() OVER (ORDER BY a) FROM t");
+        assert!(window.contains("Window"), "{window}");
+        assert!(window.contains("Project"), "{window}");
+
         let having = explain("SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 1");
         assert!(having.contains("Filter"), "{having}");
         assert!(having.contains("Aggregate"), "{having}");
@@ -851,7 +951,7 @@ mod tests {
             Err(Error::NotImplemented(_))
         ));
         assert!(matches!(
-            plan_sql("SELECT COUNT(*) OVER () FROM t", &catalog()),
+            plan_sql("SELECT lag(a) OVER (ORDER BY a) FROM t", &catalog()),
             Err(Error::NotImplemented(_))
         ));
         assert!(matches!(

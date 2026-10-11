@@ -130,6 +130,7 @@ pub(super) fn physical_shape(plan: &LogicalPlan) -> PhysNode {
         LogicalPlan::Union { inputs, .. } => {
             node("Union", inputs.iter().map(physical_shape).collect())
         }
+        LogicalPlan::Window { input, .. } => node("Window", vec![physical_shape(input)]),
     }
 }
 

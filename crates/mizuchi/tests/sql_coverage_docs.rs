@@ -49,7 +49,7 @@ fn coverage_table_names_audited_families() {
 fn per_feature_slt_files_exist_with_skipif_gaps() {
     let slt = root().join("crates/mizuchi/tests/slt");
     for (name, must_skip) in [
-        ("window.slt", true),
+        ("window.slt", false),
         ("cte.slt", true),
         ("subquery.slt", true),
         ("setops.slt", true),

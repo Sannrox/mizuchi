@@ -44,9 +44,9 @@ pub fn estimate_rows(plan: &LogicalPlan) -> Option<f64> {
                 .unwrap_or(1.0 / 3.0);
             Some((rows * sel).max(1.0))
         }
-        LogicalPlan::Project { input, .. } | LogicalPlan::Sort { input, .. } => {
-            estimate_rows(input)
-        }
+        LogicalPlan::Project { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Window { input, .. } => estimate_rows(input),
         LogicalPlan::Limit { input, fetch, .. } => {
             let rows = estimate_rows(input)?;
             Some(match fetch {
@@ -267,6 +267,21 @@ fn map_children(
                 all,
             })
         }
+        LogicalPlan::Window {
+            input,
+            partition,
+            order,
+            frame,
+            fns,
+            schema,
+        } => Ok(LogicalPlan::Window {
+            input: Box::new(f(*input)?),
+            partition,
+            order,
+            frame,
+            fns,
+            schema,
+        }),
         leaf @ (LogicalPlan::Empty { .. } | LogicalPlan::Scan { .. }) => Ok(leaf),
     }
 }
@@ -322,6 +337,30 @@ fn fold_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
                     Ok(s)
                 })
                 .collect::<Result<Vec<_>>>()?,
+        },
+        LogicalPlan::Window {
+            input,
+            partition,
+            order,
+            frame,
+            fns,
+            schema,
+        } => LogicalPlan::Window {
+            input,
+            partition: partition
+                .into_iter()
+                .map(fold_expr)
+                .collect::<Result<Vec<_>>>()?,
+            order: order
+                .into_iter()
+                .map(|mut s| {
+                    s.expr = fold_expr(s.expr)?;
+                    Ok(s)
+                })
+                .collect::<Result<Vec<_>>>()?,
+            frame,
+            fns,
+            schema,
         },
         other => other,
     })
@@ -1286,7 +1325,8 @@ fn scan_stats(plan: &LogicalPlan) -> Option<&TableStats> {
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Limit { input, .. }
-        | LogicalPlan::Sort { input, .. } => scan_stats(input),
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Window { input, .. } => scan_stats(input),
         _ => None,
     }
 }
@@ -1318,6 +1358,13 @@ fn col_ndv(plan: &LogicalPlan, local: usize) -> Option<f64> {
             }
             _ => None,
         },
+        LogicalPlan::Window { input, .. } => {
+            if local < input.schema().fields().len() {
+                col_ndv(input, local)
+            } else {
+                None
+            }
+        }
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. } => col_ndv(input, local),
@@ -1895,6 +1942,15 @@ mod tests {
             "estimate {est} should track fact cardinality"
         );
         assert_idempotent(plan_sql(sql, &stats_catalog()).unwrap());
+    }
+
+    #[test]
+    fn window_result_column_does_not_panic_join_reorder() {
+        let sql = "SELECT f.id FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS n FROM fact) f \
+             JOIN d1 ON f.id = d1.id JOIN d0 ON f.n = d0.id";
+        let plan = optimize(plan_sql(sql, &stats_catalog()).unwrap()).unwrap();
+        let _ = estimate_rows(&plan);
+        assert!(plan.explain().contains("Window"), "{}", plan.explain());
     }
 
     #[test]

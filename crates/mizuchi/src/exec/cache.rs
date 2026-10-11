@@ -68,7 +68,8 @@ fn collect_tables(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Sort { input, .. }
-        | LogicalPlan::Limit { input, .. } => collect_tables(input, out),
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Window { input, .. } => collect_tables(input, out),
         LogicalPlan::Join { left, right, .. } => {
             collect_tables(left, out);
             collect_tables(right, out);
