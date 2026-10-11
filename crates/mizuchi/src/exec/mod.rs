@@ -4,6 +4,7 @@
 
 mod agg;
 mod engine;
+mod incremental;
 mod join;
 mod key;
 mod memory;
@@ -27,6 +28,7 @@ use crate::expr::Expr;
 use crate::plan::{Catalog, LogicalPlan, NamedExpr, normalize_name};
 
 pub use engine::Engine;
+pub use incremental::MicroBatchAgg;
 
 /// Cooperative cancellation flag. Operators check it between morsels.
 #[derive(Clone, Debug, Default)]
