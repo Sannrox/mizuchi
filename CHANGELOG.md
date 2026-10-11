@@ -40,3 +40,4 @@ All notable changes to this project are documented here.
 - Physical operators implement a pull `Operator` trait. `Session::with_lowering` selects an implementation per operator; CPU scan/filter/project/limit stay the default. Dispatch is once per batch.
 - Partitioned Parquet writer: Hive-style directories, append or overwrite, staging then rename so a failed or cancelled job leaves committed files unchanged. Part files round-trip through `read_parquet`.
 - Object-store datasets: the runner supplies an `ObjectStore`. Hive-style partition paths are pruned before fetch; Parquet footer stats prune row groups after. Default tests use in-memory storage. An ignored `s3` feature talks to a local emulator.
+- `EXPLAIN` prints logical and physical plans. `EXPLAIN ANALYZE` and `Session::query_metrics` add per-operator rows, batches, elapsed time, and peak pool bytes as text and JSON. Ordinary `execute_sql` does not wrap operators.

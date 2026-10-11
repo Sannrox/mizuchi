@@ -18,7 +18,7 @@ pub mod write;
 
 pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
 pub use error::Error;
-pub use exec::{CancelToken, Engine, MicroBatchAgg, Session};
+pub use exec::{CancelToken, Engine, MicroBatchAgg, OperatorMetrics, Session};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use object_store::ObjectStore;
 pub use opt::{estimate_rows, optimize};
