@@ -30,6 +30,7 @@ pub struct Session {
 struct MemTable {
     schema: SchemaRef,
     batches: Vec<Batch>,
+    stats: crate::plan::TableStats,
 }
 
 impl Session {
@@ -53,8 +54,15 @@ impl Session {
                 ));
             }
         }
-        self.tables
-            .insert(normalize_name(&name.into()), MemTable { schema, batches });
+        let stats = crate::plan::table_stats_from_batches(schema.as_ref(), &batches);
+        self.tables.insert(
+            normalize_name(&name.into()),
+            MemTable {
+                schema,
+                batches,
+                stats,
+            },
+        );
         Ok(())
     }
 
@@ -63,6 +71,7 @@ impl Session {
         let mut catalog = Catalog::new();
         for (name, table) in &self.tables {
             catalog.register(name, table.schema.clone())?;
+            catalog.set_stats(name, table.stats.clone())?;
         }
         let plan = crate::plan::plan_sql(sql, &catalog)?;
         let plan = crate::opt::optimize(plan)?;
@@ -622,6 +631,110 @@ mod tests {
             sorted_pairs(&out, "a", "id"),
             vec![(Some(2), Some(2)), (Some(2), Some(2))]
         );
+    }
+
+    #[test]
+    fn three_table_join_matches_after_reorder() {
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("amt", DataType::Int64, true),
+        ]));
+        let id_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let fact = Batch::try_new(
+            fact_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    (0..100).map(|i| Some(i % 10)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from((0..100).map(Some).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        let d0 = Batch::try_new(
+            id_schema.clone(),
+            vec![Arc::new(Int64Array::from(
+                (0..10).map(Some).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let d1 = Batch::try_new(
+            id_schema.clone(),
+            vec![Arc::new(Int64Array::from(
+                (0..100).map(Some).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("fact", fact_schema, vec![fact]).unwrap();
+        s.register("d0", id_schema.clone(), vec![d0]).unwrap();
+        s.register("d1", id_schema.clone(), vec![d1]).unwrap();
+        let out = s
+            .execute_sql(
+                "SELECT fact.amt FROM fact JOIN d1 ON fact.id = d1.id JOIN d0 ON d1.id = d0.id",
+            )
+            .unwrap();
+        let amts = col_i64(&out, "amt");
+        assert_eq!(amts.len(), 100);
+        assert_eq!(
+            amts.iter().map(|v| v.unwrap_or(0)).sum::<i64>(),
+            (0..100).sum()
+        );
+        let filtered = s
+            .execute_sql(
+                "SELECT fact.amt FROM fact JOIN d1 ON fact.id = d1.id AND d1.id > 5 JOIN d0 ON d1.id = d0.id",
+            )
+            .unwrap();
+        let famts = col_i64(&filtered, "amt");
+        assert_eq!(famts.len(), 40);
+        assert!(famts.iter().all(|v| v.unwrap() % 10 > 5));
+
+        let extra = Batch::try_new(
+            id_schema.clone(),
+            vec![Arc::new(Int64Array::from(
+                (0..10).map(Some).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        s.register("d2", id_schema, vec![extra]).unwrap();
+        let four = s
+            .execute_sql(
+                "SELECT fact.amt FROM fact JOIN d1 ON fact.id = d1.id JOIN d0 ON d1.id = d0.id JOIN d2 ON d0.id = d2.id",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&four, "amt").len(), 100);
+    }
+
+    #[test]
+    fn same_leaf_on_equality_rejects_nulls_after_reorder() {
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("flag", DataType::Int64, true),
+        ]));
+        let id_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let fact = Batch::try_new(
+            fact_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(0), Some(1), Some(2)])),
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(1)])),
+            ],
+        )
+        .unwrap();
+        let dim = Batch::try_new(
+            id_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(0), Some(1), Some(2)]))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("fact", fact_schema, vec![fact]).unwrap();
+        s.register("d0", id_schema.clone(), vec![dim.clone()])
+            .unwrap();
+        s.register("d1", id_schema, vec![dim]).unwrap();
+        let out = s
+            .execute_sql(
+                "SELECT fact.id FROM fact JOIN d1 ON fact.id = d1.id AND fact.flag = fact.flag JOIN d0 ON d1.id = d0.id ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&out, "id"), vec![Some(0), Some(2)]);
     }
 
     #[test]

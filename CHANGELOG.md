@@ -19,3 +19,4 @@ All notable changes to this project are documented here.
 - Parquet and CSV readers that yield Arrow batches. Parquet projection decodes only requested columns; row-group skip is a footer-stats hook. CSV can infer types or keep Utf8.
 - Rule-based optimizer: constant folding, boolean simplification, filter merge, limit pushdown through projection, and redundant projection removal.
 - Predicate and projection pushdown into scans and inner joins. Parquet readers skip row groups using footer min/max.
+- Table and column statistics (row count, NDV, Int64 min/max) and cost-based inner-join reordering. Dynamic programming for up to 12 tables; greedy above that.

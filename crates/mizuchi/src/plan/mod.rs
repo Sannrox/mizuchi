@@ -4,6 +4,7 @@
 //! produce a typed tree. Unsupported SQL fails closed.
 
 mod bind;
+mod stats;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -17,11 +18,13 @@ use crate::schema::from_arrow_schema;
 use crate::sql::parse_sql;
 
 pub use bind::plan_sql;
+pub use stats::{ColumnStats, TableStats, inner_equi_rows, table_stats_from_batches};
 
 /// Registered table schemas used to bind SQL.
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
     tables: BTreeMap<String, SchemaRef>,
+    stats: BTreeMap<String, TableStats>,
 }
 
 impl Catalog {
@@ -31,9 +34,22 @@ impl Catalog {
     }
 
     /// Register `name` with an Arrow schema. Names are matched case-insensitively.
+    /// Replacing a name drops any previously attached statistics.
     pub fn register(&mut self, name: impl Into<String>, schema: SchemaRef) -> Result<()> {
         let schema = from_arrow_schema(schema)?;
-        self.tables.insert(normalize_name(&name.into()), schema);
+        let name = normalize_name(&name.into());
+        self.stats.remove(&name);
+        self.tables.insert(name, schema);
+        Ok(())
+    }
+
+    /// Attach table statistics used by cost-based rewrites.
+    pub fn set_stats(&mut self, name: impl Into<String>, stats: TableStats) -> Result<()> {
+        let name = normalize_name(&name.into());
+        if !self.tables.contains_key(&name) {
+            return Err(Error::Plan(format!("table not found: {name}")));
+        }
+        self.stats.insert(name, stats);
         Ok(())
     }
 
@@ -42,6 +58,11 @@ impl Catalog {
         self.tables
             .get(&normalize_name(name))
             .ok_or_else(|| Error::Plan(format!("table not found: {name}")))
+    }
+
+    /// Look up table statistics, if registered.
+    pub fn stats(&self, name: &str) -> Option<&TableStats> {
+        self.stats.get(&normalize_name(name))
     }
 }
 
@@ -166,6 +187,8 @@ pub enum LogicalPlan {
         projection: Option<Vec<String>>,
         /// Predicates pushed into the scan, evaluated on the table schema.
         filters: Vec<Expr>,
+        /// Table statistics from the catalog, if known.
+        stats: Option<TableStats>,
     },
     /// Filter rows by a boolean predicate.
     Filter {
@@ -270,6 +293,7 @@ fn explain_into(plan: &LogicalPlan, indent: usize, out: &mut String) {
             alias,
             projection,
             filters,
+            stats,
         } => {
             let mut extra = String::new();
             if let Some(names) = projection {
@@ -282,6 +306,9 @@ fn explain_into(plan: &LogicalPlan, indent: usize, out: &mut String) {
                     .collect::<Vec<_>>()
                     .join(", ");
                 extra.push_str(&format!(" filters=[{preds}]"));
+            }
+            if let Some(stats) = stats {
+                extra.push_str(&format!(" rowcount={}", stats.row_count));
             }
             match alias {
                 Some(alias) if alias != table => {
@@ -634,6 +661,24 @@ mod tests {
 
     fn explain(sql: &str) -> String {
         plan_sql(sql, &catalog()).unwrap().explain()
+    }
+
+    #[test]
+    fn register_clears_previous_stats() {
+        let mut c = Catalog::new();
+        c.register("t", schema(&[("a", DataType::Int64)])).unwrap();
+        c.set_stats(
+            "t",
+            TableStats {
+                row_count: 7,
+                columns: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(c.stats("t").map(|s| s.row_count), Some(7));
+        c.register("t", schema(&[("b", DataType::Int64)])).unwrap();
+        assert!(c.stats("t").is_none());
+        assert_eq!(c.table("t").unwrap().field(0).name(), "b");
     }
 
     #[test]
