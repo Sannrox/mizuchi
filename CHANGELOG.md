@@ -32,3 +32,4 @@ All notable changes to this project are documented here.
 - Engine owner shares: reserved memory and worker slices so concurrent owners cannot starve each other.
 - Stage tasks retry after a worker failure and reuse committed shuffle files. Partial writes from a failed attempt are discarded.
 - Adaptive skew handling: after shuffle-map, oversized join partitions are split by grouping map outputs and the matching other-side partition is replicated. `EXPLAIN ANALYZE` via `Session::explain_analyze` reports the splits.
+- Python scalar and aggregate UDFs over Arrow arrays, plus zero-copy interchange through the Arrow C Data Interface (`register_arrow` / `to_arrow`).

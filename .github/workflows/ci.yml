@@ -82,7 +82,10 @@ jobs:
           maturin build --release --locked -o dist
           python -m pip install dist/*.whl
       - name: Run examples
-        run: python python/examples/lazy_df.py
+        run: |
+          python -m pip install pyarrow
+          python python/examples/lazy_df.py
+          python python/examples/udf_arrow.py
 
   fuzz:
     name: Fuzz

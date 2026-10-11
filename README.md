@@ -57,6 +57,9 @@ Python (optional, not part of the default Cargo workspace):
 pip install maturin
 cd python && maturin develop
 python examples/lazy_df.py
+# UDFs and Arrow C Data Interface (optional extra):
+pip install pyarrow
+python examples/udf_arrow.py
 ```
 
 Fuzz (nightly, not part of the default Cargo workspace):
