@@ -1,0 +1,65 @@
+# Kubernetes layout for a coordinator and worker replicas.
+# The engine never opens network on its own; the runner grants CPU, memory,
+# and a spill volume per pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mizuchi-coordinator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mizuchi-coordinator
+  template:
+    metadata:
+      labels:
+        app: mizuchi-coordinator
+    spec:
+      containers:
+        - name: coordinator
+          image: mizuchi:local
+          args: ["coordinator"]
+          env:
+            - name: MIZUCHI_WORKERS
+              value: "2"
+            - name: MIZUCHI_MEMORY_PER_WORKER
+              value: "33554432"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          volumeMounts:
+            - name: spill
+              mountPath: /spill
+      volumes:
+        - name: spill
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mizuchi-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mizuchi-worker
+  template:
+    metadata:
+      labels:
+        app: mizuchi-worker
+    spec:
+      containers:
+        - name: worker
+          image: mizuchi:local
+          args: ["worker"]
+          resources:
+            limits:
+              cpu: "1"
+              memory: 128Mi
+          volumeMounts:
+            - name: spill
+              mountPath: /spill
+      volumes:
+        - name: spill
+          emptyDir: {}

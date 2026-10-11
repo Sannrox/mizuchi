@@ -1,0 +1,25 @@
+name: Cluster multi-worker
+
+# Optional job. Never on pull requests. Default cargo test stays single-process.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  multi-worker:
+    name: Multi-worker decision-support
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Cluster contract
+        run: cargo test --locked --test cluster
+      - name: Decision-support on two workers
+        run: cargo test --locked --test cluster -- --ignored --test-threads=1

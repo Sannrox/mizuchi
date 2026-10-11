@@ -1,0 +1,22 @@
+# Standalone layout. The engine does not bind ports; the runner supplies
+# process grants (CPU, memory, spill) that Cluster honors.
+services:
+  coordinator:
+    image: mizuchi:local
+    command: ["coordinator"]
+    environment:
+      MIZUCHI_WORKERS: "2"
+      MIZUCHI_MEMORY_PER_WORKER: "33554432"
+    volumes:
+      - spill:/spill
+  worker:
+    image: mizuchi:local
+    command: ["worker"]
+    environment:
+      MIZUCHI_SPILL: /spill
+    volumes:
+      - spill:/spill
+    deploy:
+      replicas: 2
+volumes:
+  spill:
