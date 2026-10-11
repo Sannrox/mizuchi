@@ -1,0 +1,52 @@
+# Subqueries. Uncorrelated FROM (derived table) executes. IN, EXISTS, scalar,
+# correlated, and LATERAL fail closed.
+
+statement ok
+CREATE TABLE t (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z'), (NULL, 'n')
+
+query I
+SELECT a FROM (SELECT a FROM t) s WHERE a IS NOT NULL
+----
+1
+2
+3
+
+skipif mizuchi
+query I
+SELECT a FROM t WHERE a IN (1, 2)
+----
+1
+2
+
+skipif mizuchi
+query I
+SELECT a FROM t WHERE a IN (SELECT a FROM t)
+----
+1
+2
+3
+
+skipif mizuchi
+query I
+SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t u WHERE u.a = t.a)
+----
+1
+2
+3
+
+skipif mizuchi
+query I
+SELECT (SELECT a FROM t WHERE a = 1)
+----
+1
+
+skipif mizuchi
+query I
+SELECT a FROM t, LATERAL (SELECT a AS x) s WHERE t.a = s.x
+----
+1
+2
+3

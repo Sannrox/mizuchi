@@ -1,0 +1,44 @@
+# DATE, TIMESTAMP, and INTERVAL. Schema accepts those Arrow types; SQL casts
+# and functions fail closed.
+
+skipif mizuchi
+query T
+SELECT CAST('2020-01-01' AS DATE)
+----
+2020-01-01
+
+skipif mizuchi
+query T
+SELECT CAST('2020-01-01 00:00:00' AS TIMESTAMP)
+----
+2020-01-01 00:00:00
+
+skipif mizuchi
+query T
+SELECT INTERVAL '1' DAY
+----
+1 day
+
+skipif mizuchi
+query I
+SELECT EXTRACT(YEAR FROM DATE '2020-01-01')
+----
+2020
+
+skipif mizuchi
+query T
+SELECT DATE_TRUNC('day', TIMESTAMP '2020-01-02 15:04:05')
+----
+2020-01-02 00:00:00
+
+skipif mizuchi
+query T
+SELECT CURRENT_DATE
+----
+2020-01-01
+
+skipif mizuchi
+query T
+SELECT NOW()
+----
+2020-01-01 00:00:00

@@ -1,0 +1,55 @@
+# Window functions. Binder rejects OVER and named WINDOW (NotImplemented).
+
+statement ok
+CREATE TABLE t (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z')
+
+skipif mizuchi
+query I
+SELECT ROW_NUMBER() OVER (ORDER BY a) FROM t
+----
+1
+2
+3
+
+skipif mizuchi
+query I
+SELECT RANK() OVER (ORDER BY a) FROM t
+----
+1
+2
+3
+
+skipif mizuchi
+query I
+SELECT DENSE_RANK() OVER (ORDER BY a) FROM t
+----
+1
+2
+3
+
+skipif mizuchi
+query I
+SELECT COUNT(*) OVER () FROM t
+----
+3
+3
+3
+
+skipif mizuchi
+query I
+SELECT SUM(a) OVER (PARTITION BY b ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t
+----
+1
+2
+3
+
+skipif mizuchi
+query I
+SELECT ROW_NUMBER() OVER w FROM t WINDOW w AS (ORDER BY a)
+----
+1
+2
+3

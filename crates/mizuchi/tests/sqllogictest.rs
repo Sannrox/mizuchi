@@ -1,6 +1,7 @@
 //! SQLLogicTest runner for the adopted corpus under `tests/slt`.
 //!
-//! Known gaps live in `gaps.slt` behind `skipif mizuchi`.
+//! Coverage of window, CTE, subquery, set, DECIMAL, and date/time SQL is
+//! recorded in `docs/sql-coverage.md`. Gaps live behind `skipif mizuchi`.
 
 use std::collections::BTreeMap;
 use std::fs;
