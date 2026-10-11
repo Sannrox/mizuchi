@@ -21,12 +21,16 @@ pub struct ColumnStats {
 }
 
 /// Table-level statistics attached to a catalog entry and its scans.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableStats {
     /// Number of rows.
     pub row_count: u64,
     /// Per-column summaries keyed by field name.
     pub columns: BTreeMap<String, ColumnStats>,
+    /// Hive-style partition column names, in directory order.
+    pub partition_columns: Vec<String>,
+    /// Known partition directories (`col=value` paths) used for pruning.
+    pub partitions: Vec<String>,
 }
 
 /// Build exact in-memory stats from `batches` that match `schema`.
@@ -47,7 +51,11 @@ pub fn table_stats_from_batches(schema: &Schema, batches: &[Batch]) -> TableStat
         };
         columns.insert(name.to_string(), stats);
     }
-    TableStats { row_count, columns }
+    TableStats {
+        row_count,
+        columns,
+        ..TableStats::default()
+    }
 }
 
 fn nulls(batches: &[Batch], name: &str) -> u64 {

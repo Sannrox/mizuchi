@@ -1838,6 +1838,7 @@ mod tests {
         TableStats {
             row_count: rows,
             columns,
+            ..TableStats::default()
         }
     }
 
@@ -1966,6 +1967,7 @@ mod tests {
         let stats = TableStats {
             row_count: 2,
             columns,
+            ..TableStats::default()
         };
         let scan = LogicalPlan::Scan {
             table: "t".into(),
