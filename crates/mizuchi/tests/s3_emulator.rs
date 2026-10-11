@@ -33,8 +33,13 @@ fn s3_ci_job_runs_emulator_and_fails_if_skipped() {
         "S3 job must fail when ignored tests are absent"
     );
     assert!(
-        yml.to_ascii_lowercase().contains("minio"),
-        "S3 job must start a MinIO emulator"
+        yml.contains("scripts/start-s3-emulator.sh"),
+        "S3 job must start the emulator via scripts/start-s3-emulator.sh"
+    );
+    let bootstrap = read("scripts/start-s3-emulator.sh");
+    assert!(
+        bootstrap.contains("alpine/minio"),
+        "emulator bootstrap must pull a public MinIO image"
     );
     assert!(
         yml.contains("pull_request"),
@@ -87,6 +92,8 @@ mod emulator {
             .with_bucket_name(bucket)
             .with_access_key_id(key)
             .with_secret_access_key(secret)
+            .with_region("us-east-1")
+            .with_virtual_hosted_style_request(false)
             .with_allow_http(true)
             .with_http_connector(SpawnedReqwestConnector::new(handle))
             .build()
