@@ -27,15 +27,20 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use arrow::array::{Array, BooleanArray, RecordBatch, RecordBatchOptions, RecordBatchReader};
+use arrow::array::{
+    Array, BooleanArray, RecordBatch, RecordBatchOptions, RecordBatchReader, StringArray,
+};
 use arrow::compute::filter_record_batch;
 use arrow::compute::kernels::boolean::{and, is_not_null};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::batch::{Batch, BatchPolicy};
 use crate::error::{Error, Result};
 use crate::expr::Expr;
-use crate::plan::{Catalog, LogicalPlan, NamedExpr, normalize_name};
+use crate::plan::{
+    AlterTable, Catalog, CatalogProvider, Ddl, LogicalPlan, NamedExpr, TableIdent, apply_alter,
+    bind_ddl, normalize_name,
+};
 
 pub use cluster::{Cluster, ClusterConfig, WorkerResources};
 pub use config::SessionConfig;
@@ -82,6 +87,7 @@ impl CancelToken {
 #[derive(Debug)]
 pub struct Session {
     tables: BTreeMap<String, MemTable>,
+    catalog: Catalog,
     policy: BatchPolicy,
     /// Parallel morsel workers. Default 1 keeps the pull iterator path.
     workers: usize,
@@ -113,6 +119,7 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             tables: BTreeMap::new(),
+            catalog: Catalog::new(),
             policy: BatchPolicy::default(),
             workers: 1,
             shuffle_dir: None,
@@ -136,6 +143,7 @@ impl Clone for Session {
     fn clone(&self) -> Self {
         Self {
             tables: self.tables.clone(),
+            catalog: self.catalog.clone(),
             policy: self.policy,
             workers: self.workers,
             shuffle_dir: self.shuffle_dir.clone(),
@@ -294,14 +302,22 @@ impl Session {
                 ));
             }
         }
-        let stats = crate::plan::table_stats_from_batches(schema.as_ref(), &batches);
+        let mut stats = crate::plan::table_stats_from_batches(schema.as_ref(), &batches);
         let name = normalize_name(&name.into());
+        if stats.partitions.is_empty()
+            && let Some(existing) = self.catalog.stats(&name)
+        {
+            stats.partition_columns = existing.partition_columns.clone();
+            stats.partitions = existing.partitions.clone();
+        }
         let generation = self
             .tables
             .get(&name)
             .map(|t| t.generation.saturating_add(1))
             .unwrap_or(1);
         self.invalidate_cache(&name);
+        self.catalog.register(name.clone(), schema.clone())?;
+        self.catalog.set_stats(name.clone(), stats.clone())?;
         self.tables.insert(
             name,
             MemTable {
@@ -313,6 +329,133 @@ impl Session {
             },
         );
         Ok(())
+    }
+
+    /// Replace the session catalog (memory or file-backed). Catalog tables
+    /// with no session data become empty scans so `SELECT` binds and runs.
+    pub fn with_catalog(mut self, catalog: Catalog) -> Self {
+        self.catalog = catalog;
+        self.sync_empty_catalog_tables();
+        self
+    }
+
+    fn sync_empty_catalog_tables(&mut self) {
+        let namespaces = self.catalog.list_namespaces();
+        for ns in namespaces {
+            let raw = if ns.catalog == crate::plan::DEFAULT_CATALOG {
+                ns.namespace.clone()
+            } else {
+                format!("{}.{}", ns.catalog, ns.namespace)
+            };
+            let Ok(names) = self.catalog.list_tables(Some(&raw)) else {
+                continue;
+            };
+            for table in names {
+                let Ok(ident) = TableIdent::from_parts(&ns.catalog, &ns.namespace, &table) else {
+                    continue;
+                };
+                let name = ident.sql_name();
+                if self.tables.contains_key(&name) {
+                    continue;
+                }
+                let Ok(schema) = self.catalog.table(&name).cloned() else {
+                    continue;
+                };
+                let stats = self.catalog.stats(&name).cloned().unwrap_or_default();
+                self.tables.insert(
+                    name,
+                    MemTable {
+                        schema,
+                        batches: Vec::new(),
+                        stats,
+                        generation: 1,
+                        source: TableSource::default(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Live catalog used for name resolution and DDL.
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    /// Record Hive partition directories used by scan reports.
+    pub fn set_partitions(
+        &mut self,
+        name: impl Into<String>,
+        columns: Vec<String>,
+        partitions: Vec<String>,
+    ) -> Result<()> {
+        let name = normalize_name(&name.into());
+        self.catalog
+            .set_partitions(&name, columns.clone(), partitions.clone())?;
+        if let Some(table) = self.tables.get_mut(&name) {
+            table.stats.partition_columns = columns;
+            table.stats.partitions = partitions;
+        }
+        Ok(())
+    }
+
+    /// `CREATE` / `DROP` / `ALTER TABLE`.
+    pub fn execute_ddl(&mut self, sql: &str) -> Result<()> {
+        self.cancel.check()?;
+        match bind_ddl(sql)? {
+            Ddl::CreateTable {
+                ident,
+                schema,
+                if_not_exists,
+            } => {
+                if self.catalog.table(&ident.sql_name()).is_ok() {
+                    if if_not_exists {
+                        return Ok(());
+                    }
+                    return Err(Error::Plan(format!(
+                        "table already exists: {}",
+                        ident.sql_name()
+                    )));
+                }
+                self.catalog.create_table(crate::plan::TableMeta {
+                    ident: ident.clone(),
+                    schema: schema.clone(),
+                    stats: crate::plan::TableStats::default(),
+                })?;
+                self.register(ident.sql_name(), schema, Vec::new())
+            }
+            Ddl::DropTable { ident, if_exists } => {
+                let name = ident.sql_name();
+                self.catalog.drop_table(name.clone(), if_exists)?;
+                self.tables.remove(&normalize_name(&name));
+                self.invalidate_cache(&name);
+                Ok(())
+            }
+            Ddl::AlterTable { ident, action } => {
+                let name = ident.sql_name();
+                let current = self.catalog.table(&name)?.clone();
+                let next = apply_alter(current.as_ref(), &action)?;
+                self.catalog.alter_table(&ident, next.clone())?;
+                if let Some(table) = self.tables.get_mut(&normalize_name(&name)) {
+                    let kept_cols = table.stats.partition_columns.clone();
+                    let kept_parts = table.stats.partitions.clone();
+                    table.batches = reshape_batches(&table.batches, next.clone(), &action)?;
+                    table.schema = next.clone();
+                    table.stats =
+                        crate::plan::table_stats_from_batches(next.as_ref(), &table.batches);
+                    table.stats.partition_columns = kept_cols;
+                    table.stats.partitions = kept_parts;
+                    table.generation = table.generation.saturating_add(1);
+                }
+                self.invalidate_cache(&name);
+                Ok(())
+            }
+            Ddl::ShowTables { .. } => Err(Error::Plan("SHOW TABLES is a query".into())),
+        }
+    }
+
+    /// `SHOW TABLES` as a two-column batch (`namespace`, `table_name`).
+    pub fn show_tables(&self, namespace: Option<&str>) -> Result<Vec<Batch>> {
+        show_tables_batches(&self.catalog, namespace)
     }
 
     /// Register a Parquet file or dataset directory as an in-memory table
@@ -716,6 +859,9 @@ impl Session {
     /// Plan and run `sql` against registered tables.
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<Batch>> {
         self.cancel.check()?;
+        if let Ok(Ddl::ShowTables { namespace }) = bind_ddl(sql) {
+            return self.show_tables(namespace.as_deref());
+        }
         if let Some((analyze, inner)) = explain_sql(sql)? {
             let text = if analyze {
                 self.explain_analyze(&inner)?
@@ -731,6 +877,13 @@ impl Session {
     /// [`Self::execute_sql`] plus a [`QueryReport`].
     pub fn execute_sql_reported(&self, sql: &str) -> Result<QueryResult> {
         self.cancel.check()?;
+        if let Ok(Ddl::ShowTables { namespace }) = bind_ddl(sql) {
+            let batches = self.show_tables(namespace.as_deref())?;
+            return Ok(QueryResult {
+                batches,
+                report: QueryReport::new("SHOW TABLES".into(), Vec::new()),
+            });
+        }
         if let Some((analyze, inner)) = explain_sql(sql)? {
             let text = if analyze {
                 self.explain_analyze(&inner)?
@@ -835,10 +988,18 @@ impl Session {
     }
 
     fn bind_optimized(&self, sql: &str) -> Result<LogicalPlan> {
-        let mut catalog = Catalog::new();
+        let mut catalog = self.catalog.planning_copy();
         for (name, table) in &self.tables {
-            catalog.register(name, table.schema.clone())?;
-            catalog.set_stats(name, table.stats.clone())?;
+            if catalog.table(name).is_err() {
+                catalog.register(name, table.schema.clone())?;
+            }
+            let mut stats = table.stats.clone();
+            if stats.partitions.is_empty()
+                && let Ok(parts) = catalog.partitions(name)
+            {
+                stats.partitions = parts;
+            }
+            catalog.set_stats(name, stats)?;
         }
         let plan = crate::plan::plan_sql(sql, &catalog)?;
         crate::opt::optimize(plan)
@@ -935,6 +1096,38 @@ fn table_source_from_files(root: &Path, files: &[PathBuf]) -> TableSource {
     }
 }
 
+fn reshape_batches(batches: &[Batch], next: SchemaRef, action: &AlterTable) -> Result<Vec<Batch>> {
+    match action {
+        AlterTable::AddColumn { data_type, .. } => batches
+            .iter()
+            .map(|batch| {
+                let mut cols = batch.as_arrow().columns().to_vec();
+                cols.push(arrow::array::new_null_array(data_type, batch.num_rows()));
+                Batch::try_new(next.clone(), cols)
+            })
+            .collect(),
+        AlterTable::RenameColumn { .. } => batches
+            .iter()
+            .map(|batch| Batch::try_new(next.clone(), batch.as_arrow().columns().to_vec()))
+            .collect(),
+    }
+}
+
+fn show_tables_batches(catalog: &Catalog, namespace: Option<&str>) -> Result<Vec<Batch>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("namespace", DataType::Utf8, false),
+        Field::new("table_name", DataType::Utf8, false),
+    ]));
+    let ns_label = namespace.unwrap_or(crate::plan::DEFAULT_NAMESPACE);
+    let names = catalog.list_tables(namespace)?;
+    let ns_col = StringArray::from(vec![ns_label.to_string(); names.len()]);
+    let name_col = StringArray::from(names);
+    Ok(vec![Batch::try_new(
+        schema,
+        vec![Arc::new(ns_col), Arc::new(name_col)],
+    )?])
+}
+
 fn collect_scan_reports(plan: &LogicalPlan, session: &Session, out: &mut Vec<InputScan>) {
     match plan {
         LogicalPlan::Scan {
@@ -955,9 +1148,13 @@ fn collect_scan_reports(plan: &LogicalPlan, session: &Session, out: &mut Vec<Inp
                 .map(|t| t.source.clone())
                 .unwrap_or_default();
             let mut partitions = source.partitions;
+            if partitions.is_empty()
+                && let Ok(parts) = session.catalog.partitions(table)
+            {
+                partitions = parts;
+            }
             if !filters.is_empty() {
-                partitions
-                    .retain(|p| !crate::store::hive_path_cannot_match(p, Some(filters.as_slice())));
+                partitions = crate::store::prune_partitions(&partitions, filters);
             }
             partitions.sort();
             out.push(InputScan {
@@ -2718,5 +2915,141 @@ mod tests {
         let out = session.execute_sql("SELECT a FROM t").unwrap();
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 0, "custom scan lowering must run instead of CPU scan");
+    }
+
+    #[test]
+    fn execute_ddl_and_show_tables() {
+        let mut s = Session::new();
+        s.execute_ddl("CREATE TABLE items (id BIGINT, note TEXT)")
+            .unwrap();
+        s.execute_ddl("ALTER TABLE items ADD COLUMN year BIGINT")
+            .unwrap();
+        assert_eq!(s.catalog().table("items").unwrap().fields().len(), 3);
+        let shown = s.execute_sql("SHOW TABLES").unwrap();
+        assert_eq!(col_utf8(&shown, "table_name"), vec![Some("items".into())]);
+        assert_eq!(col_utf8(&shown, "namespace"), vec![Some("public".into())]);
+        s.execute_ddl("DROP TABLE items").unwrap();
+        assert!(s.catalog().table("items").is_err());
+        s.execute_ddl("DROP TABLE IF EXISTS items").unwrap();
+    }
+
+    #[test]
+    fn three_part_names_query_and_show() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(1), Some(2)]))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("lake.sales.orders", schema, vec![batch])
+            .unwrap();
+        let out = s.execute_sql("SELECT id FROM lake.sales.orders").unwrap();
+        assert_eq!(col_i64(&out, "id"), vec![Some(1), Some(2)]);
+        let shown = s.execute_sql("SHOW TABLES FROM lake.sales").unwrap();
+        assert_eq!(col_utf8(&shown, "table_name"), vec![Some("orders".into())]);
+        assert_eq!(
+            col_utf8(&shown, "namespace"),
+            vec![Some("lake.sales".into())]
+        );
+    }
+
+    #[test]
+    fn alter_table_rewrites_batches_and_invalidates_cache() {
+        let mut s = session();
+        let before = s.execute_sql("SELECT a FROM t").unwrap();
+        assert_eq!(col_i64(&before, "a"), vec![Some(1), Some(2), Some(3), None]);
+        s.execute_ddl("ALTER TABLE t ADD COLUMN note TEXT").unwrap();
+        let notes = s.execute_sql("SELECT note FROM t").unwrap();
+        assert_eq!(col_utf8(&notes, "note"), vec![None, None, None, None]);
+        s.execute_ddl("ALTER TABLE t RENAME COLUMN a TO ident")
+            .unwrap();
+        let renamed = s.execute_sql("SELECT ident FROM t").unwrap();
+        assert_eq!(
+            col_i64(&renamed, "ident"),
+            vec![Some(1), Some(2), Some(3), None]
+        );
+    }
+
+    #[test]
+    fn file_catalog_select_does_not_rewrite_sidecar() {
+        let dir =
+            std::env::temp_dir().join(format!("mizuchi-catalog-select-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(1)]))],
+        )
+        .unwrap();
+        let mut cat = Catalog::open_file(&dir).unwrap();
+        cat.register("t", schema.clone()).unwrap();
+        let mut s = Session::new().with_catalog(cat);
+        s.register("t", schema, vec![batch]).unwrap();
+        let json = dir.join("mizuchi").join("public").join("t.json");
+        let before = std::fs::read(&json).unwrap();
+        let out = s.execute_sql("SELECT id FROM t").unwrap();
+        assert_eq!(col_i64(&out, "id"), vec![Some(1)]);
+        let after = std::fs::read(&json).unwrap();
+        assert_eq!(before, after);
+        let empty = Session::new().with_catalog(Catalog::open_file(&dir).unwrap());
+        let rows: usize = empty
+            .execute_sql("SELECT id FROM t")
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn three_part_qualified_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(9)]))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("lake.sales.orders", schema, vec![batch])
+            .unwrap();
+        let out = s
+            .execute_sql("SELECT orders.id FROM lake.sales.orders")
+            .unwrap();
+        assert_eq!(col_i64(&out, "id"), vec![Some(9)]);
+    }
+
+    #[test]
+    fn catalog_partitions_drive_report_pruning() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("year", DataType::Int64, true),
+        ]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), Some(2)])),
+                Arc::new(Int64Array::from(vec![Some(2020), Some(2021)])),
+            ],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("sales", schema, vec![batch]).unwrap();
+        s.set_partitions(
+            "sales",
+            vec!["year".into()],
+            vec!["year=2020".into(), "year=2021".into()],
+        )
+        .unwrap();
+        let result = s
+            .execute_sql_reported("SELECT id FROM sales WHERE year = 2020")
+            .unwrap();
+        assert_eq!(
+            result.report.inputs[0].partitions,
+            vec!["year=2020".to_string()]
+        );
+        assert_eq!(col_i64(&result.batches, "id"), vec![Some(1)]);
     }
 }

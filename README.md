@@ -56,6 +56,10 @@ reads a past version. `Session::merge_sql` runs `MERGE INTO`.
 `Session::stream_query` opens a continuous micro-batch query
 (`StreamQuery`) with event-time watermarks, windows, and a
 checkpointed Parquet sink (ADR 0009).
+`Catalog` resolves `catalog.namespace.table` (default `mizuchi.public`),
+optionally from a directory of JSON + Arrow schema files
+(`Catalog::open_file`). `Session::execute_ddl` runs `CREATE` / `DROP` /
+`ALTER TABLE`; `SHOW TABLES` lists a namespace (ADR 0010).
 `mizuchi::VERSION` and `Session::explain` are the strings a runner
 records. A complete walk-through is `cargo run -p mizuchi --example embed`.
 The engine opens TCP only when `SessionConfig.allow_network` is set

@@ -13,9 +13,9 @@ use sqlparser::ast::{
 };
 
 use super::{
-    AggCall, Catalog, JoinType, LogicalPlan, MergeActionPlan, MergeClausePlan, MergeMatch,
-    MergePlan, NamedExpr, SortExpr, expr_type, join_schema, parse_statements, require_boolean,
-    schema_from_fields,
+    AggCall, AlterTable, Catalog, Ddl, JoinType, LogicalPlan, MergeActionPlan, MergeClausePlan,
+    MergeMatch, MergePlan, NamedExpr, SortExpr, TableIdent, expr_type, join_schema,
+    parse_statements, require_boolean, schema_from_fields,
 };
 use crate::error::{Error, Result};
 use crate::expr::{BinaryOp, Expr, UnaryOp};
@@ -74,7 +74,103 @@ fn statement_kind(stmt: &Statement) -> &'static str {
         Statement::Insert(_) => "INSERT",
         Statement::Merge(_) => "MERGE",
         Statement::Query(_) => "query",
+        Statement::CreateTable(_) => "CREATE TABLE",
+        Statement::Drop { .. } => "DROP",
+        Statement::AlterTable(_) => "ALTER TABLE",
+        Statement::ShowTables { .. } => "SHOW TABLES",
         _ => "statement",
+    }
+}
+
+/// Bind `CREATE` / `DROP` / `ALTER TABLE` / `SHOW TABLES`.
+pub fn bind_ddl(sql: &str) -> Result<Ddl> {
+    let stmt = parse_statements(sql)?;
+    bind_ddl_stmt(&stmt)
+}
+
+fn bind_ddl_stmt(stmt: &Statement) -> Result<Ddl> {
+    match stmt {
+        Statement::CreateTable(ct) => {
+            let ident = TableIdent::parse(&object_name(&ct.name)?)?;
+            if !ct.columns.is_empty() {
+                let mut fields = Vec::new();
+                for col in &ct.columns {
+                    let name = ident_key(&col.name);
+                    let dt = map_type(&col.data_type)?;
+                    fields.push(Field::new(name, dt, true));
+                }
+                let schema = schema_from_fields(fields)?;
+                return Ok(Ddl::CreateTable {
+                    ident,
+                    schema,
+                    if_not_exists: ct.if_not_exists,
+                });
+            }
+            Err(Error::Plan("CREATE TABLE requires a column list".into()))
+        }
+        Statement::Drop {
+            object_type,
+            if_exists,
+            names,
+            ..
+        } => {
+            if *object_type != sqlparser::ast::ObjectType::Table {
+                return Err(Error::NotImplemented("DROP"));
+            }
+            if names.len() != 1 {
+                return Err(Error::Plan("DROP TABLE supports one name".into()));
+            }
+            let name = &names[0];
+            Ok(Ddl::DropTable {
+                ident: TableIdent::parse(&object_name(name)?)?,
+                if_exists: *if_exists,
+            })
+        }
+        Statement::AlterTable(at) => {
+            let ident = TableIdent::parse(&object_name(&at.name)?)?;
+            let action = bind_alter_op(&at.operations)?;
+            Ok(Ddl::AlterTable { ident, action })
+        }
+        Statement::ShowTables { .. } => {
+            let namespace = show_tables_namespace(stmt)?;
+            Ok(Ddl::ShowTables { namespace })
+        }
+        other => Err(Error::NotImplemented(statement_kind(other))),
+    }
+}
+
+fn bind_alter_op(ops: &[sqlparser::ast::AlterTableOperation]) -> Result<AlterTable> {
+    if ops.len() != 1 {
+        return Err(Error::Plan("ALTER TABLE supports one operation".into()));
+    }
+    match &ops[0] {
+        sqlparser::ast::AlterTableOperation::AddColumn { column_def, .. } => {
+            Ok(AlterTable::AddColumn {
+                name: ident_key(&column_def.name),
+                data_type: map_type(&column_def.data_type)?,
+            })
+        }
+        sqlparser::ast::AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => Ok(AlterTable::RenameColumn {
+            old: ident_key(old_column_name),
+            new: ident_key(new_column_name),
+        }),
+        _ => Err(Error::NotImplemented("ALTER TABLE operation")),
+    }
+}
+
+fn show_tables_namespace(stmt: &Statement) -> Result<Option<String>> {
+    match stmt {
+        Statement::ShowTables { show_options, .. } => match &show_options.show_in {
+            Some(show_in) => match &show_in.parent_name {
+                Some(name) => Ok(Some(object_name(name)?)),
+                None => Ok(None),
+            },
+            None => Ok(None),
+        },
+        _ => Ok(None),
     }
 }
 
@@ -614,22 +710,24 @@ fn bind_table_factor(factor: &TableFactor, catalog: &Catalog) -> Result<BoundFro
                 return Err(Error::NotImplemented("table function or scan hints"));
             }
             let table = object_name(name)?;
-            let schema = catalog.table(&table)?.clone();
+            let ident = TableIdent::parse(&table)?;
+            let scan_name = ident.sql_name();
+            let schema = catalog.table(&scan_name)?.clone();
             let alias_name = alias.as_ref().map(|a| ident_key(&a.name));
             if let Some(alias) = alias
                 && !alias.columns.is_empty()
             {
                 return Err(Error::NotImplemented("column aliases on table"));
             }
-            let qualifier = alias_name.clone().unwrap_or_else(|| table.clone());
+            let qualifier = alias_name.clone().unwrap_or_else(|| ident.table.clone());
             Ok(BoundFrom {
                 plan: LogicalPlan::Scan {
-                    table: table.clone(),
+                    table: scan_name.clone(),
                     schema: schema.clone(),
                     alias: alias_name,
                     projection: None,
                     filters: Vec::new(),
-                    stats: catalog.stats(&table).cloned(),
+                    stats: catalog.stats(&scan_name).cloned(),
                 },
                 scope: Scope::from_schema(Some(qualifier), schema),
             })
@@ -1080,18 +1178,24 @@ fn literal_u64(expr: &SqlExpr, what: &str) -> Result<u64> {
     }
 }
 
+fn bind_compound(parts: &[Ident], scope: &Scope) -> Result<Expr> {
+    if parts.len() < 2 || parts.len() > 4 {
+        return Err(Error::Plan("invalid qualified name".into()));
+    }
+    let col = ident_key(parts.last().expect("len checked"));
+    let prefix: Vec<String> = parts[..parts.len() - 1].iter().map(ident_key).collect();
+    let full = prefix.join(".");
+    match resolve_name(Some(&full), &col, scope) {
+        Ok(expr) => Ok(expr),
+        Err(_) if prefix.len() > 1 => resolve_name(Some(prefix.last().expect("len")), &col, scope),
+        Err(err) => Err(err),
+    }
+}
+
 fn bind_scalar(expr: &SqlExpr, scope: &Scope) -> Result<Expr> {
     match expr {
         SqlExpr::Identifier(id) => resolve_name(None, &ident_key(id), scope),
-        SqlExpr::CompoundIdentifier(parts) => {
-            if parts.len() == 2 {
-                resolve_name(Some(&ident_key(&parts[0])), &ident_key(&parts[1]), scope)
-            } else {
-                Err(Error::NotImplemented(
-                    "qualified name with more than two parts",
-                ))
-            }
-        }
+        SqlExpr::CompoundIdentifier(parts) => bind_compound(parts, scope),
         SqlExpr::Nested(inner) => bind_scalar(inner, scope),
         SqlExpr::Value(v) => bind_value(&v.value),
         SqlExpr::BinaryOp { left, op, right } => {
@@ -1368,13 +1472,19 @@ fn map_type(dt: &sqlparser::ast::DataType) -> Result<DataType> {
 }
 
 fn object_name(name: &ObjectName) -> Result<String> {
-    if name.0.len() != 1 {
-        return Err(Error::NotImplemented("catalog.schema.table name"));
+    if name.0.is_empty() || name.0.len() > 3 {
+        return Err(Error::Plan("invalid table name".into()));
     }
-    match &name.0[0] {
-        ObjectNamePart::Identifier(id) => Ok(ident_key(id)),
-        ObjectNamePart::Function(_) => Err(Error::NotImplemented("function object name")),
+    let mut parts = Vec::with_capacity(name.0.len());
+    for part in &name.0 {
+        match part {
+            ObjectNamePart::Identifier(id) => parts.push(ident_key(id)),
+            ObjectNamePart::Function(_) => {
+                return Err(Error::NotImplemented("function object name"));
+            }
+        }
     }
+    Ok(parts.join("."))
 }
 
 fn ident_key(id: &Ident) -> String {

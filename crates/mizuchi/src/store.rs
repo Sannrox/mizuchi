@@ -326,6 +326,17 @@ fn relative_to(loc: &ObjectPath, prefix: &str) -> String {
         .unwrap_or_else(|| p.to_string())
 }
 
+/// Keep partition directories that can still match `filters`.
+pub fn prune_partitions(partitions: &[String], filters: &[Expr]) -> Vec<String> {
+    let mut kept: Vec<String> = partitions
+        .iter()
+        .filter(|p| !hive_path_cannot_match(p, Some(filters)))
+        .cloned()
+        .collect();
+    kept.sort();
+    kept
+}
+
 /// True when Hive path segments prove `filters` cannot hold for this object.
 pub(crate) fn hive_path_cannot_match(rel: &str, filters: Option<&[Expr]>) -> bool {
     let Some(preds) = filters else {

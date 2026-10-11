@@ -46,8 +46,10 @@ pub use lake::{
 pub use object_store::ObjectStore;
 pub use opt::{estimate_rows, optimize};
 pub use plan::{
-    Catalog, ColumnStats, JoinType, LogicalPlan, MergeActionPlan, MergeClausePlan, MergeMatch,
-    MergePlan, TableStats, bind_merge, merge_target_table, plan_sql, table_stats_from_batches,
+    AlterTable, Catalog, CatalogProvider, ColumnStats, DEFAULT_CATALOG, DEFAULT_NAMESPACE, Ddl,
+    JoinType, LogicalPlan, MergeActionPlan, MergeClausePlan, MergeMatch, MergePlan, NamespaceIdent,
+    TableIdent, TableMeta, TableStats, apply_alter, bind_ddl, bind_merge, merge_target_table,
+    plan_sql, table_stats_from_batches,
 };
 pub use postgres::{PostgresReadOptions, PostgresSource, postgres_scan_sql, read_postgres};
 pub use read::{
@@ -57,7 +59,9 @@ pub use read::{
 };
 pub use schema::{from_arrow_schema, is_supported_data_type, to_arrow_schema};
 pub use sql::parse_sql;
-pub use store::{read_parquet_store, read_parquet_store_reported, write_parquet_store};
+pub use store::{
+    prune_partitions, read_parquet_store, read_parquet_store_reported, write_parquet_store,
+};
 pub use write::{
     ParquetWriteOptions, WriteMode, WriteStats, write_avro, write_json, write_orc, write_parquet,
     write_parquet_cancel, write_parquet_stats,
