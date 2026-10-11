@@ -7,7 +7,9 @@
 //! Embedding runners pass [`SessionConfig`] (memory, threads, spill, allowed
 //! paths, network grant), register Arrow batches, files, or an Arrow C stream,
 //! and pull results as batches. [`Cluster`] sizes in-process workers with CPU,
-//! memory, and spill grants. The engine opens TCP only when
+//! memory, and spill grants. [`StreamQuery`] runs continuous micro-batches
+//! with event-time watermarks, windows, and a checkpointed Parquet sink.
+//! The engine opens TCP only when
 //! [`SessionConfig::allow_network`] is set; denied paths, denied network, and
 //! memory caps surface as [`Error::Io`] and [`Error::Memory`].
 //! [`VERSION`] and [`Session::explain`] are the strings a runner records.
@@ -31,9 +33,9 @@ pub mod write;
 pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
 pub use error::{Error, Result};
 pub use exec::{
-    CancelToken, Cluster, ClusterConfig, Engine, InputScan, MergeStats, MicroBatchAgg,
-    OperatorMetrics, OutputWrite, QueryReport, QueryResult, Session, SessionConfig,
-    WorkerResources,
+    CancelToken, Cluster, ClusterConfig, Engine, EventWindow, InputScan, MergeStats, MicroBatchAgg,
+    OperatorMetrics, OutputWrite, QueryReport, QueryResult, Session, SessionConfig, StreamOutput,
+    StreamQuery, StreamQueryConfig, StreamTrigger, WorkerResources,
 };
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lake::{

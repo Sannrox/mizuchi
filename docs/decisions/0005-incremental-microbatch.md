@@ -25,8 +25,9 @@ Incremental work is **micro-batch execution on the same operators**:
   their hash table between micro-batches. New rows update existing
   groups or insert new ones. The prototype is [`MicroBatchAgg`].
 - The first output mode is **complete**: after each micro-batch the
-  operator emits every group accumulated so far. Update and append
-  modes, watermarks, and event-time windows are later.
+  operator emits every group accumulated so far. Event-time watermarks,
+  tumbling/sliding/session windows, append output, and checkpointed
+  sinks are [ADR 0009](0009-stream-watermarks-and-checkpoints.md).
 - Stateless operators (scan of the delta, filter, project) are unchanged
   pull iterators over that micro-batch only.
 - Cancellation (ADR 0004 / Issue #11) is still checked between morsels

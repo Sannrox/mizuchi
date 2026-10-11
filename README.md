@@ -53,6 +53,9 @@ Arrow C stream, and pull result batches. Cooperative cancellation is a
 a `QueryReport` (inputs after partition prune, outputs, version, plan).
 `write_delta` / `write_iceberg` commit a new snapshot; `TimeTravel`
 reads a past version. `Session::merge_sql` runs `MERGE INTO`.
+`Session::stream_query` opens a continuous micro-batch query
+(`StreamQuery`) with event-time watermarks, windows, and a
+checkpointed Parquet sink (ADR 0009).
 `mizuchi::VERSION` and `Session::explain` are the strings a runner
 records. A complete walk-through is `cargo run -p mizuchi --example embed`.
 The engine opens TCP only when `SessionConfig.allow_network` is set
