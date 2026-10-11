@@ -145,11 +145,19 @@ impl CombineAgg for PyCombineAgg {
         self.identity.clone()
     }
 
-    fn update(&self, state: &dyn Array, value: &dyn Array) -> std::result::Result<ArrayRef, EngineError> {
+    fn update(
+        &self,
+        state: &dyn Array,
+        value: &dyn Array,
+    ) -> std::result::Result<ArrayRef, EngineError> {
         self.call(&self.update, state, value)
     }
 
-    fn merge(&self, left: &dyn Array, right: &dyn Array) -> std::result::Result<ArrayRef, EngineError> {
+    fn merge(
+        &self,
+        left: &dyn Array,
+        right: &dyn Array,
+    ) -> std::result::Result<ArrayRef, EngineError> {
         self.call(&self.merge, left, right)
     }
 }
@@ -196,10 +204,7 @@ fn py_identity(value: &Bound<'_, PyAny>) -> PyResult<(ArrayRef, DataType)> {
         ));
     }
     if let Ok(v) = value.extract::<String>() {
-        return Ok((
-            Arc::new(StringArray::from(vec![Some(v)])),
-            DataType::Utf8,
-        ));
+        return Ok((Arc::new(StringArray::from(vec![Some(v)])), DataType::Utf8));
     }
     Err(PyValueError::new_err(
         "udaf identity must be None, bool, int, float, or str",
@@ -214,11 +219,7 @@ fn array0_to_py(py: Python<'_>, array: &dyn Array) -> PyResult<Py<PyAny>> {
     cell_to_py(py, &owned, 0)
 }
 
-fn py_to_array0(
-    _py: Python<'_>,
-    value: &Bound<'_, PyAny>,
-    dt: &DataType,
-) -> PyResult<ArrayRef> {
+fn py_to_array0(_py: Python<'_>, value: &Bound<'_, PyAny>, dt: &DataType) -> PyResult<ArrayRef> {
     if value.is_none() {
         return Ok(match dt {
             DataType::Boolean => Arc::new(BooleanArray::from(vec![None::<bool>])),
