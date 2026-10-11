@@ -127,6 +127,10 @@ enum PhysicalPlan {
         name: String,
         schema: SchemaRef,
     },
+    Scalar {
+        input: Box<LogicalPlan>,
+        schema: SchemaRef,
+    },
     Exchange {
         input: Box<PhysicalPlan>,
         keys: Vec<Expr>,
@@ -153,6 +157,7 @@ impl PhysicalPlan {
             | Self::Window { schema, .. }
             | Self::Recursive { schema, .. }
             | Self::WorkScan { schema, .. }
+            | Self::Scalar { schema, .. }
             | Self::Exchange { schema, .. }
             | Self::ShuffleRead { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Sort { input, .. } | Self::Limit { input, .. } => {
@@ -174,6 +179,7 @@ impl PhysicalPlan {
             Self::Empty { .. }
             | Self::Scan { .. }
             | Self::WorkScan { .. }
+            | Self::Scalar { .. }
             | Self::Union { .. }
             | Self::Recursive { .. } => 1,
         }
@@ -199,6 +205,10 @@ fn from_logical(plan: &LogicalPlan) -> PhysicalPlan {
         },
         LogicalPlan::WorkScan { name, schema, .. } => PhysicalPlan::WorkScan {
             name: name.clone(),
+            schema: schema.clone(),
+        },
+        LogicalPlan::Scalar { input, schema } => PhysicalPlan::Scalar {
+            input: input.clone(),
             schema: schema.clone(),
         },
         LogicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
@@ -314,26 +324,36 @@ fn ensure_distribution(plan: PhysicalPlan, n: usize, next_id: &mut usize) -> Phy
         } => {
             let left = ensure_distribution(*left, n, next_id);
             let right = ensure_distribution(*right, n, next_id);
-            let keys = on
-                .as_ref()
-                .and_then(|pred| join::equi_key_pairs(pred, left.schema().fields().len()).ok())
-                .unwrap_or_default();
-            if keys.is_empty() {
+            if join_type == JoinType::NullAwareAnti {
                 PhysicalPlan::Join {
-                    left: Box::new(left),
-                    right: Box::new(right),
+                    left: Box::new(exchange(left, Vec::new(), 1, next_id)),
+                    right: Box::new(exchange(right, Vec::new(), 1, next_id)),
                     join_type,
                     on,
                     schema,
                 }
             } else {
-                let (lk, rk): (Vec<_>, Vec<_>) = keys.into_iter().unzip();
-                PhysicalPlan::Join {
-                    left: Box::new(exchange(left, lk, n, next_id)),
-                    right: Box::new(exchange(right, rk, n, next_id)),
-                    join_type,
-                    on,
-                    schema,
+                let keys = on
+                    .as_ref()
+                    .and_then(|pred| join::equi_key_pairs(pred, left.schema().fields().len()).ok())
+                    .unwrap_or_default();
+                if keys.is_empty() {
+                    PhysicalPlan::Join {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        join_type,
+                        on,
+                        schema,
+                    }
+                } else {
+                    let (lk, rk): (Vec<_>, Vec<_>) = keys.into_iter().unzip();
+                    PhysicalPlan::Join {
+                        left: Box::new(exchange(left, lk, n, next_id)),
+                        right: Box::new(exchange(right, rk, n, next_id)),
+                        join_type,
+                        on,
+                        schema,
+                    }
                 }
             }
         }
@@ -582,6 +602,9 @@ fn explain_physical(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         }
         PhysicalPlan::WorkScan { name, schema } => {
             out.push_str(&format!("{pad}WorkScan {name} {}\n", schema));
+        }
+        PhysicalPlan::Scalar { schema, .. } => {
+            out.push_str(&format!("{pad}Scalar {schema}\n"));
         }
         PhysicalPlan::Filter { input, predicate } => {
             out.push_str(&format!(
@@ -1510,6 +1533,13 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
         }
         PhysicalPlan::WorkScan { name, .. } => {
             Err(Error::Plan(format!("working table {name} is not in scope")))
+        }
+        PhysicalPlan::Scalar { input, schema } => {
+            let batches = collect(
+                physical(input, &ctx.session, ctx.pool.as_ref())?,
+                &ctx.session.cancel,
+            )?;
+            lowering.scan(vec![super::scalar_one_row(batches, schema.clone())?])
         }
         PhysicalPlan::ShuffleRead {
             shuffle_id, schema, ..

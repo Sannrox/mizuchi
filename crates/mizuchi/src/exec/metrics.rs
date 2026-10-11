@@ -137,6 +137,7 @@ pub(super) fn physical_shape(plan: &LogicalPlan) -> PhysNode {
             node("Recursive", children)
         }
         LogicalPlan::WorkScan { .. } => leaf("WorkScan"),
+        LogicalPlan::Scalar { input, .. } => node("Scalar", vec![physical_shape(input)]),
     }
 }
 

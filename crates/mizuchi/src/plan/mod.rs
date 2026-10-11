@@ -96,6 +96,9 @@ pub enum JoinType {
     Cross,
     Semi,
     Anti,
+    /// `NOT IN (SELECT ...)`: unmatched non-null left keys, empty if the
+    /// subquery produced a null. Null keys never match a regular anti join.
+    NullAwareAnti,
 }
 
 impl fmt::Display for JoinType {
@@ -108,6 +111,7 @@ impl fmt::Display for JoinType {
             Self::Cross => "Cross",
             Self::Semi => "Semi",
             Self::Anti => "Anti",
+            Self::NullAwareAnti => "NullAwareAnti",
         })
     }
 }
@@ -394,6 +398,14 @@ pub enum LogicalPlan {
         /// Optional alias used in name resolution.
         alias: Option<String>,
     },
+    /// Scalar subquery: exactly one row. Zero rows become a null row;
+    /// more than one row fails at execution.
+    Scalar {
+        /// Inner query, which must have one column.
+        input: Box<LogicalPlan>,
+        /// Output schema, matching `input`.
+        schema: SchemaRef,
+    },
 }
 
 impl LogicalPlan {
@@ -408,7 +420,8 @@ impl LogicalPlan {
             | Self::Union { schema, .. }
             | Self::Window { schema, .. }
             | Self::Recursive { schema, .. }
-            | Self::WorkScan { schema, .. } => schema,
+            | Self::WorkScan { schema, .. }
+            | Self::Scalar { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Sort { input, .. } | Self::Limit { input, .. } => {
                 input.schema()
             }
@@ -602,6 +615,10 @@ fn explain_into(plan: &LogicalPlan, indent: usize, out: &mut String) {
             }
             _ => out.push_str(&format!("{pad}WorkScan {name} {}\n", fmt_schema(schema))),
         },
+        LogicalPlan::Scalar { input, schema } => {
+            out.push_str(&format!("{pad}Scalar {}\n", fmt_schema(schema)));
+            explain_into(input, indent + 1, out);
+        }
     }
 }
 
@@ -977,6 +994,21 @@ mod tests {
         .explain();
         assert!(rec.contains("Recursive c"), "{rec}");
         assert!(rec.contains("WorkScan c"), "{rec}");
+
+        let in_list = explain("SELECT a FROM t WHERE a IN (1, 2)");
+        assert!(in_list.contains("Filter"), "{in_list}");
+        let in_sub = explain("SELECT a FROM t WHERE a IN (SELECT a FROM t)");
+        assert!(in_sub.contains("Join Semi"), "{in_sub}");
+        let not_in = explain("SELECT a FROM t WHERE a NOT IN (SELECT a FROM t)");
+        assert!(not_in.contains("Join NullAwareAnti"), "{not_in}");
+        let exists = explain("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t u WHERE u.a = t.a)");
+        assert!(exists.contains("Join Semi"), "{exists}");
+        let scalar = plan_sql("SELECT (SELECT a FROM t WHERE a = 1)", &catalog())
+            .unwrap()
+            .explain();
+        assert!(scalar.contains("Scalar"), "{scalar}");
+        let lateral = explain("SELECT a FROM t, LATERAL (SELECT a AS x) s WHERE t.a = s.x");
+        assert!(lateral.contains("Project"), "{lateral}");
 
         let err = plan_sql(
             "WITH t AS (SELECT 1 AS n) SELECT n FROM sales.t",

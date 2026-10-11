@@ -136,6 +136,7 @@ pub(super) fn scalar_at(array: &dyn Array, i: usize) -> Result<Scalar> {
         arrow::datatypes::DataType::LargeUtf8 => {
             Scalar::Utf8(array.as_string::<i64>().value(i).to_owned())
         }
+        arrow::datatypes::DataType::Null => Scalar::Null,
         dt => {
             return Err(Error::Eval(format!(
                 "unsupported grouping or join key type: {dt}"
