@@ -28,10 +28,11 @@ pub(crate) struct Budget {
     pub used: Arc<AtomicU64>,
 }
 
-/// Query-scoped pool. `used` is the live reservation, not a high-water mark.
+/// Query-scoped pool. `used` is the live reservation; `peak` is its high water.
 pub(crate) struct MemoryPool {
     limit: Option<u64>,
     used: Arc<AtomicU64>,
+    peak: AtomicU64,
     spill_dir: Option<PathBuf>,
     seq: AtomicU64,
 }
@@ -64,6 +65,7 @@ impl MemoryPool {
         Ok(Self {
             limit,
             used,
+            peak: AtomicU64::new(0),
             spill_dir,
             seq: AtomicU64::new(1),
         })
@@ -104,7 +106,17 @@ impl MemoryPool {
         } else {
             self.used.fetch_add(bytes, Ordering::SeqCst);
         }
+        let live = self.used.load(Ordering::SeqCst);
+        self.peak.fetch_max(live, Ordering::Relaxed);
         Ok(Reservation { pool: self, bytes })
+    }
+
+    pub(super) fn used_handle(&self) -> Arc<AtomicU64> {
+        self.used.clone()
+    }
+
+    pub(super) fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Relaxed)
     }
 
     pub(super) fn spill_path(&self) -> Result<PathBuf> {

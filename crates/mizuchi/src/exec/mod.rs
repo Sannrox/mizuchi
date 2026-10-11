@@ -9,6 +9,7 @@ mod incremental;
 mod join;
 mod key;
 mod memory;
+mod metrics;
 mod op;
 mod schedule;
 mod sort;
@@ -19,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use arrow::array::{Array, BooleanArray, RecordBatch, RecordBatchOptions};
 use arrow::compute::filter_record_batch;
@@ -32,6 +34,7 @@ use crate::plan::{Catalog, LogicalPlan, NamedExpr, normalize_name};
 
 pub use engine::Engine;
 pub use incremental::MicroBatchAgg;
+pub use metrics::OperatorMetrics;
 pub use op::{CpuLowering, Lowering, Operator};
 
 /// Cooperative cancellation flag. Operators check it between morsels.
@@ -257,6 +260,14 @@ impl Session {
     /// Plan and run `sql` against registered tables.
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<Batch>> {
         self.cancel.check()?;
+        if let Some((analyze, inner)) = explain_sql(sql)? {
+            let text = if analyze {
+                self.explain_analyze(&inner)?
+            } else {
+                self.explain(&inner)?
+            };
+            return plan_text_batch(&text);
+        }
         let plan = self.bind_optimized(sql)?;
         self.execute_cached(&plan, || {
             let pool = self.memory_pool()?;
@@ -269,6 +280,25 @@ impl Session {
         })
     }
 
+    /// Logical and physical plan text. Does not run the query.
+    pub fn explain(&self, sql: &str) -> Result<String> {
+        let plan = self.bind_optimized(sql)?;
+        Ok(format!(
+            "== Logical Plan ==\n{}== Physical Plan ==\n{}",
+            plan.explain(),
+            metrics::physical_shape(&plan).format(false)
+        ))
+    }
+
+    /// Per-operator metrics as a tree. Runs the pull plan once.
+    pub fn query_metrics(&self, sql: &str) -> Result<OperatorMetrics> {
+        let plan = self.bind_optimized(sql)?;
+        let pool = self.memory_pool()?;
+        let (op, tree) = build_physical(&plan, self, &pool, true)?;
+        let _ = collect(op, &self.cancel)?;
+        Ok(tree.snapshot())
+    }
+
     /// Split the optimized plan into stages at hash-partition exchanges.
     pub fn explain_stages(&self, sql: &str) -> Result<String> {
         stage::explain_stages(&self.bind_optimized(sql)?, self.workers.max(1))
@@ -279,9 +309,21 @@ impl Session {
         stage::execute_staged(&self.bind_optimized(sql)?, self)
     }
 
-    /// Run the staged plan and describe adaptive partition splits.
+    /// Run the query and print logical/physical plans with per-operator
+    /// rows, batches, elapsed time, and peak pool bytes. Appends adaptive
+    /// shuffle notes from the staged path.
     pub fn explain_analyze(&self, sql: &str) -> Result<String> {
-        stage::explain_analyze(&self.bind_optimized(sql)?, self)
+        let plan = self.bind_optimized(sql)?;
+        let pool = self.memory_pool()?;
+        let (op, tree) = build_physical(&plan, self, &pool, true)?;
+        let _batches = collect(op, &self.cancel)?;
+        let mut text = format!(
+            "== Logical Plan ==\n{}== Physical Plan ==\n{}",
+            plan.explain(),
+            tree.format(true)
+        );
+        text.push_str(&stage::explain_analyze(&plan, self)?);
+        Ok(text)
     }
 
     pub(super) fn memory_pool(&self) -> Result<memory::MemoryPool> {
@@ -526,9 +568,24 @@ pub(super) fn physical(
     session: &Session,
     pool: &memory::MemoryPool,
 ) -> Result<Box<dyn Operator>> {
+    Ok(build_physical(plan, session, pool, false)?.0)
+}
+
+fn build_physical(
+    plan: &LogicalPlan,
+    session: &Session,
+    pool: &memory::MemoryPool,
+    analyze: bool,
+) -> Result<(Box<dyn Operator>, metrics::PhysNode)> {
     let lowering = session.lowering.0.as_ref();
     match plan {
-        LogicalPlan::Empty { schema } => lowering.empty(schema.clone()),
+        LogicalPlan::Empty { schema } => Ok(metrics::finish(
+            "Empty",
+            lowering.empty(schema.clone())?,
+            Vec::new(),
+            analyze,
+            pool,
+        )),
         LogicalPlan::Scan {
             table,
             projection,
@@ -564,27 +621,46 @@ pub(super) fn physical(
                 }
                 morsels.extend(batch.split_by_policy(&session.policy));
             }
-            lowering.scan(morsels)
+            Ok(metrics::finish(
+                "Scan",
+                lowering.scan(morsels)?,
+                Vec::new(),
+                analyze,
+                pool,
+            ))
         }
         LogicalPlan::Filter { input, predicate } => {
-            lowering.filter(physical(input, session, pool)?, predicate.clone())
+            let (child, child_node) = build_physical(input, session, pool, analyze)?;
+            Ok(metrics::finish(
+                "Filter",
+                lowering.filter(child, predicate.clone())?,
+                vec![child_node],
+                analyze,
+                pool,
+            ))
         }
         LogicalPlan::Project {
             input,
             exprs,
             schema,
-        } => lowering.project(
-            physical(input, session, pool)?,
-            exprs.clone(),
-            schema.clone(),
-        ),
+        } => {
+            let (child, child_node) = build_physical(input, session, pool, analyze)?;
+            Ok(metrics::finish(
+                "Project",
+                lowering.project(child, exprs.clone(), schema.clone())?,
+                vec![child_node],
+                analyze,
+                pool,
+            ))
+        }
         LogicalPlan::Aggregate {
             input,
             group,
             aggs,
             schema,
         } => {
-            let child = physical(input, session, pool)?;
+            let (child, child_node) = build_physical(input, session, pool, analyze)?;
+            let t0 = Instant::now();
             let batches = agg::run(
                 child,
                 group,
@@ -594,7 +670,18 @@ pub(super) fn physical(
                 pool,
                 &session.cancel,
             )?;
-            lowering.scan(batches)
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let (op, node) = metrics::finish(
+                "HashAggregate",
+                lowering.scan(batches)?,
+                vec![child_node],
+                analyze,
+                pool,
+            );
+            if analyze {
+                metrics::add_blocking(&node, ns, pool.peak());
+            }
+            Ok((op, node))
         }
         LogicalPlan::Join {
             left,
@@ -603,9 +690,12 @@ pub(super) fn physical(
             on,
             schema,
         } => {
+            let (left_op, left_node) = build_physical(left, session, pool, analyze)?;
+            let (right_op, right_node) = build_physical(right, session, pool, analyze)?;
+            let t0 = Instant::now();
             let batches = join::run(
-                physical(left, session, pool)?,
-                physical(right, session, pool)?,
+                left_op,
+                right_op,
                 join::JoinSpec {
                     join_type: *join_type,
                     on: on.as_ref(),
@@ -617,11 +707,24 @@ pub(super) fn physical(
                 pool,
                 &session.cancel,
             )?;
-            lowering.scan(batches)
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let (op, node) = metrics::finish(
+                "HashJoin",
+                lowering.scan(batches)?,
+                vec![left_node, right_node],
+                analyze,
+                pool,
+            );
+            if analyze {
+                metrics::add_blocking(&node, ns, pool.peak());
+            }
+            Ok((op, node))
         }
         LogicalPlan::Sort { input, order } => {
+            let (child, child_node) = build_physical(input, session, pool, analyze)?;
+            let t0 = Instant::now();
             let batches = sort::ordered(
-                physical(input, session, pool)?,
+                child,
                 input.schema().clone(),
                 order,
                 0,
@@ -630,15 +733,28 @@ pub(super) fn physical(
                 pool,
                 &session.cancel,
             )?;
-            lowering.scan(batches)
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let (op, node) = metrics::finish(
+                "Sort",
+                lowering.scan(batches)?,
+                vec![child_node],
+                analyze,
+                pool,
+            );
+            if analyze {
+                metrics::add_blocking(&node, ns, pool.peak());
+            }
+            Ok((op, node))
         }
         LogicalPlan::Limit { input, skip, fetch } => match input.as_ref() {
             LogicalPlan::Sort {
                 input: sorted,
                 order,
             } => {
+                let (child, child_node) = build_physical(sorted, session, pool, analyze)?;
+                let t0 = Instant::now();
                 let batches = sort::ordered(
-                    physical(sorted, session, pool)?,
+                    child,
                     sorted.schema().clone(),
                     order,
                     *skip,
@@ -647,12 +763,68 @@ pub(super) fn physical(
                     pool,
                     &session.cancel,
                 )?;
-                lowering.scan(batches)
+                let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let (op, node) = metrics::finish(
+                    "Sort",
+                    lowering.scan(batches)?,
+                    vec![child_node],
+                    analyze,
+                    pool,
+                );
+                if analyze {
+                    metrics::add_blocking(&node, ns, pool.peak());
+                }
+                Ok((op, node))
             }
-            _ => lowering.limit(physical(input, session, pool)?, *skip, *fetch),
+            _ => {
+                let (child, child_node) = build_physical(input, session, pool, analyze)?;
+                Ok(metrics::finish(
+                    "Limit",
+                    lowering.limit(child, *skip, *fetch)?,
+                    vec![child_node],
+                    analyze,
+                    pool,
+                ))
+            }
         },
         LogicalPlan::Union { .. } => Err(Error::NotImplemented("physical union")),
     }
+}
+
+fn explain_sql(sql: &str) -> Result<Option<(bool, String)>> {
+    if !sql
+        .trim_start()
+        .get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("EXPLAIN"))
+    {
+        return Ok(None);
+    }
+    let stmt = crate::plan::parse_statements(sql)?;
+    match stmt {
+        sqlparser::ast::Statement::Explain {
+            analyze,
+            statement,
+            describe_alias,
+            ..
+        } => {
+            if !matches!(describe_alias, sqlparser::ast::DescribeAlias::Explain) {
+                return Err(Error::NotImplemented("DESCRIBE"));
+            }
+            Ok(Some((analyze, statement.to_string())))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn plan_text_batch(text: &str) -> Result<Vec<Batch>> {
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("plan", arrow::datatypes::DataType::Utf8, false),
+    ]));
+    let batch = Batch::try_new(
+        schema,
+        vec![Arc::new(arrow::array::StringArray::from(vec![Some(text)]))],
+    )?;
+    Ok(vec![batch])
 }
 
 pub(super) fn collect(mut exec: Box<dyn Operator>, cancel: &CancelToken) -> Result<Vec<Batch>> {
@@ -801,6 +973,72 @@ mod tests {
 
     #[test]
     fn scan_projects_and_filters_end_to_end() {
+        let out = session()
+            .execute_sql("SELECT a FROM t WHERE a > 1")
+            .unwrap();
+        assert_eq!(col_i64(&out, "a"), vec![Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn explain_prints_logical_and_physical() {
+        let text = session()
+            .explain("SELECT a FROM t WHERE a > 1 ORDER BY a LIMIT 2")
+            .unwrap();
+        assert!(text.contains("== Logical Plan =="), "{text}");
+        assert!(text.contains("== Physical Plan =="), "{text}");
+        assert!(text.contains("Scan"), "{text}");
+        assert!(text.contains("Sort"), "{text}");
+        assert!(
+            !text.contains("elapsed_ns="),
+            "EXPLAIN must not run metrics: {text}"
+        );
+    }
+
+    #[test]
+    fn analyze_populates_per_operator_metrics() {
+        let s = join_session();
+        let sql = "SELECT t.a, COUNT(*) FROM t JOIN u ON t.a = u.id GROUP BY t.a";
+        let text = s.explain_analyze(sql).unwrap();
+        assert!(text.contains("HashJoin"), "{text}");
+        assert!(text.contains("HashAggregate"), "{text}");
+        assert!(text.contains("rows="), "{text}");
+        assert!(text.contains("batches="), "{text}");
+        assert!(text.contains("elapsed_ns="), "{text}");
+        assert!(text.contains("peak_bytes="), "{text}");
+
+        let metrics = s.query_metrics(sql).unwrap();
+        assert_eq!(metrics.name, "HashAggregate");
+        assert!(metrics.rows > 0, "{metrics:?}");
+        assert!(metrics.batches > 0, "{metrics:?}");
+        assert!(metrics.elapsed_ns > 0, "{metrics:?}");
+        assert_eq!(metrics.children.len(), 1);
+        assert_eq!(metrics.children[0].name, "HashJoin");
+        let json = metrics.to_json();
+        assert!(json.contains("\"name\":\"HashAggregate\""), "{json}");
+        assert!(json.contains("\"name\":\"HashJoin\""), "{json}");
+        assert!(json.contains("\"rows\":"), "{json}");
+    }
+
+    #[test]
+    fn execute_sql_explain_returns_plan_text() {
+        let out = session()
+            .execute_sql("EXPLAIN SELECT a FROM t LIMIT 1")
+            .unwrap();
+        let plan = col_utf8(&out, "plan");
+        assert_eq!(plan.len(), 1);
+        let text = plan[0].as_ref().unwrap();
+        assert!(text.contains("== Logical Plan =="), "{text}");
+        assert!(text.contains("Limit"), "{text}");
+        let analyzed = session()
+            .execute_sql("EXPLAIN ANALYZE SELECT a FROM t LIMIT 1")
+            .unwrap();
+        let text = col_utf8(&analyzed, "plan")[0].as_ref().unwrap().clone();
+        assert!(text.contains("elapsed_ns="), "{text}");
+        assert!(text.contains("Limit"), "{text}");
+    }
+
+    #[test]
+    fn execute_sql_without_explain_still_returns_rows() {
         let out = session()
             .execute_sql("SELECT a FROM t WHERE a > 1")
             .unwrap();
