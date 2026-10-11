@@ -17,7 +17,7 @@ If the skill is missing, run `bash scripts/validate-workflow-skills.sh` from thi
 checkout to get the latest version; consumers always use `main`.
 
 Run the shared skill's scripts from the repository being changed, preserving its working
-directory. Follow this repository's `AGENTS.md` and `.agents/project.md` in addition to the
+directory. Follow this repository's `AGENTS.md` (including `## Agent skill profile`) in addition to the
 canonical skill.
 
 Keep shared fixes and instructions upstream in `Sannrox/agent-kit`. When the stub template
