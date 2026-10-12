@@ -10,6 +10,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -17,6 +18,7 @@ use arrow::array::{
     Int32Array, Int64Array, LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array,
     UInt64Array,
 };
+use arrow::compute;
 use arrow::datatypes::{
     DataType, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef,
     UInt8Type, UInt16Type, UInt32Type, UInt64Type,
@@ -24,7 +26,11 @@ use arrow::datatypes::{
 
 use super::CancelToken;
 use super::Operator;
-use super::key::{Scalar, eval_all, extract_key, scalar_at};
+use super::key::{
+    HASH_BOOL, HASH_F32, HASH_F64, HASH_I8, HASH_I16, HASH_I32, HASH_I64, HASH_NULL, HASH_U8,
+    HASH_U16, HASH_U32, HASH_U64, HASH_UTF8, Scalar, canonical_f32, canonical_f64, dict_utf8_at,
+    eval_all, extract_key, scalar_at,
+};
 use super::memory::{self, MemoryPool, batch_bytes};
 use crate::batch::{Batch, BatchPolicy};
 use crate::error::{Error, Result};
@@ -197,7 +203,9 @@ pub(super) struct HashAgg {
     schema: SchemaRef,
     grouped: bool,
     combining: bool,
-    slots: HashMap<Vec<Scalar>, usize>,
+    /// Hash of the group key → candidate slots. New groups allocate `Scalar`
+    /// keys once; lookups hash array values in place (no per-row `String`).
+    slots: HashMap<u64, Vec<usize>>,
     keys: Vec<Vec<Scalar>>,
     accums: Vec<Vec<Accum>>,
 }
@@ -255,9 +263,11 @@ impl HashAgg {
                 | AggCall::User { arg: e, .. } => Some(e.eval(batch)?),
             });
         }
+        if !self.grouped {
+            return self.update_ungrouped(&arg_cols, batch.num_rows());
+        }
         for row in 0..batch.num_rows() {
-            let key = extract_key(&key_cols, row)?;
-            let slot = self.ensure_group(key)?;
+            let slot = self.ensure_group_row(&key_cols, row)?;
             for (accum, arg) in self.accums[slot].iter_mut().zip(arg_cols.iter()) {
                 accum.update(arg.as_deref(), row)?;
             }
@@ -265,10 +275,47 @@ impl HashAgg {
         Ok(())
     }
 
-    fn ensure_group(&mut self, key: Vec<Scalar>) -> Result<usize> {
-        if let Some(&slot) = self.slots.get(&key) {
-            return Ok(slot);
+    fn update_ungrouped(&mut self, arg_cols: &[Option<ArrayRef>], n: usize) -> Result<()> {
+        if self.keys.is_empty() {
+            self.insert_group(Vec::new())?;
         }
+        for (accum, arg) in self.accums[0].iter_mut().zip(arg_cols.iter()) {
+            accum.update_array(arg.as_deref(), n)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_group_row(&mut self, cols: &[ArrayRef], row: usize) -> Result<usize> {
+        let h = hash_row(cols, row)?;
+        if let Some(cands) = self.slots.get(&h) {
+            for &slot in cands {
+                if row_matches(&self.keys[slot], cols, row)? {
+                    return Ok(slot);
+                }
+            }
+        }
+        let key = extract_key(cols, row)?;
+        self.insert_group_hashed(h, key)
+    }
+
+    fn ensure_group(&mut self, key: Vec<Scalar>) -> Result<usize> {
+        let h = hash_scalars(&key);
+        if let Some(cands) = self.slots.get(&h) {
+            for &slot in cands {
+                if self.keys[slot] == key {
+                    return Ok(slot);
+                }
+            }
+        }
+        self.insert_group_hashed(h, key)
+    }
+
+    fn insert_group(&mut self, key: Vec<Scalar>) -> Result<usize> {
+        let h = hash_scalars(&key);
+        self.insert_group_hashed(h, key)
+    }
+
+    fn insert_group_hashed(&mut self, h: u64, key: Vec<Scalar>) -> Result<usize> {
         let slot = self.keys.len();
         let n_group = self.group_exprs.len();
         let accums = self
@@ -283,7 +330,7 @@ impl HashAgg {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        self.slots.insert(key.clone(), slot);
+        self.slots.entry(h).or_default().push(slot);
         self.keys.push(key);
         self.accums.push(accums);
         Ok(slot)
@@ -453,6 +500,70 @@ impl Accum {
         }
     }
 
+    /// Whole-array update for the ungrouped path. COUNT/SUM/AVG/MIN/MAX use
+    /// Arrow compute kernels; COUNT DISTINCT and user aggs stay row-wise.
+    fn update_array(&mut self, arg: Option<&dyn Array>, n: usize) -> Result<()> {
+        if matches!(self, Self::CountDistinct(_) | Self::User { .. }) {
+            for row in 0..n {
+                self.update(arg, row)?;
+            }
+            return Ok(());
+        }
+        match self {
+            Self::Count(c) => {
+                *c += match arg {
+                    None => n as i64,
+                    Some(array) => (array.len() - array.null_count()) as i64,
+                };
+                Ok(())
+            }
+            Self::SumF64 { sum, seen } => {
+                let array = arg.ok_or_else(|| Error::Eval("SUM needs an argument".into()))?;
+                if array.null_count() == array.len() {
+                    return Ok(());
+                }
+                *sum += sum_f64_array(array)?;
+                *seen = true;
+                Ok(())
+            }
+            Self::SumI64 { sum, seen } => {
+                let array = arg.ok_or_else(|| Error::Eval("SUM needs an argument".into()))?;
+                if array.null_count() == array.len() {
+                    return Ok(());
+                }
+                *sum = sum
+                    .checked_add(sum_i64_array(array)?)
+                    .ok_or_else(|| Error::Eval("SUM overflow".into()))?;
+                *seen = true;
+                Ok(())
+            }
+            Self::SumU64 { sum, seen } => {
+                let array = arg.ok_or_else(|| Error::Eval("SUM needs an argument".into()))?;
+                if array.null_count() == array.len() {
+                    return Ok(());
+                }
+                *sum = sum
+                    .checked_add(sum_u64_array(array)?)
+                    .ok_or_else(|| Error::Eval("SUM overflow".into()))?;
+                *seen = true;
+                Ok(())
+            }
+            Self::Avg { sum, count } => {
+                let array = arg.ok_or_else(|| Error::Eval("AVG needs an argument".into()))?;
+                let valid = (array.len() - array.null_count()) as i64;
+                if valid == 0 {
+                    return Ok(());
+                }
+                *sum += sum_f64_array(array)?;
+                *count += valid;
+                Ok(())
+            }
+            Self::Min { current } => update_minmax_array(current, arg, true),
+            Self::Max { current } => update_minmax_array(current, arg, false),
+            Self::CountDistinct(_) | Self::User { .. } => unreachable!("handled above"),
+        }
+    }
+
     fn finish(&self) -> Scalar {
         match self {
             Self::Count(n) => Scalar::I64(*n),
@@ -554,6 +665,32 @@ fn update_avg(sum: &mut f64, count: &mut i64, arg: Option<&dyn Array>, row: usiz
     Ok(())
 }
 
+fn update_minmax_array(
+    current: &mut Option<Scalar>,
+    arg: Option<&dyn Array>,
+    is_min: bool,
+) -> Result<()> {
+    let array = arg.ok_or_else(|| Error::Eval("MIN/MAX needs an argument".into()))?;
+    if array.null_count() == array.len() {
+        return Ok(());
+    }
+    let part = if is_min {
+        min_scalar(array)?
+    } else {
+        max_scalar(array)?
+    };
+    match current {
+        None => *current = Some(part),
+        Some(cur) => {
+            let ord = cmp_scalar(cur, &part)?;
+            if (is_min && ord == Ordering::Greater) || (!is_min && ord == Ordering::Less) {
+                *current = Some(part);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn update_minmax(
     current: &mut Option<Scalar>,
     arg: Option<&dyn Array>,
@@ -575,6 +712,389 @@ fn update_minmax(
         }
     }
     Ok(())
+}
+
+fn hash_scalars(key: &[Scalar]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_row(cols: &[ArrayRef], row: usize) -> Result<u64> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cols.len().hash(&mut hasher);
+    for col in cols {
+        hash_cell(col.as_ref(), row, &mut hasher)?;
+    }
+    Ok(hasher.finish())
+}
+
+fn hash_cell(array: &dyn Array, row: usize, hasher: &mut impl Hasher) -> Result<()> {
+    if array.is_null(row) {
+        HASH_NULL.hash(hasher);
+        return Ok(());
+    }
+    match array.data_type() {
+        DataType::Boolean => {
+            HASH_BOOL.hash(hasher);
+            array.as_boolean().value(row).hash(hasher);
+        }
+        DataType::Int8 => {
+            HASH_I8.hash(hasher);
+            array.as_primitive::<Int8Type>().value(row).hash(hasher);
+        }
+        DataType::Int16 => {
+            HASH_I16.hash(hasher);
+            array.as_primitive::<Int16Type>().value(row).hash(hasher);
+        }
+        DataType::Int32 => {
+            HASH_I32.hash(hasher);
+            array.as_primitive::<Int32Type>().value(row).hash(hasher);
+        }
+        DataType::Int64 => {
+            HASH_I64.hash(hasher);
+            array.as_primitive::<Int64Type>().value(row).hash(hasher);
+        }
+        DataType::UInt8 => {
+            HASH_U8.hash(hasher);
+            array.as_primitive::<UInt8Type>().value(row).hash(hasher);
+        }
+        DataType::UInt16 => {
+            HASH_U16.hash(hasher);
+            array.as_primitive::<UInt16Type>().value(row).hash(hasher);
+        }
+        DataType::UInt32 => {
+            HASH_U32.hash(hasher);
+            array.as_primitive::<UInt32Type>().value(row).hash(hasher);
+        }
+        DataType::UInt64 => {
+            HASH_U64.hash(hasher);
+            array.as_primitive::<UInt64Type>().value(row).hash(hasher);
+        }
+        DataType::Float32 => {
+            HASH_F32.hash(hasher);
+            canonical_f32(array.as_primitive::<Float32Type>().value(row).to_bits()).hash(hasher);
+        }
+        DataType::Float64 => {
+            HASH_F64.hash(hasher);
+            canonical_f64(array.as_primitive::<Float64Type>().value(row).to_bits()).hash(hasher);
+        }
+        DataType::Utf8 => {
+            HASH_UTF8.hash(hasher);
+            array.as_string::<i32>().value(row).hash(hasher);
+        }
+        DataType::LargeUtf8 => {
+            HASH_UTF8.hash(hasher);
+            array.as_string::<i64>().value(row).hash(hasher);
+        }
+        DataType::Dictionary(_, _) => {
+            HASH_UTF8.hash(hasher);
+            dict_utf8_at(array, row)?.hash(hasher);
+        }
+        dt => {
+            return Err(Error::Eval(format!(
+                "unsupported grouping or join key type: {dt}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn row_matches(key: &[Scalar], cols: &[ArrayRef], row: usize) -> Result<bool> {
+    if key.len() != cols.len() {
+        return Ok(false);
+    }
+    for (part, col) in key.iter().zip(cols) {
+        if !cell_matches(part, col.as_ref(), row)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn cell_matches(part: &Scalar, array: &dyn Array, row: usize) -> Result<bool> {
+    if array.is_null(row) {
+        return Ok(*part == Scalar::Null);
+    }
+    Ok(match (part, array.data_type()) {
+        (Scalar::Bool(v), DataType::Boolean) => *v == array.as_boolean().value(row),
+        (Scalar::I8(v), DataType::Int8) => *v == array.as_primitive::<Int8Type>().value(row),
+        (Scalar::I16(v), DataType::Int16) => *v == array.as_primitive::<Int16Type>().value(row),
+        (Scalar::I32(v), DataType::Int32) => *v == array.as_primitive::<Int32Type>().value(row),
+        (Scalar::I64(v), DataType::Int64) => *v == array.as_primitive::<Int64Type>().value(row),
+        (Scalar::U8(v), DataType::UInt8) => *v == array.as_primitive::<UInt8Type>().value(row),
+        (Scalar::U16(v), DataType::UInt16) => *v == array.as_primitive::<UInt16Type>().value(row),
+        (Scalar::U32(v), DataType::UInt32) => *v == array.as_primitive::<UInt32Type>().value(row),
+        (Scalar::U64(v), DataType::UInt64) => *v == array.as_primitive::<UInt64Type>().value(row),
+        (Scalar::F32(v), DataType::Float32) => {
+            Scalar::F32(*v) == Scalar::F32(array.as_primitive::<Float32Type>().value(row).to_bits())
+        }
+        (Scalar::F64(v), DataType::Float64) => {
+            Scalar::F64(*v) == Scalar::F64(array.as_primitive::<Float64Type>().value(row).to_bits())
+        }
+        (Scalar::Utf8(v), DataType::Utf8) => v == array.as_string::<i32>().value(row),
+        (Scalar::Utf8(v), DataType::LargeUtf8) => v == array.as_string::<i64>().value(row),
+        (Scalar::Utf8(v), DataType::Dictionary(_, _)) => v == dict_utf8_at(array, row)?,
+        _ => false,
+    })
+}
+
+fn sum_f64_array(array: &dyn Array) -> Result<f64> {
+    Ok(match array.data_type() {
+        DataType::Float64 => compute::sum(array.as_primitive::<Float64Type>()).unwrap_or(0.0),
+        DataType::Float32 => compute::sum(array.as_primitive::<Float32Type>())
+            .map(f64::from)
+            .unwrap_or(0.0),
+        DataType::Int64 => compute::sum(array.as_primitive::<Int64Type>())
+            .map(|v| v as f64)
+            .unwrap_or(0.0),
+        DataType::Int32 => compute::sum(array.as_primitive::<Int32Type>())
+            .map(f64::from)
+            .unwrap_or(0.0),
+        DataType::UInt64 => compute::sum(array.as_primitive::<UInt64Type>())
+            .map(|v| v as f64)
+            .unwrap_or(0.0),
+        other => {
+            let mut s = 0.0;
+            for row in 0..array.len() {
+                if !array.is_null(row) {
+                    s += numeric_as_f64(array, row)?;
+                }
+            }
+            let _ = other;
+            s
+        }
+    })
+}
+
+fn sum_i64_array(array: &dyn Array) -> Result<i64> {
+    // Integer SUM stays checked so overflow fails closed. Arrow's kernel wraps.
+    if let DataType::Int64 = array.data_type() {
+        let a = array.as_primitive::<Int64Type>();
+        let mut s = 0i64;
+        if a.null_count() == 0 {
+            for v in a.values().iter() {
+                s = s
+                    .checked_add(*v)
+                    .ok_or_else(|| Error::Eval("SUM overflow".into()))?;
+            }
+            return Ok(s);
+        }
+        for i in 0..a.len() {
+            if a.is_valid(i) {
+                s = s
+                    .checked_add(a.value(i))
+                    .ok_or_else(|| Error::Eval("SUM overflow".into()))?;
+            }
+        }
+        return Ok(s);
+    }
+    let mut s = 0i64;
+    for row in 0..array.len() {
+        if array.is_null(row) {
+            continue;
+        }
+        s = s
+            .checked_add(integer_value(array, row)?)
+            .ok_or_else(|| Error::Eval("SUM overflow".into()))?;
+    }
+    Ok(s)
+}
+
+fn sum_u64_array(array: &dyn Array) -> Result<u64> {
+    if let DataType::UInt64 = array.data_type() {
+        let a = array.as_primitive::<UInt64Type>();
+        let mut s = 0u64;
+        if a.null_count() == 0 {
+            for v in a.values().iter() {
+                s = s
+                    .checked_add(*v)
+                    .ok_or_else(|| Error::Eval("SUM overflow".into()))?;
+            }
+            return Ok(s);
+        }
+        for i in 0..a.len() {
+            if a.is_valid(i) {
+                s = s
+                    .checked_add(a.value(i))
+                    .ok_or_else(|| Error::Eval("SUM overflow".into()))?;
+            }
+        }
+        return Ok(s);
+    }
+    let mut s = 0u64;
+    for row in 0..array.len() {
+        if array.is_null(row) {
+            continue;
+        }
+        s = s
+            .checked_add(unsigned_value(array, row)?)
+            .ok_or_else(|| Error::Eval("SUM overflow".into()))?;
+    }
+    Ok(s)
+}
+
+fn min_scalar(array: &dyn Array) -> Result<Scalar> {
+    if let Some(v) = kernel_extremum(array, true)? {
+        return Ok(v);
+    }
+    extremum_scalar(array, true)
+}
+
+fn max_scalar(array: &dyn Array) -> Result<Scalar> {
+    if let Some(v) = kernel_extremum(array, false)? {
+        return Ok(v);
+    }
+    extremum_scalar(array, false)
+}
+
+fn kernel_extremum(array: &dyn Array, is_min: bool) -> Result<Option<Scalar>> {
+    let scalar = match array.data_type() {
+        DataType::Int8 => {
+            let a = array.as_primitive::<Int8Type>();
+            let v = if is_min {
+                compute::min(a)
+            } else {
+                compute::max(a)
+            };
+            v.map(Scalar::I8)
+        }
+        DataType::Int16 => {
+            let a = array.as_primitive::<Int16Type>();
+            let v = if is_min {
+                compute::min(a)
+            } else {
+                compute::max(a)
+            };
+            v.map(Scalar::I16)
+        }
+        DataType::Int32 => {
+            let a = array.as_primitive::<Int32Type>();
+            let v = if is_min {
+                compute::min(a)
+            } else {
+                compute::max(a)
+            };
+            v.map(Scalar::I32)
+        }
+        DataType::Int64 => {
+            let a = array.as_primitive::<Int64Type>();
+            let v = if is_min {
+                compute::min(a)
+            } else {
+                compute::max(a)
+            };
+            v.map(Scalar::I64)
+        }
+        DataType::UInt8 => {
+            let a = array.as_primitive::<UInt8Type>();
+            let v = if is_min {
+                compute::min(a)
+            } else {
+                compute::max(a)
+            };
+            v.map(Scalar::U8)
+        }
+        DataType::UInt16 => {
+            let a = array.as_primitive::<UInt16Type>();
+            let v = if is_min {
+                compute::min(a)
+            } else {
+                compute::max(a)
+            };
+            v.map(Scalar::U16)
+        }
+        DataType::UInt32 => {
+            let a = array.as_primitive::<UInt32Type>();
+            let v = if is_min {
+                compute::min(a)
+            } else {
+                compute::max(a)
+            };
+            v.map(Scalar::U32)
+        }
+        DataType::UInt64 => {
+            let a = array.as_primitive::<UInt64Type>();
+            let v = if is_min {
+                compute::min(a)
+            } else {
+                compute::max(a)
+            };
+            v.map(Scalar::U64)
+        }
+        DataType::Float32 => {
+            let a = array.as_primitive::<Float32Type>();
+            let v = if is_min {
+                compute::min(a)
+            } else {
+                compute::max(a)
+            };
+            v.map(|x| Scalar::F32(x.to_bits()))
+        }
+        DataType::Float64 => {
+            let a = array.as_primitive::<Float64Type>();
+            let v = if is_min {
+                compute::min(a)
+            } else {
+                compute::max(a)
+            };
+            v.map(|x| Scalar::F64(x.to_bits()))
+        }
+        DataType::Boolean => {
+            let a = array.as_boolean();
+            let mut cur: Option<bool> = None;
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    let v = a.value(i);
+                    cur = Some(match cur {
+                        None => v,
+                        Some(c) => {
+                            if is_min {
+                                c && v
+                            } else {
+                                c || v
+                            }
+                        }
+                    });
+                }
+            }
+            cur.map(Scalar::Bool)
+        }
+        DataType::Utf8 => {
+            let a = array.as_string::<i32>();
+            let mut cur: Option<&str> = None;
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    let v = a.value(i);
+                    cur = Some(match cur {
+                        None => v,
+                        Some(c) => {
+                            if is_min {
+                                if v < c { v } else { c }
+                            } else if v > c {
+                                v
+                            } else {
+                                c
+                            }
+                        }
+                    });
+                }
+            }
+            cur.map(|s| Scalar::Utf8(s.to_owned()))
+        }
+        _ => return Ok(None),
+    };
+    scalar
+        .ok_or_else(|| Error::Eval("MIN/MAX of empty array".into()))
+        .map(Some)
+}
+
+fn extremum_scalar(array: &dyn Array, is_min: bool) -> Result<Scalar> {
+    let mut cur: Option<Scalar> = None;
+    for row in 0..array.len() {
+        update_minmax(&mut cur, Some(array), row, is_min)?;
+    }
+    cur.ok_or_else(|| Error::Eval("MIN/MAX of empty array".into()))
 }
 
 fn integer_value(array: &dyn Array, row: usize) -> Result<i64> {
@@ -670,6 +1190,17 @@ fn build_array(values: &[Scalar], dt: &DataType) -> Result<ArrayRef> {
         DataType::Float64 => Arc::new(Float64Array::from(map_f64(values)?)),
         DataType::Utf8 => Arc::new(StringArray::from(map_utf8(values)?)),
         DataType::LargeUtf8 => Arc::new(LargeStringArray::from(map_utf8(values)?)),
+        DataType::Dictionary(_, value)
+            if matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            let plain = match value.as_ref() {
+                DataType::LargeUtf8 => {
+                    Arc::new(LargeStringArray::from(map_utf8(values)?)) as ArrayRef
+                }
+                _ => Arc::new(StringArray::from(map_utf8(values)?)) as ArrayRef,
+            };
+            compute::cast(plain.as_ref(), dt).map_err(|e| Error::Eval(e.to_string()))?
+        }
         dt => {
             return Err(Error::Eval(format!(
                 "unsupported aggregate output type: {dt}"
@@ -826,4 +1357,223 @@ fn downcast_uint<T>(v: &Scalar, f: impl Fn(u64) -> Option<T>) -> Result<Option<T
     };
     f(n).map(Some)
         .ok_or_else(|| Error::Eval("unsigned SUM does not fit the result type".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::NamedExpr;
+    use arrow::array::{DictionaryArray, Float64Array, Int32Array, Int64Array};
+    use arrow::datatypes::{Field, Schema};
+
+    fn i64_batch(values: Vec<Option<i64>>) -> Batch {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        Batch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap()
+    }
+
+    fn finish_sum(batch: &Batch) -> Scalar {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Int64, true)]));
+        let mut table =
+            HashAgg::new(&[], &[("s".into(), AggCall::Sum(Expr::nth(0)))], schema).unwrap();
+        table.update(batch).unwrap();
+        table.accums[0][0].finish()
+    }
+
+    #[test]
+    fn hash_row_matches_extracted_scalar_key() {
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])),
+            Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])),
+        ];
+        for row in 0..3 {
+            let key = extract_key(&cols, row).unwrap();
+            assert_eq!(hash_row(&cols, row).unwrap(), hash_scalars(&key));
+        }
+        assert_eq!(hash_row(&[], 0).unwrap(), hash_scalars(&[]));
+    }
+
+    #[test]
+    fn hash_row_matches_dictionary_utf8_key() {
+        let keys = Int32Array::from(vec![Some(0), Some(1), None, Some(0)]);
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["red", "blue"]));
+        let dict = DictionaryArray::try_new(keys, values).unwrap();
+        let cols: Vec<ArrayRef> = vec![Arc::new(dict)];
+        for row in 0..4 {
+            let key = extract_key(&cols, row).unwrap();
+            assert_eq!(hash_row(&cols, row).unwrap(), hash_scalars(&key));
+            assert!(row_matches(&key, &cols, row).unwrap());
+        }
+    }
+
+    #[test]
+    fn ungrouped_sum_uses_whole_array_and_skips_nulls() {
+        let batch = i64_batch(vec![Some(1), None, Some(2), Some(3)]);
+        assert_eq!(finish_sum(&batch), Scalar::I64(6));
+        let empty = i64_batch(vec![]);
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Int64, true)]));
+        let mut table =
+            HashAgg::new(&[], &[("s".into(), AggCall::Sum(Expr::nth(0)))], schema).unwrap();
+        table.update(&empty).unwrap();
+        let out = table.finish(&BatchPolicy::unlimited()).unwrap();
+        assert_eq!(out[0].num_rows(), 1);
+        assert!(
+            out[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .is_null(0)
+        );
+    }
+
+    #[test]
+    fn ungrouped_sum_of_one_million_int64() {
+        const N: i64 = 1_000_000;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = Batch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from_iter_values(std::iter::repeat_n(
+                1i64, N as usize,
+            )))],
+        )
+        .unwrap();
+        assert_eq!(finish_sum(&batch), Scalar::I64(N));
+    }
+
+    #[test]
+    fn grouped_utf8_lookup_does_not_split_equal_keys() {
+        let n = 8_192usize;
+        let flags: Vec<Option<&str>> = (0..n).map(|i| Some(["A", "N", "R"][i % 3])).collect();
+        let qty: Vec<Option<i64>> = (0..n).map(|i| Some(i as i64)).collect();
+        let batch = Batch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("flag", DataType::Utf8, true),
+                Field::new("qty", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(flags)),
+                Arc::new(Int64Array::from(qty)),
+            ],
+        )
+        .unwrap();
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("flag", DataType::Utf8, true),
+            Field::new("s", DataType::Int64, true),
+            Field::new("c", DataType::Int64, true),
+        ]));
+        let mut table = HashAgg::new(
+            &[NamedExpr {
+                expr: Expr::nth(0),
+                name: "flag".into(),
+            }],
+            &[
+                ("s".into(), AggCall::Sum(Expr::nth(1))),
+                ("c".into(), AggCall::CountStar),
+            ],
+            out_schema,
+        )
+        .unwrap();
+        table.update(&batch).unwrap();
+        let out = table.finish(&BatchPolicy::unlimited()).unwrap();
+        assert_eq!(out[0].num_rows(), 3);
+        let counts = out[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut total = 0i64;
+        for i in 0..counts.len() {
+            total += counts.value(i);
+        }
+        assert_eq!(total, n as i64);
+    }
+
+    #[test]
+    fn grouped_dictionary_utf8_matches_plain_utf8() {
+        let keys = Int32Array::from(vec![0, 1, 0, 1, 0]);
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["A", "N"]));
+        let dict = DictionaryArray::try_new(keys, values).unwrap();
+        let qty = Int64Array::from(vec![1, 2, 3, 4, 5]);
+        let batch = Batch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(
+                    "flag",
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                    true,
+                ),
+                Field::new("qty", DataType::Int64, true),
+            ])),
+            vec![Arc::new(dict), Arc::new(qty)],
+        )
+        .unwrap();
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("flag", DataType::Utf8, true),
+            Field::new("c", DataType::Int64, true),
+        ]));
+        let mut table = HashAgg::new(
+            &[NamedExpr {
+                expr: Expr::nth(0),
+                name: "flag".into(),
+            }],
+            &[("c".into(), AggCall::CountStar)],
+            out_schema,
+        )
+        .unwrap();
+        table.update(&batch).unwrap();
+        let out = table.finish(&BatchPolicy::unlimited()).unwrap();
+        let mut rows: Vec<(String, i64)> = (0..out[0].num_rows())
+            .map(|i| {
+                let k = out[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(i)
+                    .to_owned();
+                let c = out[0]
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(i);
+                (k, c)
+            })
+            .collect();
+        rows.sort();
+        assert_eq!(rows, vec![("A".into(), 3), ("N".into(), 2)]);
+    }
+
+    #[test]
+    fn grouped_float_signed_zero_is_one_group() {
+        let batch = Batch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, true)])),
+            vec![Arc::new(Float64Array::from(vec![0.0f64, -0.0f64, 0.0]))],
+        )
+        .unwrap();
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Float64, true),
+            Field::new("c", DataType::Int64, true),
+        ]));
+        let mut table = HashAgg::new(
+            &[NamedExpr {
+                expr: Expr::nth(0),
+                name: "x".into(),
+            }],
+            &[("c".into(), AggCall::CountStar)],
+            out_schema,
+        )
+        .unwrap();
+        table.update(&batch).unwrap();
+        let out = table.finish(&BatchPolicy::unlimited()).unwrap();
+        assert_eq!(out[0].num_rows(), 1);
+        assert_eq!(
+            out[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
+    }
 }

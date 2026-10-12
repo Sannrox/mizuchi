@@ -2,15 +2,15 @@
 
 use std::hash::{Hash, Hasher};
 
-use arrow::array::{Array, ArrayRef, AsArray};
+use arrow::array::{Array, ArrayRef, AsArray, DictionaryArray, StringArray};
 use arrow::datatypes::{
-    Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
-    UInt32Type, UInt64Type,
+    ArrowDictionaryKeyType, DataType, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
+    Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 
 use crate::error::{Error, Result};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum Scalar {
     Null,
     Bool(bool),
@@ -50,29 +50,81 @@ impl PartialEq for Scalar {
 
 impl Eq for Scalar {}
 
+/// Variant tags for [`Scalar::hash`] and in-place cell hashing. Must stay in
+/// lockstep so a grouping lookup without allocating `String` matches an
+/// inserted key.
+pub(super) const HASH_NULL: u8 = 0;
+pub(super) const HASH_BOOL: u8 = 1;
+pub(super) const HASH_I8: u8 = 2;
+pub(super) const HASH_I16: u8 = 3;
+pub(super) const HASH_I32: u8 = 4;
+pub(super) const HASH_I64: u8 = 5;
+pub(super) const HASH_U8: u8 = 6;
+pub(super) const HASH_U16: u8 = 7;
+pub(super) const HASH_U32: u8 = 8;
+pub(super) const HASH_U64: u8 = 9;
+pub(super) const HASH_F32: u8 = 10;
+pub(super) const HASH_F64: u8 = 11;
+pub(super) const HASH_UTF8: u8 = 12;
+
 impl Hash for Scalar {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
         match self {
-            Self::Null => {}
-            Self::Bool(v) => v.hash(state),
-            Self::I8(v) => v.hash(state),
-            Self::I16(v) => v.hash(state),
-            Self::I32(v) => v.hash(state),
-            Self::I64(v) => v.hash(state),
-            Self::U8(v) => v.hash(state),
-            Self::U16(v) => v.hash(state),
-            Self::U32(v) => v.hash(state),
-            Self::U64(v) => v.hash(state),
-            Self::F32(v) => canonical_f32(*v).hash(state),
-            Self::F64(v) => canonical_f64(*v).hash(state),
-            Self::Utf8(v) => v.hash(state),
+            Self::Null => HASH_NULL.hash(state),
+            Self::Bool(v) => {
+                HASH_BOOL.hash(state);
+                v.hash(state);
+            }
+            Self::I8(v) => {
+                HASH_I8.hash(state);
+                v.hash(state);
+            }
+            Self::I16(v) => {
+                HASH_I16.hash(state);
+                v.hash(state);
+            }
+            Self::I32(v) => {
+                HASH_I32.hash(state);
+                v.hash(state);
+            }
+            Self::I64(v) => {
+                HASH_I64.hash(state);
+                v.hash(state);
+            }
+            Self::U8(v) => {
+                HASH_U8.hash(state);
+                v.hash(state);
+            }
+            Self::U16(v) => {
+                HASH_U16.hash(state);
+                v.hash(state);
+            }
+            Self::U32(v) => {
+                HASH_U32.hash(state);
+                v.hash(state);
+            }
+            Self::U64(v) => {
+                HASH_U64.hash(state);
+                v.hash(state);
+            }
+            Self::F32(v) => {
+                HASH_F32.hash(state);
+                canonical_f32(*v).hash(state);
+            }
+            Self::F64(v) => {
+                HASH_F64.hash(state);
+                canonical_f64(*v).hash(state);
+            }
+            Self::Utf8(v) => {
+                HASH_UTF8.hash(state);
+                v.hash(state);
+            }
         }
     }
 }
 
 /// SQL grouping / equality: +0.0 equals -0.0; all NaNs form one group.
-fn canonical_f32(bits: u32) -> u32 {
+pub(super) fn canonical_f32(bits: u32) -> u32 {
     let v = f32::from_bits(bits);
     if v == 0.0 {
         0.0f32.to_bits()
@@ -83,7 +135,7 @@ fn canonical_f32(bits: u32) -> u32 {
     }
 }
 
-fn canonical_f64(bits: u64) -> u64 {
+pub(super) fn canonical_f64(bits: u64) -> u64 {
     let v = f64::from_bits(bits);
     if v == 0.0 {
         0.0f64.to_bits()
@@ -130,13 +182,10 @@ pub(super) fn scalar_at(array: &dyn Array, i: usize) -> Result<Scalar> {
         arrow::datatypes::DataType::Float64 => {
             Scalar::F64(array.as_primitive::<Float64Type>().value(i).to_bits())
         }
-        arrow::datatypes::DataType::Utf8 => {
-            Scalar::Utf8(array.as_string::<i32>().value(i).to_owned())
-        }
-        arrow::datatypes::DataType::LargeUtf8 => {
-            Scalar::Utf8(array.as_string::<i64>().value(i).to_owned())
-        }
-        arrow::datatypes::DataType::Null => Scalar::Null,
+        DataType::Utf8 => Scalar::Utf8(array.as_string::<i32>().value(i).to_owned()),
+        DataType::LargeUtf8 => Scalar::Utf8(array.as_string::<i64>().value(i).to_owned()),
+        DataType::Dictionary(_, _) => Scalar::Utf8(dict_utf8_at(array, i)?.to_owned()),
+        DataType::Null => Scalar::Null,
         dt => {
             return Err(Error::Eval(format!(
                 "unsupported grouping or join key type: {dt}"
@@ -150,4 +199,58 @@ pub(super) fn eval_all(
     batch: &crate::batch::Batch,
 ) -> Result<Vec<ArrayRef>> {
     exprs.iter().map(|e| e.eval(batch)).collect()
+}
+
+/// Utf8 (or LargeUtf8) value at `row` in a dictionary array, without allocating.
+pub(super) fn dict_utf8_at(array: &dyn Array, row: usize) -> Result<&str> {
+    let DataType::Dictionary(key, value) = array.data_type() else {
+        return Err(Error::Eval("expected dictionary grouping key".into()));
+    };
+    match (key.as_ref(), value.as_ref()) {
+        (DataType::Int8, DataType::Utf8) => dict_utf8_typed::<Int8Type>(array, row),
+        (DataType::Int16, DataType::Utf8) => dict_utf8_typed::<Int16Type>(array, row),
+        (DataType::Int32, DataType::Utf8) => dict_utf8_typed::<Int32Type>(array, row),
+        (DataType::Int64, DataType::Utf8) => dict_utf8_typed::<Int64Type>(array, row),
+        (DataType::UInt8, DataType::Utf8) => dict_utf8_typed::<UInt8Type>(array, row),
+        (DataType::UInt16, DataType::Utf8) => dict_utf8_typed::<UInt16Type>(array, row),
+        (DataType::UInt32, DataType::Utf8) => dict_utf8_typed::<UInt32Type>(array, row),
+        (DataType::UInt64, DataType::Utf8) => dict_utf8_typed::<UInt64Type>(array, row),
+        (DataType::Int32, DataType::LargeUtf8) => dict_large_utf8_typed::<Int32Type>(array, row),
+        dt => Err(Error::Eval(format!(
+            "unsupported dictionary grouping key type: {}[{}]",
+            dt.0, dt.1
+        ))),
+    }
+}
+
+fn dict_utf8_typed<K: ArrowDictionaryKeyType>(array: &dyn Array, row: usize) -> Result<&str> {
+    let dict = array
+        .as_any()
+        .downcast_ref::<DictionaryArray<K>>()
+        .ok_or_else(|| Error::Eval("dictionary key downcast failed".into()))?;
+    let idx = dict
+        .key(row)
+        .ok_or_else(|| Error::Eval("null dictionary key".into()))?;
+    let values = dict
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| Error::Eval("expected Utf8 dictionary values".into()))?;
+    Ok(values.value(idx))
+}
+
+fn dict_large_utf8_typed<K: ArrowDictionaryKeyType>(array: &dyn Array, row: usize) -> Result<&str> {
+    let dict = array
+        .as_any()
+        .downcast_ref::<DictionaryArray<K>>()
+        .ok_or_else(|| Error::Eval("dictionary key downcast failed".into()))?;
+    let idx = dict
+        .key(row)
+        .ok_or_else(|| Error::Eval("null dictionary key".into()))?;
+    let values = dict
+        .values()
+        .as_any()
+        .downcast_ref::<arrow::array::LargeStringArray>()
+        .ok_or_else(|| Error::Eval("expected LargeUtf8 dictionary values".into()))?;
+    Ok(values.value(idx))
 }

@@ -27,9 +27,9 @@ Same physical shape at every generator scale (tiny, SF1, SF10).
 
 | query | operators | SF1 wall ms | DuckDB ratio |
 | --- | --- | ---: | ---: |
-| tpch_q1 | HashAggregate → Sort over `lineitem` Scan (predicate pushed into Scan) | 923.214 | 0.022 |
+| tpch_q1 | HashAggregate → Sort over `lineitem` Scan (predicate pushed into Scan) | 776.129 | 0.026 |
 | tpch_q3 | two HashJoins, HashAggregate, Sort/Limit over customer/orders/lineitem | 1536.120 | 0.013 |
-| tpch_q6 | HashAggregate (ungrouped SUM) over `lineitem` Scan (predicate pushed into Scan) | 18.383 | 0.305 |
+| tpch_q6 | HashAggregate (ungrouped SUM) over `lineitem` Scan (predicate pushed into Scan) | 19.121 | 0.293 |
 | tpcds_store_sales | two HashJoins, HashAggregate, Sort over store_sales/item/date_dim | 695.238 | 0.019 |
 
 Scan-only `tpch_q6` is the closest gap. Grouped aggregation and the three-way
@@ -54,16 +54,17 @@ path today.
 
 q1 evaluates several arithmetic aggregates per `lineitem` row (`SUM` of
 `l_extendedprice * (1 - l_discount) * (1 + l_tax)` and related). q6 is a
-selective Filter plus one product. Group keys and aggregate arguments are
-extracted as `Scalar` values per row inside HashAggregate, then boxed into
-the hash table. That per-row path is the expression limiter.
+selective Filter plus one product. Filter and projection already run Arrow
+compute over whole arrays. Ungrouped aggregate updates (q6) fold COUNT/SUM/AVG
+kernels over those arrays. Grouped lookup (q1) hashes Utf8 and primitive cells
+in place and allocates `Scalar` keys only when inserting a new group.
 
 ### Hash aggregate
 
 q1 is a two-key grouped aggregate over six million `lineitem` rows at SF1.
 q3 and store_sales group the join output. HashAggregate exclusive time plus
-the SF1 923 ms wall for q1 put grouped aggregation in the top limiters.
-Updates walk each row, look up a `Vec<Scalar>` key, and mutate per-group
+the SF1 wall for q1 put grouped aggregation in the top limiters. Updates hash
+the grouping row in place, probe collision lists, and mutate per-group
 accumulators.
 
 ### Hash join
@@ -93,24 +94,26 @@ regardless of the worker count used for the published SF1 numbers.
 Highest impact first, feeding the follow-up Issues. Rank is exclusive
 operator time at SF1 from `gb_bench profile --sf 1`.
 
-1. **Hash join build/probe** on q3 (1663.2 ms + 348.5 ms exclusive) and
-   store_sales (663.0 ms + 171.9 ms). Peak pool 2.62 GiB / 4.10 GiB.
+1. **Hash join build/probe** on q3 (1334.6 ms + 337.6 ms exclusive) and
+   store_sales (554.3 ms + 238.1 ms). Peak pool 2.62 GiB / 4.10 GiB.
    [#104](https://github.com/Sannrox/mizuchi/issues/104)
-2. **Hash aggregate updates** on q1 (954.9 ms exclusive, peak 349 MiB).
+2. **Hash aggregate updates** on q1 (826.6 ms exclusive, peak 349 MiB).
    [#104](https://github.com/Sannrox/mizuchi/issues/104)
-3. **Per-row expression and aggregate kernels** (Scalar boxing inside those
-   same operators; q1 arithmetic, q6 Filter). [#103](https://github.com/Sannrox/mizuchi/issues/103)
+3. **Columnar expression and aggregate kernels** (whole-array filter/project
+   and ungrouped COUNT/SUM/AVG/MIN/MAX; grouped lookup hashes Utf8 in place).
+   [#103](https://github.com/Sannrox/mizuchi/issues/103)
 4. **Single-thread join/sort** (morsel workers unused on the join plans).
    [#105](https://github.com/Sannrox/mizuchi/issues/105)
 5. **Batch and key copies** between collect, hash tables, and spill (the
    2–4 GiB peaks). [#107](https://github.com/Sannrox/mizuchi/issues/107)
-6. **Scan/decode working set** (Scan exclusive is 0.5 ms on q1 and 0.09 ms
+6. **Scan/decode working set** (Scan exclusive is 0.46 ms on q1 and 0.08 ms
    on q6; Parquet projection and row-group skip would shrink the registered
    tables). [#106](https://github.com/Sannrox/mizuchi/issues/106)
 
-q6 stays the control: ungrouped SUM over a pushed-down Scan, 13.1 ms
-HashAggregate exclusive at SF1, published wall 18.4 ms, ratio 0.305.
-Closing (1)–(3) is what the 2–3× target needs on q1/q3.
+q6 stays the control: ungrouped SUM over a pushed-down Scan, 4.0 ms
+HashAggregate exclusive at SF1 (was 13.1 ms), published wall 19.1 ms.
+q1 wall dropped from 923 ms to 776 ms. Closing (1)–(2) is what the 2–3×
+target still needs on q1/q3.
 
 ## Tiny in-memory profile (default tests)
 
