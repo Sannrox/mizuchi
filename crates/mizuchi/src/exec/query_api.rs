@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 
 use super::CancelToken;
 use super::metrics::OperatorMetrics;
+use super::query_ui::{self, UiResponse};
 use super::report::{InputScan, OutputWrite, QueryReport};
 use crate::error::{Error, Result};
 
@@ -37,6 +38,9 @@ pub struct QueryApiConfig {
     pub history_path: Option<PathBuf>,
     /// How many completed queries to keep.
     pub retention: QueryRetention,
+    /// Unpacked console directory served at `/ui/`. `None` leaves those
+    /// routes absent (ADR 0014).
+    pub ui_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for QueryApiConfig {
@@ -46,6 +50,7 @@ impl std::fmt::Debug for QueryApiConfig {
             .field("auth_token", &self.auth_token.as_ref().map(|_| "_"))
             .field("history_path", &self.history_path)
             .field("retention", &self.retention)
+            .field("ui_dir", &self.ui_dir)
             .finish()
     }
 }
@@ -460,7 +465,7 @@ impl std::fmt::Debug for QueryApiServer {
 }
 
 impl QueryApiServer {
-    /// Bind `cfg.bind` and serve `/healthz` and `/v1/*` from `log`.
+    /// Bind `cfg.bind` and serve `/healthz`, `/v1/*`, and `/ui/` from `log`.
     ///
     /// Non-loopback addresses require `allow_network` (ADR 0008). Prefer
     /// [`super::Session::serve_query_api`], which passes the session grant.
@@ -491,9 +496,10 @@ impl QueryApiServer {
         let shutdown = Arc::new(AtomicBool::new(false));
         let inflight = Arc::new(AtomicUsize::new(0));
         let auth = cfg.auth_token.clone();
+        let ui_dir = cfg.ui_dir.clone();
         let stop = shutdown.clone();
         let live = inflight.clone();
-        let join = thread::spawn(move || serve_loop(listener, log, auth, stop, live));
+        let join = thread::spawn(move || serve_loop(listener, log, auth, ui_dir, stop, live));
         Ok(Self {
             addr,
             shutdown,
@@ -525,6 +531,7 @@ fn serve_loop(
     listener: TcpListener,
     log: Arc<QueryLog>,
     auth: Option<String>,
+    ui_dir: Option<PathBuf>,
     shutdown: Arc<AtomicBool>,
     inflight: Arc<AtomicUsize>,
 ) {
@@ -541,9 +548,10 @@ fn serve_loop(
                 inflight.fetch_add(1, Ordering::SeqCst);
                 let log = Arc::clone(&log);
                 let auth = auth.clone();
+                let ui_dir = ui_dir.clone();
                 let inflight = Arc::clone(&inflight);
                 thread::spawn(move || {
-                    let _ = handle_stream(&log, auth.as_deref(), &mut stream);
+                    let _ = handle_stream(&log, auth.as_deref(), ui_dir.as_deref(), &mut stream);
                     inflight.fetch_sub(1, Ordering::SeqCst);
                 });
             }
@@ -560,7 +568,12 @@ fn serve_loop(
     }
 }
 
-fn handle_stream(log: &QueryLog, auth: Option<&str>, stream: &mut TcpStream) -> Result<()> {
+fn handle_stream(
+    log: &QueryLog,
+    auth: Option<&str>,
+    ui_dir: Option<&Path>,
+    stream: &mut TcpStream,
+) -> Result<()> {
     let per_io = Duration::from_millis(200);
     stream
         .set_read_timeout(Some(per_io))
@@ -574,8 +587,19 @@ fn handle_stream(log: &QueryLog, auth: Option<&str>, stream: &mut TcpStream) -> 
     let mut parts = start.split_whitespace();
     let method = parts.next().unwrap_or("");
     let raw_path = parts.next().unwrap_or("");
+    let (path, _) = split_path(raw_path);
+    if method == "GET"
+        && let Some(root) = ui_dir
+        && query_ui::is_ui_route(&path)
+    {
+        if path == "/" || path == "/ui" {
+            return write_redirect(stream, "ui/");
+        }
+        let rel = path.strip_prefix("/ui/").unwrap_or("");
+        return write_ui(stream, query_ui::serve(root, rel));
+    }
     let (status, payload) = if let Some(token) = auth
-        && !is_public(raw_path)
+        && !is_public(raw_path, ui_dir.is_some())
         && !bearer_ok(&head, token)
     {
         (401, json!({"error": "unauthorized"}))
@@ -585,9 +609,9 @@ fn handle_stream(log: &QueryLog, auth: Option<&str>, stream: &mut TcpStream) -> 
     write_json(stream, status, &payload)
 }
 
-fn is_public(path: &str) -> bool {
+fn is_public(path: &str, ui: bool) -> bool {
     let p = path.split('?').next().unwrap_or(path);
-    p == "/healthz" || p == "/v1/schema"
+    p == "/healthz" || p == "/v1/schema" || (ui && query_ui::is_ui_route(p))
 }
 
 fn bearer_ok(head: &str, token: &str) -> bool {
@@ -1012,6 +1036,42 @@ fn write_json(stream: &mut TcpStream, status: u16, payload: &Value) -> Result<()
     Ok(())
 }
 
+fn write_redirect(stream: &mut TcpStream, location: &str) -> Result<()> {
+    let head = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|e| Error::Io(e.to_string()))
+}
+
+fn write_ui(stream: &mut TcpStream, resp: UiResponse) -> Result<()> {
+    let reason = match resp.status {
+        200 => "OK",
+        404 => "Not Found",
+        _ => "Error",
+    };
+    let extra = match resp.location {
+        Some(loc) => format!("Location: {loc}\r\n"),
+        None => String::new(),
+    };
+    let head = format!(
+        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: {}\r\nContent-Security-Policy: {}\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n{extra}\r\n",
+        resp.status,
+        resp.content_type,
+        resp.body.len(),
+        resp.cache_control,
+        query_ui::CSP,
+    );
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|e| Error::Io(e.to_string()))?;
+    stream
+        .write_all(&resp.body)
+        .map_err(|e| Error::Io(e.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1209,6 +1269,7 @@ mod tests {
             auth_token: Some("secret".into()),
             history_path: None,
             retention: QueryRetention::default(),
+            ui_dir: None,
         };
         let server = QueryApiServer::bind(log.clone(), &cfg).unwrap();
         let addr = server.addr();
@@ -1310,6 +1371,7 @@ mod tests {
                 auth_token: None,
                 history_path: None,
                 retention: QueryRetention::default(),
+                ui_dir: None,
             }),
             allow_network: false,
             ..SessionConfig::default()
@@ -1326,6 +1388,7 @@ mod tests {
             auth_token: None,
             history_path: None,
             retention: QueryRetention::default(),
+            ui_dir: None,
         };
         let server = QueryApiServer::bind_with_network(log, &cfg, true).unwrap();
         let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server.addr().port());
@@ -1343,6 +1406,7 @@ mod tests {
             auth_token: Some(String::new()),
             history_path: None,
             retention: QueryRetention::default(),
+            ui_dir: None,
         };
         let err = QueryApiServer::bind(log, &cfg).unwrap_err();
         assert!(matches!(err, Error::Plan(_)), "{err:?}");
@@ -1356,6 +1420,7 @@ mod tests {
             auth_token: None,
             history_path: None,
             retention: QueryRetention::default(),
+            ui_dir: None,
         };
         let err = QueryApiServer::bind(log, &cfg).unwrap_err();
         assert!(matches!(err, Error::Io(_)), "{err:?}");
@@ -1368,10 +1433,105 @@ mod tests {
             auth_token: Some("super-secret".into()),
             history_path: None,
             retention: QueryRetention::default(),
+            ui_dir: None,
         };
         let text = format!("{cfg:?}");
         assert!(!text.contains("super-secret"), "{text}");
         assert!(text.contains("auth_token: Some(\"_\")") || text.contains("auth_token: Some(_)"));
+    }
+
+    fn http_raw(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+    ) -> (u16, String, String) {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut req =
+            format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+        if let Some(t) = token {
+            req.push_str(&format!("Authorization: Bearer {t}\r\n"));
+        }
+        req.push_str("\r\n");
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        let status = text
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let (headers, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        (status, headers.to_string(), body.to_string())
+    }
+
+    #[test]
+    fn http_serves_console_dir_without_token_and_keeps_api_auth() {
+        let root = std::env::temp_dir().join(format!("mizuchi-ui-http-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::write(
+            root.join("index.html"),
+            "<!doctype html><html><head><title>mizuchi</title><script type=\"module\" src=\"./assets/app.js\"></script></head></html>",
+        )
+        .unwrap();
+        std::fs::write(root.join("assets/app.js"), "export {}").unwrap();
+        let log = StdArc::new(QueryLog::memory(QueryRetention::default()));
+        let cfg = QueryApiConfig {
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            auth_token: Some("secret".into()),
+            history_path: None,
+            retention: QueryRetention::default(),
+            ui_dir: Some(root.clone()),
+        };
+        let server = QueryApiServer::bind(log, &cfg).unwrap();
+        let addr = server.addr();
+
+        let (st, headers, _) = http_raw(addr, "GET", "/", None);
+        assert_eq!(st, 302);
+        assert!(
+            headers.to_ascii_lowercase().contains("location: ui/"),
+            "{headers}"
+        );
+
+        let (st, headers, body) = http_raw(addr, "GET", "/ui/", None);
+        assert_eq!(st, 200);
+        assert!(body.contains("mizuchi"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("content-security-policy:"),
+            "{headers}"
+        );
+
+        let (st, _, body) = http_raw(addr, "GET", "/ui/running", None);
+        assert_eq!(st, 200);
+        assert!(body.contains("mizuchi"));
+
+        let (st, _, body) = http_raw(addr, "GET", "/ui/queries/q-1", None);
+        assert_eq!(st, 200);
+        assert!(body.contains("<base href=\"../\">"), "{body}");
+
+        let (st, _, body) = http_raw(addr, "GET", "/ui/assets/app.js", None);
+        assert_eq!(st, 200);
+        assert_eq!(body, "export {}");
+
+        let (st, _, _) = http_raw(addr, "GET", "/ui/../Cargo.toml", None);
+        assert_eq!(st, 404);
+        let (st, _, _) = http_raw(addr, "GET", "/ui/%2e%2e/Cargo.toml", None);
+        assert_eq!(st, 404);
+
+        let (st, _) = http_json(addr, "GET", "/v1/queries", None);
+        assert_eq!(st, 401);
+        let (st, _) = http_json(addr, "GET", "/v1/queries", Some("secret"));
+        assert_eq!(st, 200);
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

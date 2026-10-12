@@ -71,7 +71,8 @@ serves a versioned HTTP API (`/v1`, contract `mizuchi.query-api/v1` in
 `/healthz`) so external UIs can list completed queries, inspect plans and
 operator metrics, watch running queries, and cancel (ADR 0012). The JSON
 schema is `crates/mizuchi/schemas/query-api-v1.json`. Bind address, optional bearer
-token, and history path are set by the embedder; loopback listens do not
+token, history path, and optional unpacked console directory (`ui_dir`, served
+at `/ui/`) are set by the embedder (ADR 0014); loopback listens do not
 require `allow_network`.
 `mizuchi::VERSION` and `Session::explain` are the strings a runner
 records. A complete walk-through is `cargo run -p mizuchi --example embed`.
