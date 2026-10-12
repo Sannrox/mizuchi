@@ -109,6 +109,7 @@ fn limiters_rank_suite_queries_and_follow_ups() {
         "tpcds_store_sales",
         "exclusive",
         "peak_bytes",
+        "copied_bytes",
         "Scan",
         "Expression",
         "Hash aggregate",

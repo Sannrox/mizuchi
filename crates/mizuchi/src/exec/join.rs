@@ -68,16 +68,16 @@ pub(super) fn run(
         spec.join_type,
         JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti
     ) {
-        return semi_anti_chunks(&left_chunks, &right_chunks, &spec, policy);
+        return semi_anti_chunks(&left_chunks, &right_chunks, &spec, policy, pool);
     }
     if spec.join_type == JoinType::Inner {
         if spilled {
             let mut parts = Vec::new();
             for l in &left_chunks {
-                let l = load_chunk(l, spec.left_schema.clone())?;
+                let l = load_chunk(l, spec.left_schema.clone(), pool)?;
                 for r in &right_chunks {
-                    let r = load_chunk(r, spec.right_schema.clone())?;
-                    parts.push(join_pair(&l, &r, &spec, policy, workers)?);
+                    let r = load_chunk(r, spec.right_schema.clone(), pool)?;
+                    parts.push(join_pair(&l, &r, &spec, policy, workers, pool)?);
                 }
             }
             return Ok(parts
@@ -89,23 +89,23 @@ pub(super) fn run(
         let left = take_batches(left_chunks, spec.left_schema.clone())?;
         let right = take_batches(right_chunks, spec.right_schema.clone())?;
         if left.len() == 1 && right.len() == 1 {
-            return join_pair(&left[0], &right[0], &spec, policy, workers);
+            return join_pair(&left[0], &right[0], &spec, policy, workers, pool);
         }
-        return hash_join_streamed(&left, &right, &spec, policy, workers);
+        return hash_join_streamed(&left, &right, &spec, policy, workers, pool);
     }
-    let mut parts = Vec::new();
-    for l in &left_chunks {
-        let l = load_chunk(l, spec.left_schema.clone())?;
-        for r in &right_chunks {
-            let r = load_chunk(r, spec.right_schema.clone())?;
-            parts.push(join_pair(&l, &r, &spec, policy, workers)?);
-        }
-    }
-    Ok(parts
-        .into_iter()
-        .flatten()
-        .filter(|b| b.num_rows() > 0)
-        .collect())
+    // Unmatched rows for LEFT/RIGHT/FULL are relative to the whole opposite
+    // side. Concatenate once, then emit unmatched rows a single time.
+    let left = concat_chunk(
+        &take_batches(left_chunks, spec.left_schema.clone())?,
+        spec.left_schema.clone(),
+        pool,
+    )?;
+    let right = concat_chunk(
+        &take_batches(right_chunks, spec.right_schema.clone())?,
+        spec.right_schema.clone(),
+        pool,
+    )?;
+    join_pair(&left, &right, &spec, policy, workers, pool)
 }
 
 /// Inner join whose output is aggregated immediately so the wide join
@@ -129,10 +129,17 @@ pub(super) fn run_then_agg(
     if pool.has_limit() {
         let mut joined = Vec::new();
         for l in &left_chunks {
-            let l = load_chunk(l, spec.left_schema.clone())?;
+            let l = load_chunk(l, spec.left_schema.clone(), pool)?;
             for r in &right_chunks {
-                let r = load_chunk(r, spec.right_schema.clone())?;
-                joined.extend(join_pair(&l, &r, &spec, &session.policy, session.workers)?);
+                let r = load_chunk(r, spec.right_schema.clone(), pool)?;
+                joined.extend(join_pair(
+                    &l,
+                    &r,
+                    &spec,
+                    &session.policy,
+                    session.workers,
+                    pool,
+                )?);
             }
         }
         if joined.is_empty() {
@@ -162,6 +169,7 @@ pub(super) fn run_then_agg(
             aggs,
             out_schema.clone(),
             session,
+            pool,
         )?
     {
         return Ok(out);
@@ -169,7 +177,14 @@ pub(super) fn run_then_agg(
     let mut joined = Vec::new();
     for l in &left {
         for r in &right {
-            joined.extend(join_pair(l, r, &spec, &session.policy, session.workers)?);
+            joined.extend(join_pair(
+                l,
+                r,
+                &spec,
+                &session.policy,
+                session.workers,
+                pool,
+            )?);
         }
     }
     if joined.is_empty() {
@@ -208,6 +223,7 @@ pub(super) fn run_then_agg(
     agg::merge_finish(tables, group, aggs, out_schema, &session.policy)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fold_unique_i64_join(
     left: &[Batch],
     right: &[Batch],
@@ -216,6 +232,7 @@ fn fold_unique_i64_join(
     aggs: &[(String, AggCall)],
     out_schema: SchemaRef,
     session: &Session,
+    pool: &MemoryPool,
 ) -> Result<Option<Vec<Batch>>> {
     let left_ncols = spec.left_schema.fields().len();
     let split = match spec.on {
@@ -236,7 +253,7 @@ fn fold_unique_i64_join(
     } else {
         (right, left, spec.right_schema.clone())
     };
-    let build = concat_chunk(build_batches, build_schema)?;
+    let build = concat_chunk(build_batches, build_schema, pool)?;
     let n_build = build.num_rows();
     let build_keys: Vec<ArrayRef> = if build_left {
         split
@@ -516,12 +533,12 @@ fn chunks_on_disk(chunks: &[Chunk]) -> bool {
     chunks.iter().any(|c| matches!(c, Chunk::File(_)))
 }
 
-fn load_chunk(chunk: &Chunk, schema: SchemaRef) -> Result<Batch> {
+fn load_chunk(chunk: &Chunk, schema: SchemaRef, pool: &MemoryPool) -> Result<Batch> {
     match chunk {
         Chunk::Mem(b) => Ok(b.clone()),
         Chunk::File(p) => {
             let batches = memory::read_spill(p, schema.clone())?;
-            concat_chunk(&batches, schema)
+            concat_chunk(&batches, schema, pool)
         }
     }
 }
@@ -557,7 +574,16 @@ fn collect_chunks(
     cancel: &CancelToken,
 ) -> Result<Vec<Chunk>> {
     if !pool.has_limit() {
-        return Ok(vec![Chunk::Mem(concat_exec(exec, schema, cancel)?)]);
+        let mut out = Vec::new();
+        while let Some(batch) = exec.next_batch(cancel)? {
+            if batch.num_rows() > 0 {
+                out.push(Chunk::Mem(batch));
+            }
+        }
+        if out.is_empty() {
+            out.push(Chunk::Mem(Batch::empty(schema)?));
+        }
+        return Ok(out);
     }
     let mut out = Vec::new();
     let mut cur: Vec<Batch> = Vec::new();
@@ -594,7 +620,7 @@ fn collect_chunks(
     }
     if !cur.is_empty() {
         if out.is_empty() {
-            out.push(Chunk::Mem(concat_chunk(&cur, schema)?));
+            out.push(Chunk::Mem(concat_chunk(&cur, schema, pool)?));
         } else {
             out.push(spill_chunk(&cur, schema, pool)?);
         }
@@ -605,19 +631,25 @@ fn collect_chunks(
 }
 
 fn spill_chunk(cur: &[Batch], schema: SchemaRef, pool: &MemoryPool) -> Result<Chunk> {
-    let batch = concat_chunk(cur, schema.clone())?;
+    let batch = concat_chunk(cur, schema.clone(), pool)?;
     let path = pool.spill_path()?;
     memory::write_spill(&path, schema, std::slice::from_ref(&batch))?;
     Ok(Chunk::File(path))
 }
 
-fn concat_chunk(batches: &[Batch], schema: SchemaRef) -> Result<Batch> {
-    if batches.is_empty() {
-        return Batch::empty(schema);
+fn concat_chunk(batches: &[Batch], schema: SchemaRef, pool: &MemoryPool) -> Result<Batch> {
+    match batches {
+        [] => Batch::empty(schema),
+        [one] if one.num_columns() == 0 => Ok(one.clone()),
+        [one] => Batch::try_new(schema, one.as_arrow().columns().to_vec()),
+        _ => {
+            let arrows: Vec<RecordBatch> = batches.iter().map(|b| b.as_arrow().clone()).collect();
+            let inner = concat_batches(&schema, &arrows).map_err(|e| Error::Eval(e.to_string()))?;
+            let out = Batch::from_arrow(inner)?;
+            pool.record_copy(batch_bytes(&out));
+            Ok(out)
+        }
     }
-    let arrows: Vec<RecordBatch> = batches.iter().map(|b| b.as_arrow().clone()).collect();
-    let inner = concat_batches(&schema, &arrows).map_err(|e| Error::Eval(e.to_string()))?;
-    Batch::from_arrow(inner)
 }
 
 fn semi_anti_chunks(
@@ -625,13 +657,14 @@ fn semi_anti_chunks(
     right_chunks: &[Chunk],
     spec: &JoinSpec<'_>,
     policy: &BatchPolicy,
+    pool: &MemoryPool,
 ) -> Result<Vec<Batch>> {
     let keep_hit = spec.join_type == JoinType::Semi;
     let naaj = spec.join_type == JoinType::NullAwareAnti;
     let mut right_rows = 0usize;
     if naaj {
         for r in right_chunks {
-            let right = load_chunk(r, spec.right_schema.clone())?;
+            let right = load_chunk(r, spec.right_schema.clone(), pool)?;
             right_rows += right.num_rows();
             if right_has_null_key(&right, spec)? {
                 return Ok(Vec::new());
@@ -640,11 +673,11 @@ fn semi_anti_chunks(
     }
     let mut parts = Vec::new();
     for l in left_chunks {
-        let left = load_chunk(l, spec.left_schema.clone())?;
+        let left = load_chunk(l, spec.left_schema.clone(), pool)?;
         let mut hits = vec![false; left.num_rows()];
         for r in right_chunks {
-            let right = load_chunk(r, spec.right_schema.clone())?;
-            or_left_hits(&left, &right, spec, &mut hits)?;
+            let right = load_chunk(r, spec.right_schema.clone(), pool)?;
+            or_left_hits(&left, &right, spec, &mut hits, pool)?;
         }
         if naaj && right_rows > 0 {
             mark_null_left_keys(&left, spec, &mut hits)?;
@@ -655,7 +688,7 @@ fn semi_anti_chunks(
             .filter(|(_, hit)| **hit == keep_hit)
             .map(|(i, _)| i as u32)
             .collect();
-        let out = take_left(&left, &indices, spec.schema.clone())?;
+        let out = take_left(&left, &indices, spec.schema.clone(), pool)?;
         parts.extend(
             out.split_by_policy(policy)
                 .into_iter()
@@ -665,11 +698,17 @@ fn semi_anti_chunks(
     Ok(parts)
 }
 
-fn or_left_hits(left: &Batch, right: &Batch, spec: &JoinSpec<'_>, hits: &mut [bool]) -> Result<()> {
+fn or_left_hits(
+    left: &Batch,
+    right: &Batch,
+    spec: &JoinSpec<'_>,
+    hits: &mut [bool],
+    pool: &MemoryPool,
+) -> Result<()> {
     if spec.join_type == JoinType::NullAwareAnti {
         let pairs = naaj_pairs(spec)?;
         if !pairs.is_empty() {
-            return probe_equi_hits(left, right, &pairs, None, hits);
+            return probe_equi_hits(left, right, &pairs, None, hits, pool);
         }
     }
     let split = match spec.on {
@@ -686,7 +725,8 @@ fn or_left_hits(left: &Batch, right: &Batch, spec: &JoinSpec<'_>, hits: &mut [bo
                 continue;
             }
             for rrow in 0..right.num_rows() {
-                if cartesian || residual_ok(left, right, lrow, rrow, split.residual.as_ref())? {
+                if cartesian || residual_ok(left, right, lrow, rrow, split.residual.as_ref(), pool)?
+                {
                     *hit = true;
                     break;
                 }
@@ -694,7 +734,14 @@ fn or_left_hits(left: &Batch, right: &Batch, spec: &JoinSpec<'_>, hits: &mut [bo
         }
         return Ok(());
     }
-    probe_equi_hits(left, right, &split.keys, split.residual.as_ref(), hits)
+    probe_equi_hits(
+        left,
+        right,
+        &split.keys,
+        split.residual.as_ref(),
+        hits,
+        pool,
+    )
 }
 
 fn probe_equi_hits(
@@ -703,6 +750,7 @@ fn probe_equi_hits(
     keys: &[(Expr, Expr)],
     residual: Option<&Expr>,
     hits: &mut [bool],
+    pool: &MemoryPool,
 ) -> Result<()> {
     let left_keys: Vec<ArrayRef> = keys
         .iter()
@@ -718,7 +766,7 @@ fn probe_equi_hits(
             continue;
         }
         table.for_matches(&left_keys, lrow, |rrow| {
-            if residual_ok(left, right, lrow, rrow as usize, residual)? {
+            if residual_ok(left, right, lrow, rrow as usize, residual, pool)? {
                 *hit = true;
                 Ok(false)
             } else {
@@ -791,12 +839,14 @@ fn mark_null_left_keys(left: &Batch, spec: &JoinSpec<'_>, hits: &mut [bool]) -> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn join_pair(
     left_batch: &Batch,
     right_batch: &Batch,
     spec: &JoinSpec<'_>,
     policy: &BatchPolicy,
     workers: usize,
+    pool: &MemoryPool,
 ) -> Result<Vec<Batch>> {
     let left_ncols = left_batch.num_columns();
     let split = match spec.on {
@@ -813,6 +863,7 @@ fn join_pair(
             spec.join_type,
             split.residual.as_ref(),
             spec.schema.clone(),
+            pool,
         )?;
         return Ok(out
             .split_by_policy(policy)
@@ -841,6 +892,7 @@ fn join_pair(
             left_batch.num_rows() < right_batch.num_rows(),
             workers,
             policy,
+            pool,
         );
     }
     let out = hash_join(
@@ -851,6 +903,7 @@ fn join_pair(
         split.residual.as_ref(),
         spec.schema.clone(),
         workers,
+        pool,
     )?;
     Ok(out
         .split_by_policy(policy)
@@ -867,6 +920,7 @@ fn hash_join_streamed(
     spec: &JoinSpec<'_>,
     policy: &BatchPolicy,
     workers: usize,
+    pool: &MemoryPool,
 ) -> Result<Vec<Batch>> {
     let left_ncols = spec.left_schema.fields().len();
     let split = match spec.on {
@@ -877,9 +931,9 @@ fn hash_join_streamed(
         },
     };
     if split.keys.is_empty() {
-        let l = concat_chunk(left, spec.left_schema.clone())?;
-        let r = concat_chunk(right, spec.right_schema.clone())?;
-        return join_pair(&l, &r, spec, policy, workers);
+        let l = concat_chunk(left, spec.left_schema.clone(), pool)?;
+        let r = concat_chunk(right, spec.right_schema.clone(), pool)?;
+        return join_pair(&l, &r, spec, policy, workers, pool);
     }
     let ln: usize = left.iter().map(Batch::num_rows).sum();
     let rn: usize = right.iter().map(Batch::num_rows).sum();
@@ -889,7 +943,7 @@ fn hash_join_streamed(
     } else {
         (right, left, spec.right_schema.clone())
     };
-    let build = concat_chunk(build_batches, build_schema)?;
+    let build = concat_chunk(build_batches, build_schema, pool)?;
     let build_keys: Vec<ArrayRef> = if build_left {
         split
             .keys
@@ -937,6 +991,7 @@ fn hash_join_streamed(
                 build_left,
                 spec.schema.clone(),
                 policy,
+                pool,
             )?);
         }
         return Ok(out);
@@ -971,6 +1026,7 @@ fn hash_join_streamed(
                         build_left,
                         spec.schema.clone(),
                         policy,
+                        pool,
                     )?;
                     parts
                         .lock()
@@ -1002,6 +1058,7 @@ fn probe_inner_batch(
     build_left: bool,
     schema: SchemaRef,
     policy: &BatchPolicy,
+    pool: &MemoryPool,
 ) -> Result<Vec<Batch>> {
     if probe.num_rows() == 0 {
         return Ok(Vec::new());
@@ -1028,6 +1085,7 @@ fn probe_inner_batch(
                 build_left,
                 0,
                 probe.num_rows(),
+                pool,
             )?
         }
     } else {
@@ -1040,32 +1098,18 @@ fn probe_inner_batch(
             build_left,
             0,
             probe.num_rows(),
+            pool,
         )?
     };
     if left_idx.is_empty() {
         return Ok(Vec::new());
     }
-    let joined = hconcat_take(left, right, &left_idx, &right_idx, schema)?;
+    let joined = hconcat_take(left, right, &left_idx, &right_idx, schema, pool)?;
     Ok(joined
         .split_by_policy(policy)
         .into_iter()
         .filter(|b| b.num_rows() > 0)
         .collect())
-}
-
-fn concat_exec(exec: &mut dyn Operator, schema: SchemaRef, cancel: &CancelToken) -> Result<Batch> {
-    let mut batches = Vec::new();
-    while let Some(batch) = exec.next_batch(cancel)? {
-        if batch.num_rows() > 0 {
-            batches.push(batch);
-        }
-    }
-    if batches.is_empty() {
-        return Batch::empty(schema);
-    }
-    let arrows: Vec<RecordBatch> = batches.into_iter().map(Batch::into_arrow).collect();
-    let inner = concat_batches(&schema, &arrows).map_err(|e| Error::Eval(e.to_string()))?;
-    Batch::from_arrow(inner)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1077,6 +1121,7 @@ fn hash_join(
     residual: Option<&Expr>,
     schema: SchemaRef,
     _workers: usize,
+    pool: &MemoryPool,
 ) -> Result<Batch> {
     let left_keys: Vec<ArrayRef> = eq_keys
         .iter()
@@ -1096,7 +1141,7 @@ fn hash_join(
     for lrow in 0..left.num_rows() {
         let mut matched = false;
         table.for_matches(&left_keys, lrow, |rrow| {
-            if residual_ok(left, right, lrow, rrow as usize, residual)? {
+            if residual_ok(left, right, lrow, rrow as usize, residual, pool)? {
                 matched = true;
                 build_hit[rrow as usize] = true;
                 left_idx.push(lrow as u32);
@@ -1113,23 +1158,24 @@ fn hash_join(
         JoinType::Inner => unreachable!("inner uses inner_hash_join"),
         JoinType::Left => {
             append_unmatched_left(&mut left_idx, &mut right_idx, &unmatched_left);
-            hconcat_take(left, right, &left_idx, &right_idx, schema)
+            hconcat_take(left, right, &left_idx, &right_idx, schema, pool)
         }
         JoinType::Right => {
             append_unmatched_right(&mut left_idx, &mut right_idx, &build_hit);
-            hconcat_take(left, right, &left_idx, &right_idx, schema)
+            hconcat_take(left, right, &left_idx, &right_idx, schema, pool)
         }
         JoinType::Full => {
             append_unmatched_left(&mut left_idx, &mut right_idx, &unmatched_left);
             append_unmatched_right(&mut left_idx, &mut right_idx, &build_hit);
-            hconcat_take(left, right, &left_idx, &right_idx, schema)
+            hconcat_take(left, right, &left_idx, &right_idx, schema, pool)
         }
         JoinType::Semi => take_left(
             left,
             &matched_once(&unmatched_left, left.num_rows()),
             schema,
+            pool,
         ),
-        JoinType::Anti => take_left(left, &unmatched_left, schema),
+        JoinType::Anti => take_left(left, &unmatched_left, schema, pool),
         JoinType::NullAwareAnti => Err(Error::Eval(
             "internal: null-aware anti used the hash path".into(),
         )),
@@ -1146,6 +1192,7 @@ fn emit_join_chunks(
     right_idx: &[u32],
     schema: SchemaRef,
     policy: &BatchPolicy,
+    pool: &MemoryPool,
 ) -> Result<Vec<Batch>> {
     if left_idx.is_empty() {
         return Ok(Vec::new());
@@ -1161,6 +1208,7 @@ fn emit_join_chunks(
             &left_idx[start..end],
             &right_idx[start..end],
             schema.clone(),
+            pool,
         )?);
         start = end;
     }
@@ -1178,6 +1226,7 @@ fn inner_hash_join(
     build_left: bool,
     workers: usize,
     policy: &BatchPolicy,
+    pool: &MemoryPool,
 ) -> Result<Vec<Batch>> {
     let (build_keys, probe_keys, n_build, n_probe) = if build_left {
         (left_keys, right_keys, left.num_rows(), right.num_rows())
@@ -1188,14 +1237,14 @@ fn inner_hash_join(
     let n = workers.max(1).min(n_probe.max(1));
     if residual.is_none() && table.has_unique_i64(probe_keys) {
         return unique_i64_join(
-            &table, probe_keys, left, right, build_left, schema, n, policy,
+            &table, probe_keys, left, right, build_left, schema, n, policy, pool,
         );
     }
     if n <= 1 {
         let (left_idx, right_idx) = probe_inner_range(
-            &table, probe_keys, left, right, residual, build_left, 0, n_probe,
+            &table, probe_keys, left, right, residual, build_left, 0, n_probe, pool,
         )?;
-        return emit_join_chunks(left, right, &left_idx, &right_idx, schema, policy);
+        return emit_join_chunks(left, right, &left_idx, &right_idx, schema, policy, pool);
     }
     let chunk = n_probe.div_ceil(n);
     let parts = Mutex::new(Vec::new());
@@ -1211,7 +1260,7 @@ fn inner_hash_join(
             let parts = &parts;
             handles.push(scope.spawn(move || -> Result<()> {
                 let pair = probe_inner_range(
-                    table, probe_keys, left, right, residual, build_left, start, end,
+                    table, probe_keys, left, right, residual, build_left, start, end, pool,
                 )?;
                 parts
                     .lock()
@@ -1236,7 +1285,7 @@ fn inner_hash_join(
         left_idx.extend(l);
         right_idx.extend(r);
     }
-    emit_join_chunks(left, right, &left_idx, &right_idx, schema, policy)
+    emit_join_chunks(left, right, &left_idx, &right_idx, schema, policy, pool)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1249,6 +1298,7 @@ fn unique_i64_join(
     schema: SchemaRef,
     workers: usize,
     policy: &BatchPolicy,
+    pool: &MemoryPool,
 ) -> Result<Vec<Batch>> {
     let n_probe = if build_left {
         right.num_rows()
@@ -1260,7 +1310,7 @@ fn unique_i64_join(
         let (left_idx, right_idx) = table
             .probe_unique_i64(probe_keys, build_left)?
             .ok_or_else(|| Error::Eval("expected unique i64 join map".into()))?;
-        return emit_join_chunks(left, right, &left_idx, &right_idx, schema, policy);
+        return emit_join_chunks(left, right, &left_idx, &right_idx, schema, policy, pool);
     }
     let chunk = n_probe.div_ceil(n);
     let parts = Mutex::new(Vec::new());
@@ -1298,7 +1348,7 @@ fn unique_i64_join(
         left_idx.extend(l);
         right_idx.extend(r);
     }
-    emit_join_chunks(left, right, &left_idx, &right_idx, schema, policy)
+    emit_join_chunks(left, right, &left_idx, &right_idx, schema, policy, pool)
 }
 
 fn unique_i64_brow(
@@ -1370,6 +1420,7 @@ fn probe_inner_range(
     build_left: bool,
     start: usize,
     end: usize,
+    pool: &MemoryPool,
 ) -> Result<(Vec<u32>, Vec<u32>)> {
     let mut left_idx = Vec::new();
     let mut right_idx = Vec::new();
@@ -1380,7 +1431,7 @@ fn probe_inner_range(
             } else {
                 (prow as u32, brow)
             };
-            if residual_ok(left, right, lrow as usize, rrow as usize, residual)? {
+            if residual_ok(left, right, lrow as usize, rrow as usize, residual, pool)? {
                 left_idx.push(lrow);
                 right_idx.push(rrow);
             }
@@ -1724,6 +1775,7 @@ fn nested_loop(
     join_type: JoinType,
     residual: Option<&Expr>,
     schema: SchemaRef,
+    pool: &MemoryPool,
 ) -> Result<Batch> {
     let mut left_idx = Vec::new();
     let mut right_idx = Vec::new();
@@ -1734,7 +1786,7 @@ fn nested_loop(
     for lrow in 0..left.num_rows() {
         let mut matched = false;
         for (rrow, hit) in build_hit.iter_mut().enumerate() {
-            if cartesian || residual_ok(left, right, lrow, rrow, residual)? {
+            if cartesian || residual_ok(left, right, lrow, rrow, residual, pool)? {
                 matched = true;
                 *hit = true;
                 left_idx.push(lrow as u32);
@@ -1748,27 +1800,28 @@ fn nested_loop(
 
     match join_type {
         JoinType::Inner | JoinType::Cross => {
-            hconcat_take(left, right, &left_idx, &right_idx, schema)
+            hconcat_take(left, right, &left_idx, &right_idx, schema, pool)
         }
         JoinType::Left => {
             append_unmatched_left(&mut left_idx, &mut right_idx, &unmatched_left);
-            hconcat_take(left, right, &left_idx, &right_idx, schema)
+            hconcat_take(left, right, &left_idx, &right_idx, schema, pool)
         }
         JoinType::Right => {
             append_unmatched_right(&mut left_idx, &mut right_idx, &build_hit);
-            hconcat_take(left, right, &left_idx, &right_idx, schema)
+            hconcat_take(left, right, &left_idx, &right_idx, schema, pool)
         }
         JoinType::Full => {
             append_unmatched_left(&mut left_idx, &mut right_idx, &unmatched_left);
             append_unmatched_right(&mut left_idx, &mut right_idx, &build_hit);
-            hconcat_take(left, right, &left_idx, &right_idx, schema)
+            hconcat_take(left, right, &left_idx, &right_idx, schema, pool)
         }
         JoinType::Semi => take_left(
             left,
             &matched_once(&unmatched_left, left.num_rows()),
             schema,
+            pool,
         ),
-        JoinType::Anti => take_left(left, &unmatched_left, schema),
+        JoinType::Anti => take_left(left, &unmatched_left, schema, pool),
         JoinType::NullAwareAnti => Err(Error::Eval(
             "internal: null-aware anti used the nested-loop path".into(),
         )),
@@ -1807,6 +1860,7 @@ fn residual_ok(
     lrow: usize,
     rrow: usize,
     residual: Option<&Expr>,
+    pool: &MemoryPool,
 ) -> Result<bool> {
     let Some(pred) = residual else {
         return Ok(true);
@@ -1817,6 +1871,7 @@ fn residual_ok(
         &[lrow as u32],
         &[rrow as u32],
         join_pair_schema(left, right),
+        pool,
     )?;
     Ok(filter_batch(&pair, pred)?.is_some())
 }
@@ -1831,6 +1886,7 @@ fn hconcat_take(
     left_idx: &[u32],
     right_idx: &[u32],
     schema: SchemaRef,
+    pool: &MemoryPool,
 ) -> Result<Batch> {
     debug_assert_eq!(left_idx.len(), right_idx.len());
     let n = left_idx.len();
@@ -1838,16 +1894,28 @@ fn hconcat_take(
         return Batch::empty(schema);
     }
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    columns.extend(take_or_null(left, left_idx)?);
-    columns.extend(take_or_null(right, right_idx)?);
+    columns.extend(take_or_null(left, left_idx, pool)?);
+    columns.extend(take_or_null(right, right_idx, pool)?);
     Batch::try_new(schema, columns)
 }
 
-fn take_or_null(batch: &Batch, indices: &[u32]) -> Result<Vec<ArrayRef>> {
+fn take_or_null(batch: &Batch, indices: &[u32], pool: &MemoryPool) -> Result<Vec<ArrayRef>> {
+    if !indices.contains(&u32::MAX)
+        && let Some((offset, length)) = crate::batch::contiguous_indices(indices)
+    {
+        return Ok(batch
+            .as_arrow()
+            .columns()
+            .iter()
+            .map(|c| c.slice(offset, length))
+            .collect());
+    }
     let mut out = Vec::with_capacity(batch.num_columns());
     for col in batch.as_arrow().columns() {
         out.push(take_with_nulls(col, indices)?);
     }
+    let bytes: u64 = out.iter().map(|c| c.get_array_memory_size() as u64).sum();
+    pool.record_copy(bytes);
     Ok(out)
 }
 
@@ -1876,16 +1944,15 @@ fn take_with_nulls(col: &ArrayRef, indices: &[u32]) -> Result<ArrayRef> {
     zip(&mask, &taken, &nulls).map_err(|e| Error::Eval(e.to_string()))
 }
 
-fn take_left(left: &Batch, indices: &[u32], schema: SchemaRef) -> Result<Batch> {
-    if indices.is_empty() {
-        return Batch::empty(schema);
+fn take_left(left: &Batch, indices: &[u32], schema: SchemaRef, pool: &MemoryPool) -> Result<Batch> {
+    let gathered = left.gather(indices)?;
+    if !indices.is_empty() && crate::batch::contiguous_indices(indices).is_none() {
+        pool.record_copy(batch_bytes(&gathered));
     }
-    let idx = UInt32Array::from(indices.to_vec());
-    let mut columns = Vec::with_capacity(left.num_columns());
-    for col in left.as_arrow().columns() {
-        columns.push(take(col.as_ref(), &idx, None).map_err(|e| Error::Eval(e.to_string()))?);
+    if gathered.num_columns() == 0 {
+        return Ok(gathered);
     }
-    Batch::try_new(schema, columns)
+    Batch::try_new(schema, gathered.as_arrow().columns().to_vec())
 }
 
 struct EquiSplit {
@@ -2237,5 +2304,46 @@ mod tests {
             int_relation::<Int64Type>(&arr, 0),
             IntRelation::Hash(_)
         ));
+    }
+
+    #[test]
+    fn concat_chunk_reuses_a_single_batch() {
+        use std::sync::Arc;
+
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
+        )
+        .unwrap();
+        let pool = MemoryPool::new(None, None).unwrap();
+        let out = concat_chunk(std::slice::from_ref(&batch), schema, &pool).unwrap();
+        assert_eq!(pool.copied(), 0);
+        assert!(Arc::ptr_eq(out.column(0), batch.column(0)));
+    }
+
+    #[test]
+    fn concat_chunk_records_bytes_when_merging() {
+        use std::sync::Arc;
+
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let a = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .unwrap();
+        let b = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![2_i64]))],
+        )
+        .unwrap();
+        let pool = MemoryPool::new(None, None).unwrap();
+        let out = concat_chunk(&[a, b], schema, &pool).unwrap();
+        assert_eq!(out.num_rows(), 2);
+        assert!(pool.copied() > 0);
     }
 }

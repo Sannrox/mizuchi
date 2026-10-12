@@ -33,6 +33,7 @@ pub(crate) struct MemoryPool {
     limit: Option<u64>,
     used: Arc<AtomicU64>,
     peak: AtomicU64,
+    copied: Arc<AtomicU64>,
     spill_dir: Option<PathBuf>,
     seq: AtomicU64,
 }
@@ -66,6 +67,7 @@ impl MemoryPool {
             limit,
             used,
             peak: AtomicU64::new(0),
+            copied: Arc::new(AtomicU64::new(0)),
             spill_dir,
             seq: AtomicU64::new(1),
         })
@@ -117,6 +119,20 @@ impl MemoryPool {
 
     pub(super) fn peak(&self) -> u64 {
         self.peak.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn record_copy(&self, bytes: u64) {
+        if bytes > 0 {
+            self.copied.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn copied(&self) -> u64 {
+        self.copied.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn copied_handle(&self) -> Arc<AtomicU64> {
+        self.copied.clone()
     }
 
     pub(super) fn spill_path(&self) -> Result<PathBuf> {

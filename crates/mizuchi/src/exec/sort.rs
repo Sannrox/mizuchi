@@ -5,7 +5,7 @@
 //! lexicographic sort. LIMIT after ORDER BY asks that sort for only the first
 //! `skip + fetch` keys, then drops the offset.
 
-use arrow::array::{Array, RecordBatch};
+use arrow::array::{Array, RecordBatch, UInt32Array};
 use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::SchemaRef;
 
@@ -32,7 +32,7 @@ pub(super) fn ordered(
         return Ok(Vec::new());
     }
     if !pool.has_limit() {
-        return sort_concat(&mut child, schema, order, skip, fetch, policy, cancel);
+        return sort_concat(&mut child, schema, order, skip, fetch, policy, pool, cancel);
     }
     let mut run: Vec<Batch> = Vec::new();
     let mut held: Vec<memory::Reservation<'_>> = Vec::new();
@@ -70,7 +70,16 @@ pub(super) fn ordered(
     if spills.is_empty() {
         drop(held);
         let mut concat = batches_to_exec(run, schema.clone());
-        return sort_concat(&mut concat, schema, order, skip, fetch, policy, cancel);
+        return sort_concat(
+            &mut concat,
+            schema,
+            order,
+            skip,
+            fetch,
+            policy,
+            pool,
+            cancel,
+        );
     }
     if !run.is_empty() {
         spills.push(spill_sorted_run(&run, schema.clone(), order, pool, cancel)?);
@@ -78,9 +87,10 @@ pub(super) fn ordered(
         run.clear();
     }
     let merged = merge_spilled(spills, schema.clone(), order, pool, cancel)?;
-    apply_skip_fetch(merged, schema, skip, fetch, policy, cancel)
+    apply_skip_fetch(merged, schema, skip, fetch, policy, pool, cancel)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sort_concat(
     child: &mut dyn Operator,
     schema: SchemaRef,
@@ -88,10 +98,11 @@ fn sort_concat(
     skip: u64,
     fetch: Option<u64>,
     policy: &BatchPolicy,
+    pool: &MemoryPool,
     cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
-    let batch = concat_exec(child, schema.clone(), cancel)?;
-    sort_batch(&batch, order, skip, fetch, policy)
+    let batch = concat_exec(child, schema.clone(), pool, cancel)?;
+    sort_batch(&batch, order, skip, fetch, policy, pool)
 }
 
 fn sort_batch(
@@ -100,6 +111,7 @@ fn sort_batch(
     skip: u64,
     fetch: Option<u64>,
     policy: &BatchPolicy,
+    pool: &MemoryPool,
 ) -> Result<Vec<Batch>> {
     let n = batch.num_rows();
     let skip = clamp_rows(skip, n);
@@ -124,7 +136,7 @@ fn sort_batch(
     let indices = lexsort_to_indices(&columns, k).map_err(|e| Error::Eval(e.to_string()))?;
     let start = skip.min(indices.len());
     let len = indices.len() - start;
-    take_rows(batch, &indices.slice(start, len), policy)
+    take_rows(batch, &indices.slice(start, len), policy, pool)
 }
 
 fn spill_sorted_run(
@@ -142,6 +154,7 @@ fn spill_sorted_run(
         0,
         None,
         &BatchPolicy::unlimited(),
+        pool,
         cancel,
     )?;
     let path = pool.spill_path()?;
@@ -165,7 +178,7 @@ fn merge_spilled(
         let b = runs.remove(0);
         let left = memory::read_spill(&a, schema.clone())?;
         let right = memory::read_spill(&b, schema.clone())?;
-        let merged = merge_sorted_batches(left, right, schema.clone(), order, cancel)?;
+        let merged = merge_sorted_batches(left, right, schema.clone(), order, pool, cancel)?;
         let path = pool.spill_path()?;
         memory::write_spill(&path, schema.clone(), &merged)?;
         runs.push(path);
@@ -181,6 +194,7 @@ fn merge_sorted_batches(
     right: Vec<Batch>,
     schema: SchemaRef,
     order: &[SortExpr],
+    pool: &MemoryPool,
     cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
     let mut child = batches_to_exec(left.into_iter().chain(right).collect(), schema.clone());
@@ -191,6 +205,7 @@ fn merge_sorted_batches(
         0,
         None,
         &BatchPolicy::unlimited(),
+        pool,
         cancel,
     )
 }
@@ -201,10 +216,11 @@ fn apply_skip_fetch(
     skip: u64,
     fetch: Option<u64>,
     policy: &BatchPolicy,
+    pool: &MemoryPool,
     cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
     let mut child = batches_to_exec(batches, schema.clone());
-    let batch = concat_exec(&mut child, schema, cancel)?;
+    let batch = concat_exec(&mut child, schema, pool, cancel)?;
     let n = batch.num_rows();
     let skip = clamp_rows(skip, n);
     if skip >= n || n == 0 {
@@ -221,25 +237,62 @@ fn apply_skip_fetch(
         .collect())
 }
 
-fn concat_exec(exec: &mut dyn Operator, schema: SchemaRef, cancel: &CancelToken) -> Result<Batch> {
+fn concat_exec(
+    exec: &mut dyn Operator,
+    schema: SchemaRef,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Batch> {
     let mut batches = Vec::new();
     while let Some(batch) = exec.next_batch(cancel)? {
         if batch.num_rows() > 0 {
             batches.push(batch);
         }
     }
-    if batches.is_empty() {
-        return Batch::empty(schema);
+    match batches.len() {
+        0 => Batch::empty(schema),
+        1 => Ok(batches.pop().expect("len is 1")),
+        _ => {
+            let arrows: Vec<RecordBatch> = batches.into_iter().map(Batch::into_arrow).collect();
+            let inner = concat_batches(&schema, &arrows).map_err(|e| Error::Eval(e.to_string()))?;
+            let out = Batch::from_arrow(inner)?;
+            pool.record_copy(batch_bytes(&out));
+            Ok(out)
+        }
     }
-    let arrows: Vec<RecordBatch> = batches.into_iter().map(Batch::into_arrow).collect();
-    let inner = concat_batches(&schema, &arrows).map_err(|e| Error::Eval(e.to_string()))?;
-    Batch::from_arrow(inner)
 }
 
-fn take_rows(batch: &Batch, indices: &dyn Array, policy: &BatchPolicy) -> Result<Vec<Batch>> {
+fn take_rows(
+    batch: &Batch,
+    indices: &dyn Array,
+    policy: &BatchPolicy,
+    pool: &MemoryPool,
+) -> Result<Vec<Batch>> {
     if indices.is_empty() {
         return empty_out(batch.schema(), policy);
     }
+    let out = if let Some(idx) = indices.as_any().downcast_ref::<UInt32Array>() {
+        if idx.null_count() == 0 {
+            let values = idx.values();
+            let gathered = batch.gather(values)?;
+            if crate::batch::contiguous_indices(values).is_none() {
+                pool.record_copy(batch_bytes(&gathered));
+            }
+            gathered
+        } else {
+            take_all_columns(batch, indices, pool)?
+        }
+    } else {
+        take_all_columns(batch, indices, pool)?
+    };
+    Ok(out
+        .split_by_policy(policy)
+        .into_iter()
+        .filter(|b| b.num_rows() > 0)
+        .collect())
+}
+
+fn take_all_columns(batch: &Batch, indices: &dyn Array, pool: &MemoryPool) -> Result<Batch> {
     let mut columns = Vec::with_capacity(batch.num_columns());
     for i in 0..batch.num_columns() {
         columns.push(
@@ -248,11 +301,8 @@ fn take_rows(batch: &Batch, indices: &dyn Array, policy: &BatchPolicy) -> Result
         );
     }
     let out = Batch::try_new(batch.schema(), columns)?;
-    Ok(out
-        .split_by_policy(policy)
-        .into_iter()
-        .filter(|b| b.num_rows() > 0)
-        .collect())
+    pool.record_copy(batch_bytes(&out));
+    Ok(out)
 }
 
 fn empty_out(schema: SchemaRef, policy: &BatchPolicy) -> Result<Vec<Batch>> {

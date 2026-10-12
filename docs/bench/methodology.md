@@ -64,8 +64,8 @@ Ratio in the results table is `reference_ms / mizuchi_ms` (same convention as
 
 ## Operator profiles
 
-`Session::query_metrics` records inclusive `elapsed_ns` and pool `peak_bytes`
-per physical operator. Exclusive time is inclusive minus the children's
+`Session::query_metrics` records inclusive `elapsed_ns`, pool `peak_bytes`,
+and `copied_bytes` per physical operator. Exclusive time is inclusive minus the children's
 inclusive times. Rank exclusive time for the CPU profile of the plan.
 `peak_bytes` is the allocation profile: join and aggregate reserve only when
 a `memory_limit` is set, so `gb_bench profile` uses a 24 GiB cap. `gb_bench

@@ -1,4 +1,4 @@
-//! Per-operator rows, batches, elapsed time, and peak pool bytes.
+//! Per-operator rows, batches, elapsed time, peak pool bytes, and copied bytes.
 //!
 //! Wrappers are installed only for `EXPLAIN ANALYZE`. Ordinary `execute_sql`
 //! builds the same operator tree with no timing.
@@ -27,6 +27,8 @@ pub struct OperatorMetrics {
     pub elapsed_ns: u64,
     /// High-water of the query memory pool observed here.
     pub peak_bytes: u64,
+    /// Bytes copied by concat/take under this operator (zero-copy paths add 0).
+    pub copied_bytes: u64,
     /// True when `elapsed_ns` is a blocking build recorded after children
     /// already ran (join, aggregate, sort). Those child times are disjoint.
     pub blocking: bool,
@@ -83,6 +85,8 @@ impl OperatorMetrics {
             out.push_str(&n.elapsed_ns.to_string());
             out.push_str(",\"peak_bytes\":");
             out.push_str(&n.peak_bytes.to_string());
+            out.push_str(",\"copied_bytes\":");
+            out.push_str(&n.copied_bytes.to_string());
             out.push_str(",\"rows\":");
             out.push_str(&n.rows.to_string());
             out.push_str(",\"batches\":");
@@ -115,6 +119,8 @@ impl OperatorMetrics {
         out.push_str(if self.blocking { "true" } else { "false" });
         out.push_str(",\"peak_bytes\":");
         out.push_str(&self.peak_bytes.to_string());
+        out.push_str(",\"copied_bytes\":");
+        out.push_str(&self.copied_bytes.to_string());
         out.push_str(",\"children\":[");
         for (i, child) in self.children.iter().enumerate() {
             if i > 0 {
@@ -132,6 +138,7 @@ pub(super) struct Counters {
     batches: AtomicU64,
     elapsed_ns: AtomicU64,
     peak_bytes: AtomicU64,
+    copied_bytes: AtomicU64,
     blocking: AtomicBool,
 }
 
@@ -149,6 +156,7 @@ impl PhysNode {
             batches: self.metrics.batches.load(Ordering::Relaxed),
             elapsed_ns: self.metrics.elapsed_ns.load(Ordering::Relaxed),
             peak_bytes: self.metrics.peak_bytes.load(Ordering::Relaxed),
+            copied_bytes: self.metrics.copied_bytes.load(Ordering::Relaxed),
             blocking: self.metrics.blocking.load(Ordering::Relaxed),
             children: self.children.iter().map(PhysNode::snapshot).collect(),
         }
@@ -165,13 +173,14 @@ impl PhysNode {
         if analyze {
             let snap = self.snapshot();
             out.push_str(&format!(
-                "{pad}{} rows={} batches={} elapsed_ns={} exclusive_ns={} peak_bytes={}\n",
+                "{pad}{} rows={} batches={} elapsed_ns={} exclusive_ns={} peak_bytes={} copied_bytes={}\n",
                 snap.name,
                 snap.rows,
                 snap.batches,
                 snap.elapsed_ns,
                 snap.exclusive_ns(),
-                snap.peak_bytes
+                snap.peak_bytes,
+                snap.copied_bytes
             ));
         } else {
             out.push_str(&format!("{pad}{}\n", self.name));
@@ -255,6 +264,8 @@ pub(super) fn finish(
                 inner: op,
                 metrics,
                 used: pool.used_handle(),
+                copied: pool.copied_handle(),
+                last_copied: pool.copied(),
             }),
             node,
         )
@@ -263,13 +274,16 @@ pub(super) fn finish(
     }
 }
 
-pub(super) fn add_blocking(node: &PhysNode, elapsed_ns: u64, peak_bytes: u64) {
+pub(super) fn add_blocking(node: &PhysNode, elapsed_ns: u64, peak_bytes: u64, copied_bytes: u64) {
     node.metrics
         .elapsed_ns
         .fetch_add(elapsed_ns, Ordering::Relaxed);
     node.metrics
         .peak_bytes
         .fetch_max(peak_bytes, Ordering::Relaxed);
+    node.metrics
+        .copied_bytes
+        .fetch_add(copied_bytes, Ordering::Relaxed);
     node.metrics.blocking.store(true, Ordering::Relaxed);
 }
 
@@ -277,6 +291,8 @@ struct Metered {
     inner: Box<dyn Operator>,
     metrics: Arc<Counters>,
     used: Arc<AtomicU64>,
+    copied: Arc<AtomicU64>,
+    last_copied: u64,
 }
 
 impl Operator for Metered {
@@ -294,6 +310,11 @@ impl Operator for Metered {
         self.metrics
             .peak_bytes
             .fetch_max(self.used.load(Ordering::Relaxed), Ordering::Relaxed);
+        let now = self.copied.load(Ordering::Relaxed);
+        self.metrics
+            .copied_bytes
+            .fetch_add(now.saturating_sub(self.last_copied), Ordering::Relaxed);
+        self.last_copied = now;
         Ok(out)
     }
 }
@@ -315,6 +336,7 @@ mod tests {
             batches: 1,
             elapsed_ns,
             peak_bytes,
+            copied_bytes: 0,
             blocking,
             children,
         }
@@ -343,6 +365,7 @@ mod tests {
             json.contains("\"name\":\"HashJoin\",\"exclusive_ns\":30"),
             "{json}"
         );
+        assert!(json.contains("\"copied_bytes\":0"), "{json}");
     }
 
     #[test]

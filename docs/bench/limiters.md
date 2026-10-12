@@ -7,7 +7,8 @@ times: [results.md](results.md).
 The CPU profile of a physical plan is exclusive operator time: inclusive
 `elapsed_ns` from `Session::query_metrics` minus the children's inclusive
 times, ranked highest first. The allocation profile is the query memory-pool
-high-water (`peak_bytes`). Join and aggregate reserve only when a
+high-water (`peak_bytes`) and bytes rewritten by concat/take
+(`copied_bytes`). Join and aggregate reserve only when a
 `memory_limit` is set, so `gb_bench profile` uses a 24 GiB cap (above the
 SF1 working set). `gb_bench run` does not set a cap. `peak_bytes` on a
 blocking operator is the pool high-water observed when that operator
@@ -82,10 +83,15 @@ the hash table is still built on one thread.
 
 ### Copies
 
-Join `collect` clones Arrow batches into the build/probe sides. Grouping
-keys still allocate `Scalar` on insert. Spill reload clones again.
-Filter/project emit new batches from Arrow compute; those copies are
-smaller than the materialized join sides on q3/store_sales.
+An unbounded join keeps probe morsels and concatenates only the smaller
+build side, and only when that side arrives as more than one morsel. A
+contiguous gather is a slice of the parent arrays. `copied_bytes` on
+`EXPLAIN ANALYZE` / `query_metrics` counts bytes written by those
+concatenations (slices add 0). Before this change both sides were
+concatenated on the unbounded path, so a multi-morsel probe paid a full
+rewrite. Grouping keys still allocate `Scalar` on insert. Spill reload
+clones again. Filter/project emit new batches from Arrow compute; those
+copies are smaller than a full probe rewrite on q3/store_sales.
 
 ### Scheduling
 
@@ -112,7 +118,9 @@ operator time at SF1 from `gb_bench profile --sf 1`.
 4. **Join build and materialization** (probe is parallel; both sides still
    fully collected). [#105](https://github.com/Sannrox/mizuchi/issues/105)
 5. **Batch and key copies** between collect, hash tables, and spill (the
-   2–4 GiB peaks). [#107](https://github.com/Sannrox/mizuchi/issues/107)
+   2–4 GiB peaks). Probe concat on the unbounded path is gone;
+   `copied_bytes` now shows remaining rewrites.
+   [#107](https://github.com/Sannrox/mizuchi/issues/107)
 6. **Scan/decode working set** (Scan exclusive is 0.77 ms on q1 and 0.06 ms
    on q6 after a full in-memory load). Parquet file scans now project,
    skip row groups and pages, and late-materialize remaining columns
