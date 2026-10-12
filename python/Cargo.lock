@@ -938,13 +938,66 @@ name = "mizuchi"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "mizuchi-core",
+ "mizuchi-exec",
+ "mizuchi-io",
+ "mizuchi-plan",
+ "mizuchi-postgres",
+ "object_store",
+ "sqlparser",
+]
+
+[[package]]
+name = "mizuchi-core"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+]
+
+[[package]]
+name = "mizuchi-exec"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "mizuchi-core",
+ "mizuchi-io",
+ "mizuchi-plan",
+ "mizuchi-postgres",
+ "object_store",
+ "serde_json",
+ "sqlparser",
+]
+
+[[package]]
+name = "mizuchi-io"
+version = "0.1.0"
+dependencies = [
+ "arrow",
  "arrow-avro",
  "bytes",
  "futures",
+ "mizuchi-core",
  "object_store",
  "parquet",
  "serde_json",
+]
+
+[[package]]
+name = "mizuchi-plan"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "mizuchi-core",
+ "serde_json",
  "sqlparser",
+]
+
+[[package]]
+name = "mizuchi-postgres"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "mizuchi-core",
 ]
 
 [[package]]

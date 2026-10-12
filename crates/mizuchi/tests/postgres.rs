@@ -28,7 +28,7 @@ fn optional_workflow_is_dispatch_only() {
     assert!(yml.contains("--features postgres"));
     assert!(yml.contains("--ignored"));
     let cargo = read("crates/mizuchi/Cargo.toml");
-    assert!(cargo.contains("dep:postgres"));
+    assert!(cargo.contains("mizuchi-postgres/client"));
 }
 
 #[cfg(feature = "postgres")]

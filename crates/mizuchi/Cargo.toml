@@ -13,34 +13,21 @@ homepage = "https://github.com/Sannrox/mizuchi"
 
 [dependencies]
 arrow = { workspace = true }
-arrow-avro = { workspace = true }
-parquet = { workspace = true }
-sqlparser = { workspace = true }
+mizuchi-core = { workspace = true }
+mizuchi-exec = { workspace = true }
+mizuchi-flight = { path = "../mizuchi-flight", version = "0.1.0", optional = true }
+mizuchi-io = { workspace = true }
+mizuchi-plan = { workspace = true }
+mizuchi-postgres = { workspace = true }
 object_store = { workspace = true }
-futures = { workspace = true }
-bytes = { workspace = true }
-serde_json = { workspace = true }
-postgres = { workspace = true, optional = true }
-postgres-native-tls = { workspace = true, optional = true }
-native-tls = { workspace = true, optional = true }
-arrow-flight = { workspace = true, optional = true }
-tonic = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+sqlparser = { workspace = true }
 
 [features]
 default = []
-# Optional Amazon S3 client for the ignored emulator test. The engine API takes
-# a caller-provided ObjectStore; it does not open S3 itself.
-s3 = ["object_store/aws"]
-# Optional Linux filesystem-limit tests in `tests/sandbox_os.rs`. Library
-# sources do not use this feature.
+s3 = ["mizuchi-io/s3", "mizuchi-exec/s3"]
 sandbox = []
-# Optional PostgreSQL source. Opens TCP only when the embedder sets
-# `SessionConfig.allow_network`. Default tests do not enable this.
-postgres = ["dep:postgres", "dep:postgres-native-tls", "dep:native-tls"]
-# Optional Arrow Flight workers. Binds TCP only when the embedder sets
-# `SessionConfig.allow_network`. Default tests do not enable this.
-flight = ["dep:arrow-flight", "dep:tonic", "dep:tokio"]
+postgres = ["mizuchi-postgres/client", "mizuchi-exec/postgres"]
+flight = ["dep:mizuchi-flight"]
 
 [[bin]]
 name = "mizuchi"
@@ -54,6 +41,8 @@ required-features = ["flight"]
 
 [dev-dependencies]
 arrow = { workspace = true }
+futures = { workspace = true }
+parquet = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

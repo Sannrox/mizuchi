@@ -37,7 +37,7 @@ with this change.
 Published SF1/SF10 walls above still time in-memory queries after a full
 `read_parquet` load (method unchanged). File scans with
 `ParquetReadOptions::filters` skip work before decode. Default tests in
-`crates/mizuchi/src/read.rs` assert the skip ratios; compressed-byte
+`crates/mizuchi-io/src/read.rs` assert the skip ratios; compressed-byte
 counts are writer-dependent so tests check `kept < total`.
 
 | case | row groups kept / total | bytes | rows returned |

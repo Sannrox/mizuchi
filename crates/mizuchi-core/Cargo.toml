@@ -1,0 +1,11 @@
+[package]
+name = "mizuchi-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = true
+description = "Foundations for mizuchi: errors, Arrow batches, expressions, cancellation."
+
+[dependencies]
+arrow = { workspace = true }

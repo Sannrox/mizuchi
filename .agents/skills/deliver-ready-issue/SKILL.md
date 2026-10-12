@@ -122,8 +122,8 @@ mark the Issue unless documented maintainer policy requires it.
 1. Add focused deterministic tests while implementing.
 2. Run `verify-change` and retain exact commands, results, skips, and remaining
    uncertainty. At minimum for ship: `cargo fmt --all -- --check`, focused
-   tests plus `cargo test --locked --workspace`, and
-   `cargo clippy --locked --workspace --all-targets -- -D warnings`
+   tests plus `cargo test --locked --workspace --exclude mizuchi-flight`, and
+   `cargo clippy --locked --workspace --all-targets --exclude mizuchi-flight -- -D warnings`
    (offline; no control plane required).
 3. Run **`autoreview` before committing** (or before push if already committed).
    Do **not** vendor the skill into this repo. Resolve the shared helper (env

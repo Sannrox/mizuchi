@@ -7,13 +7,16 @@
 `mizuchi` is a Rust 2024 workspace for an Arrow-native query and transform
 engine: SQL and DataFrame front ends, a logical plan, an optimizer, and a
 vectorized, morsel-driven execution engine. Single-node first, distributed
-later. The workspace has one crate today, `crates/mizuchi` (library). The
-direction is recorded in [ADR 0002](docs/decisions/0002-own-query-engine.md);
-nothing executes yet. This is a side project and must never block the
-runners that embed existing engines.
+later. Library crates: `mizuchi-core`, `mizuchi-plan`, `mizuchi-io`,
+`mizuchi-postgres`, `mizuchi-exec`, and the published facade `mizuchi`
+(ADR [0013](docs/decisions/0013-workspace-crate-graph.md)). Arrow Flight
+lives in `mizuchi-flight`, excluded from default workspace members and
+pulled in with `--features flight`. The direction is recorded in
+[ADR 0002](docs/decisions/0002-own-query-engine.md). This is a side
+project and must never block the runners that embed existing engines.
 
-Add new code along the layer boundaries (sql, plan, optimizer, physical plan,
-execution, memory/spill, readers) rather than growing `lib.rs`. Do not commit
+Add new code in the crate of its layer (core, plan, io, exec, postgres,
+flight) rather than growing the facade `lib.rs`. Do not commit
 local state (`.state/`), benchmark datasets (`bench-data/`), spill files, or
 generated artifacts.
 
@@ -44,9 +47,9 @@ The compiler is pinned in `rust-toolchain.toml`. Local gates match CI
 
 ```sh
 cargo fmt --all -- --check
-cargo build --locked --workspace --all-targets
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace
+cargo build --locked --workspace --all-targets --exclude mizuchi-flight
+cargo clippy --locked --workspace --all-targets --exclude mizuchi-flight -- -D warnings
+cargo test --locked --workspace --exclude mizuchi-flight
 bash scripts/validate-workflow-skills.sh
 ```
 
