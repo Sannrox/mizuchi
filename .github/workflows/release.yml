@@ -24,6 +24,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Dry-run crates.io pack
         run: cargo publish --locked --dry-run -p mizuchi
+      - name: Package contains readme and license
+        run: |
+          list=$(cargo package --list --locked -p mizuchi)
+          printf '%s\n' "$list"
+          echo "$list" | grep -Fx README.md
+          echo "$list" | grep -Fx src/lib.rs
 
   wheels:
     name: Wheel (${{ matrix.os }})
