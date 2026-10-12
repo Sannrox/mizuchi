@@ -1,6 +1,11 @@
 //! Hashable values for grouping and equi-join keys.
+//!
+//! Grouping and equi-join lookups use a cheap non-crypto hasher. Precomputed
+//! row hashes are stored in an identity map so the bucket step does not hash
+//! them again.
 
-use std::hash::{Hash, Hasher};
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use arrow::array::{Array, ArrayRef, AsArray, DictionaryArray, StringArray};
 use arrow::datatypes::{
@@ -9,6 +14,103 @@ use arrow::datatypes::{
 };
 
 use crate::error::{Error, Result};
+
+/// rustc-hash style multiply. Fast and well distributed for in-memory maps.
+const FX_K: u64 = 0x517cc1b727220a95;
+
+/// Cheap hasher for grouping keys, join keys, and integer build maps.
+#[derive(Clone, Copy, Default)]
+pub(super) struct FastHasher {
+    state: u64,
+}
+
+impl Hasher for FastHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut i = 0;
+        while i + 8 <= bytes.len() {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bytes[i..i + 8]);
+            self.write_u64(u64::from_le_bytes(buf));
+            i += 8;
+        }
+        if i < bytes.len() {
+            let mut buf = [0u8; 8];
+            buf[..bytes.len() - i].copy_from_slice(&bytes[i..]);
+            self.write_u64(u64::from_le_bytes(buf));
+        }
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.write_u64(u64::from(i));
+    }
+
+    fn write_u16(&mut self, i: u16) {
+        self.write_u64(u64::from(i));
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(u64::from(i));
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.state = (self.state.rotate_left(5) ^ i).wrapping_mul(FX_K);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.state
+    }
+}
+
+/// Use a precomputed `u64` hash as the bucket key without hashing it again.
+#[derive(Clone, Copy, Default)]
+pub(super) struct IdentityHasher(u64);
+
+impl Hasher for IdentityHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut v = 0u64;
+        for (i, b) in bytes.iter().take(8).enumerate() {
+            v |= u64::from(*b) << (8 * i);
+        }
+        self.0 = v;
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.0 = u64::from(i);
+    }
+
+    fn write_u16(&mut self, i: u16) {
+        self.0 = u64::from(i);
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.0 = u64::from(i);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+pub(super) type FastBuild = BuildHasherDefault<FastHasher>;
+pub(super) type FastMap<K, V> = HashMap<K, V, FastBuild>;
+pub(super) type IdentityBuild = BuildHasherDefault<IdentityHasher>;
+pub(super) type IdentityMap<V> = HashMap<u64, V, IdentityBuild>;
+
+pub(super) fn fast_map_with_capacity<K, V>(n: usize) -> FastMap<K, V> {
+    HashMap::with_capacity_and_hasher(n, FastBuild::default())
+}
+
+pub(super) fn identity_map_with_capacity<V>(n: usize) -> IdentityMap<V> {
+    HashMap::with_capacity_and_hasher(n, IdentityBuild::default())
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum Scalar {
@@ -256,14 +358,14 @@ fn dict_large_utf8_typed<K: ArrowDictionaryKeyType>(array: &dyn Array, row: usiz
 }
 
 pub(super) fn hash_scalars(key: &[Scalar]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = FastHasher::default();
     key.hash(&mut hasher);
     hasher.finish()
 }
 
 /// Hash one grouping or join key row without allocating `Scalar` / `String`.
 pub(super) fn hash_row(cols: &[ArrayRef], row: usize) -> Result<u64> {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = FastHasher::default();
     cols.len().hash(&mut hasher);
     for col in cols {
         hash_cell(col.as_ref(), row, &mut hasher)?;
@@ -496,5 +598,15 @@ mod tests {
         let nulls: Vec<ArrayRef> = vec![Arc::new(arrow::array::NullArray::new(2))];
         assert!(row_has_null(&nulls, 0));
         assert!(row_has_null(&nulls, 1));
+    }
+
+    #[test]
+    fn identity_map_uses_precomputed_hash() {
+        let mut map = identity_map_with_capacity::<usize>(4);
+        let cols: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![7i64]))];
+        let h = hash_row(&cols, 0).unwrap();
+        map.insert(h, 3);
+        assert_eq!(map.get(&h), Some(&3));
+        assert_eq!(map.get(&(h ^ 1)), None);
     }
 }

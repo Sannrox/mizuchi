@@ -28,3 +28,12 @@ jobs:
         run: python -m pip install duckdb datafusion pyarrow
       - name: Run tiny suite
         run: bash scripts/bench-gb.sh tiny
+      - name: Publish ratios and fail on regression
+        run: |
+          bash scripts/check-bench-regression.sh \
+            --scale tiny \
+            --mizuchi "${BENCH_DATA:-bench-data}/tiny/mizuchi.json" \
+            --duckdb "${BENCH_DATA:-bench-data}/tiny/duckdb.json" \
+            --datafusion "${BENCH_DATA:-bench-data}/tiny/datafusion.json" \
+            --baseline docs/bench/baseline.json \
+            --results-md docs/bench/results.md

@@ -2,8 +2,9 @@
 //!
 //! Batches of rules run to a fixed point. Each rule walks the plan bottom-up.
 //! Core rules: fold literals, simplify boolean algebra, merge adjacent
-//! filters, push predicates and projections, reorder inner joins by cost,
-//! push limit through projection, and drop identity / nested projections.
+//! filters, push predicates and unused columns through joins and
+//! aggregates, reorder inner joins by cost, push limit through
+//! projection, and drop identity / nested projections.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -14,7 +15,9 @@ use arrow::datatypes::Schema;
 use crate::batch::Batch;
 use crate::error::Result;
 use crate::expr::{BinaryOp, Expr, UnaryOp};
-use crate::plan::{JoinType, LogicalPlan, NamedExpr, TableStats, inner_equi_rows, join_schema};
+use crate::plan::{
+    AggCall, JoinType, LogicalPlan, NamedExpr, TableStats, inner_equi_rows, join_schema,
+};
 
 /// Apply the standard rule batches to `plan`.
 pub fn optimize(plan: LogicalPlan) -> Result<LogicalPlan> {
@@ -171,7 +174,11 @@ impl Optimizer {
                 },
                 RuleBatch {
                     max_iterations: 16,
-                    rules: vec![Rule::PushJoinFilters, Rule::PushScanFilters],
+                    rules: vec![
+                        Rule::PushJoinFilters,
+                        Rule::PushScanFilters,
+                        Rule::PushProjection,
+                    ],
                 },
                 RuleBatch {
                     max_iterations: 16,
@@ -732,7 +739,429 @@ fn push_projection(plan: LogicalPlan) -> LogicalPlan {
             input,
             exprs,
             schema: out_schema,
-        } => match *input {
+        } => {
+            let child_schema = input.schema().clone();
+            let mut keep = BTreeSet::new();
+            for e in &exprs {
+                collect_refs(&e.expr, child_schema.as_ref(), &mut keep);
+            }
+            let (input, map) = prune_child(*input, &keep);
+            LogicalPlan::Project {
+                input: Box::new(input),
+                exprs: map_named(exprs, &map),
+                schema: out_schema,
+            }
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group,
+            aggs,
+            schema,
+        } => {
+            let child_schema = input.schema().clone();
+            let mut keep = BTreeSet::new();
+            for e in &group {
+                collect_refs(&e.expr, child_schema.as_ref(), &mut keep);
+            }
+            for (_, call) in &aggs {
+                collect_agg_refs(call, child_schema.as_ref(), &mut keep);
+            }
+            if keep.is_empty() && !child_schema.fields().is_empty() {
+                keep.insert(0);
+            }
+            let (input, map) = prune_child(*input, &keep);
+            LogicalPlan::Aggregate {
+                input: Box::new(input),
+                group: map_named(group, &map),
+                aggs: aggs
+                    .into_iter()
+                    .map(|(name, call)| (name, map_agg(call, &map)))
+                    .collect(),
+                schema,
+            }
+        }
+        other => other,
+    }
+}
+
+fn collect_refs(expr: &Expr, schema: &Schema, out: &mut BTreeSet<usize>) {
+    match expr {
+        Expr::Nth(i) if *i < schema.fields().len() => {
+            out.insert(*i);
+        }
+        Expr::Column(name) => {
+            if let Ok(i) = schema.index_of(name) {
+                out.insert(i);
+            }
+        }
+        Expr::Literal(_) => {}
+        Expr::Binary(_, l, r) => {
+            collect_refs(l, schema, out);
+            collect_refs(r, schema, out);
+        }
+        Expr::Unary(_, c) | Expr::Cast { expr: c, .. } | Expr::Substring { expr: c, .. } => {
+            collect_refs(c, schema, out);
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(e) = operand {
+                collect_refs(e, schema, out);
+            }
+            for (w, t) in when_then {
+                collect_refs(w, schema, out);
+                collect_refs(t, schema, out);
+            }
+            if let Some(e) = else_expr {
+                collect_refs(e, schema, out);
+            }
+        }
+        Expr::Coalesce(args) | Expr::Concat(args) | Expr::Array(args) => {
+            for e in args {
+                collect_refs(e, schema, out);
+            }
+        }
+        Expr::Nth(_) => {}
+    }
+}
+
+fn collect_agg_refs(call: &AggCall, schema: &Schema, out: &mut BTreeSet<usize>) {
+    match call {
+        AggCall::CountStar => {}
+        AggCall::Count(e)
+        | AggCall::CountDistinct(e)
+        | AggCall::Sum(e)
+        | AggCall::Avg(e)
+        | AggCall::Min(e)
+        | AggCall::Max(e) => collect_refs(e, schema, out),
+        AggCall::User { arg, .. } => collect_refs(arg, schema, out),
+    }
+}
+
+fn collect_column_names(expr: &Expr, out: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Column(name) => {
+            out.insert(name.clone());
+        }
+        Expr::Nth(_) | Expr::Literal(_) => {}
+        Expr::Binary(_, l, r) => {
+            collect_column_names(l, out);
+            collect_column_names(r, out);
+        }
+        Expr::Unary(_, c) | Expr::Cast { expr: c, .. } | Expr::Substring { expr: c, .. } => {
+            collect_column_names(c, out);
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(e) = operand {
+                collect_column_names(e, out);
+            }
+            for (w, t) in when_then {
+                collect_column_names(w, out);
+                collect_column_names(t, out);
+            }
+            if let Some(e) = else_expr {
+                collect_column_names(e, out);
+            }
+        }
+        Expr::Coalesce(args) | Expr::Concat(args) | Expr::Array(args) => {
+            for e in args {
+                collect_column_names(e, out);
+            }
+        }
+    }
+}
+
+fn map_nth(expr: Expr, map: &HashMap<usize, usize>) -> Expr {
+    match expr {
+        Expr::Nth(i) => Expr::Nth(map.get(&i).copied().unwrap_or(i)),
+        Expr::Binary(op, l, r) => {
+            Expr::Binary(op, Box::new(map_nth(*l, map)), Box::new(map_nth(*r, map)))
+        }
+        Expr::Unary(op, c) => Expr::Unary(op, Box::new(map_nth(*c, map))),
+        Expr::Cast { expr, data_type } => Expr::Cast {
+            expr: Box::new(map_nth(*expr, map)),
+            data_type,
+        },
+        Expr::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => Expr::Case {
+            operand: operand.map(|e| Box::new(map_nth(*e, map))),
+            when_then: when_then
+                .into_iter()
+                .map(|(w, t)| (map_nth(w, map), map_nth(t, map)))
+                .collect(),
+            else_expr: else_expr.map(|e| Box::new(map_nth(*e, map))),
+        },
+        Expr::Coalesce(args) => Expr::Coalesce(args.into_iter().map(|e| map_nth(e, map)).collect()),
+        Expr::Concat(args) => Expr::Concat(args.into_iter().map(|e| map_nth(e, map)).collect()),
+        Expr::Substring {
+            expr,
+            start,
+            length,
+        } => Expr::Substring {
+            expr: Box::new(map_nth(*expr, map)),
+            start,
+            length,
+        },
+        Expr::Array(args) => Expr::Array(args.into_iter().map(|e| map_nth(e, map)).collect()),
+        other => other,
+    }
+}
+
+fn map_named(exprs: Vec<NamedExpr>, map: &HashMap<usize, usize>) -> Vec<NamedExpr> {
+    exprs
+        .into_iter()
+        .map(|mut e| {
+            e.expr = map_nth(e.expr, map);
+            e
+        })
+        .collect()
+}
+
+fn map_agg(call: AggCall, map: &HashMap<usize, usize>) -> AggCall {
+    match call {
+        AggCall::CountStar => AggCall::CountStar,
+        AggCall::Count(e) => AggCall::Count(map_nth(e, map)),
+        AggCall::CountDistinct(e) => AggCall::CountDistinct(map_nth(e, map)),
+        AggCall::Sum(e) => AggCall::Sum(map_nth(e, map)),
+        AggCall::Avg(e) => AggCall::Avg(map_nth(e, map)),
+        AggCall::Min(e) => AggCall::Min(map_nth(e, map)),
+        AggCall::Max(e) => AggCall::Max(map_nth(e, map)),
+        AggCall::User { name, arg, agg } => AggCall::User {
+            name,
+            arg: map_nth(arg, map),
+            agg,
+        },
+    }
+}
+
+fn keep_map(n: usize, keep: &BTreeSet<usize>) -> HashMap<usize, usize> {
+    let mut map = HashMap::new();
+    let mut next = 0usize;
+    for i in 0..n {
+        if keep.contains(&i) {
+            map.insert(i, next);
+            next += 1;
+        }
+    }
+    map
+}
+
+fn restrict_map(src: &HashMap<usize, usize>, keep: &BTreeSet<usize>) -> HashMap<usize, usize> {
+    keep.iter()
+        .filter_map(|i| src.get(i).copied().map(|j| (*i, j)))
+        .collect()
+}
+
+fn identity_map(n: usize) -> HashMap<usize, usize> {
+    (0..n).map(|i| (i, i)).collect()
+}
+
+fn identity_project(input: LogicalPlan, keep: &BTreeSet<usize>) -> LogicalPlan {
+    let schema = input.schema().clone();
+    let n = schema.fields().len();
+    if keep.len() == n && (0..n).all(|i| keep.contains(&i)) {
+        return input;
+    }
+    let mut exprs = Vec::new();
+    let mut fields = Vec::new();
+    for i in 0..n {
+        if keep.contains(&i) {
+            exprs.push(NamedExpr {
+                expr: Expr::nth(i),
+                name: schema.field(i).name().to_string(),
+            });
+            fields.push(schema.field(i).clone());
+        }
+    }
+    if exprs.is_empty() {
+        return input;
+    }
+    LogicalPlan::Project {
+        input: Box::new(input),
+        exprs,
+        schema: Arc::new(Schema::new(fields)),
+    }
+}
+
+fn plan_required_nths(plan: &LogicalPlan) -> BTreeSet<usize> {
+    match plan {
+        LogicalPlan::Filter { input, predicate } => {
+            let mut keep = BTreeSet::new();
+            collect_refs(predicate, input.schema(), &mut keep);
+            keep
+        }
+        LogicalPlan::Sort { input, order } => {
+            let mut keep = BTreeSet::new();
+            for key in order {
+                collect_refs(&key.expr, input.schema(), &mut keep);
+            }
+            keep
+        }
+        LogicalPlan::Limit { input, .. } => plan_required_nths(input),
+        LogicalPlan::Project { input, exprs, .. } => {
+            let mut keep = BTreeSet::new();
+            for e in exprs {
+                collect_refs(&e.expr, input.schema(), &mut keep);
+            }
+            keep
+        }
+        _ => BTreeSet::new(),
+    }
+}
+
+/// Drop unused columns. A join is never wrapped, so a bushy inner-join
+/// tree stays flattenable for reorder.
+fn prune_child(plan: LogicalPlan, keep: &BTreeSet<usize>) -> (LogicalPlan, HashMap<usize, usize>) {
+    let n = plan.schema().fields().len();
+    if n == 0 || (keep.len() == n && (0..n).all(|i| keep.contains(&i))) {
+        if let LogicalPlan::Join { .. } = &plan {
+            return prune_join(plan, keep);
+        }
+        return (plan, identity_map(n));
+    }
+    match plan {
+        j @ LogicalPlan::Join { .. } => prune_join(j, keep),
+        LogicalPlan::Filter { input, predicate } => {
+            let mut child_keep = keep.clone();
+            collect_refs(&predicate, input.schema(), &mut child_keep);
+            let (input, child_map) = prune_child(*input, &child_keep);
+            let plan = LogicalPlan::Filter {
+                input: Box::new(input),
+                predicate: map_nth(predicate, &child_map),
+            };
+            (plan, restrict_map(&child_map, keep))
+        }
+        LogicalPlan::Sort { input, order } => {
+            let mut child_keep = keep.clone();
+            for key in &order {
+                collect_refs(&key.expr, input.schema(), &mut child_keep);
+            }
+            let (input, child_map) = prune_child(*input, &child_keep);
+            let order = order
+                .into_iter()
+                .map(|mut key| {
+                    key.expr = map_nth(key.expr, &child_map);
+                    key
+                })
+                .collect();
+            (
+                LogicalPlan::Sort {
+                    input: Box::new(input),
+                    order,
+                },
+                restrict_map(&child_map, keep),
+            )
+        }
+        LogicalPlan::Limit { input, skip, fetch } => {
+            let (input, map) = prune_child(*input, keep);
+            (
+                LogicalPlan::Limit {
+                    input: Box::new(input),
+                    skip,
+                    fetch,
+                },
+                map,
+            )
+        }
+        LogicalPlan::Project {
+            input,
+            exprs,
+            schema,
+        } => {
+            let mut child_keep = BTreeSet::new();
+            let mut kept = Vec::new();
+            for (i, e) in exprs.into_iter().enumerate() {
+                if keep.contains(&i) {
+                    collect_refs(&e.expr, input.schema(), &mut child_keep);
+                    kept.push((i, e));
+                }
+            }
+            let (input, child_map) = prune_child(*input, &child_keep);
+            let mut new_exprs = Vec::with_capacity(kept.len());
+            let mut fields = Vec::with_capacity(kept.len());
+            let mut out_map = HashMap::new();
+            for (new_i, (old_i, mut e)) in kept.into_iter().enumerate() {
+                e.expr = map_nth(e.expr, &child_map);
+                fields.push(schema.field(old_i).clone());
+                new_exprs.push(e);
+                out_map.insert(old_i, new_i);
+            }
+            (
+                LogicalPlan::Project {
+                    input: Box::new(input),
+                    exprs: new_exprs,
+                    schema: Arc::new(Schema::new(fields)),
+                },
+                out_map,
+            )
+        }
+        LogicalPlan::Scan {
+            table,
+            schema,
+            alias,
+            projection,
+            filters,
+            stats,
+        } => prune_scan(table, schema, alias, projection, filters, stats, keep),
+        other => {
+            let map = keep_map(n, keep);
+            (identity_project(other, keep), map)
+        }
+    }
+}
+
+fn prune_scan(
+    table: String,
+    schema: Arc<Schema>,
+    alias: Option<String>,
+    projection: Option<Vec<String>>,
+    filters: Vec<Expr>,
+    stats: Option<TableStats>,
+    keep: &BTreeSet<usize>,
+) -> (LogicalPlan, HashMap<usize, usize>) {
+    let n = schema.fields().len();
+    let mut names = Vec::new();
+    let mut fields = Vec::new();
+    let mut out_map = HashMap::new();
+    for i in 0..n {
+        if !keep.contains(&i) {
+            continue;
+        }
+        out_map.insert(i, names.len());
+        names.push(schema.field(i).name().to_string());
+        fields.push(schema.field(i).clone());
+    }
+    let mut extras = BTreeSet::new();
+    let mut filter_idx = BTreeSet::new();
+    for pred in &filters {
+        collect_refs(pred, schema.as_ref(), &mut filter_idx);
+        collect_column_names(pred, &mut extras);
+    }
+    for i in filter_idx {
+        if i < n {
+            extras.insert(schema.field(i).name().to_string());
+        }
+    }
+    for name in extras {
+        if names.iter().any(|n| n == &name) {
+            continue;
+        }
+        if let Ok(i) = schema.index_of(&name) {
+            names.push(name);
+            fields.push(schema.field(i).clone());
+        }
+    }
+    if names.is_empty() {
+        return (
             LogicalPlan::Scan {
                 table,
                 schema,
@@ -740,85 +1169,90 @@ fn push_projection(plan: LogicalPlan) -> LogicalPlan {
                 projection,
                 filters,
                 stats,
-            } => {
-                let mut names = Vec::with_capacity(exprs.len());
-                for e in &exprs {
-                    match &e.expr {
-                        Expr::Nth(i) if *i < schema.fields().len() => {
-                            names.push(schema.field(*i).name().to_string());
-                        }
-                        Expr::Column(n) => names.push(n.clone()),
-                        _ => {
-                            return LogicalPlan::Project {
-                                input: Box::new(LogicalPlan::Scan {
-                                    table,
-                                    schema,
-                                    alias,
-                                    projection,
-                                    filters,
-                                    stats,
-                                }),
-                                exprs,
-                                schema: out_schema,
-                            };
-                        }
-                    }
-                }
-                let mut fields = Vec::with_capacity(names.len());
-                for name in &names {
-                    match schema.index_of(name) {
-                        Ok(i) => fields.push(schema.field(i).clone()),
-                        Err(_) => {
-                            return LogicalPlan::Project {
-                                input: Box::new(LogicalPlan::Scan {
-                                    table,
-                                    schema,
-                                    alias,
-                                    projection,
-                                    filters,
-                                    stats,
-                                }),
-                                exprs,
-                                schema: out_schema,
-                            };
-                        }
-                    }
-                }
-                let new_schema = Arc::new(Schema::new(fields));
-                let scan = LogicalPlan::Scan {
-                    table,
-                    schema: new_schema.clone(),
-                    alias,
-                    projection: Some(names),
-                    filters,
-                    stats,
-                };
-                if is_identity(&exprs, &new_schema) {
-                    scan
-                } else {
-                    let exprs = exprs
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, mut e)| {
-                            e.expr = Expr::nth(i);
-                            e
-                        })
-                        .collect();
-                    LogicalPlan::Project {
-                        input: Box::new(scan),
-                        exprs,
-                        schema: out_schema,
-                    }
+            },
+            identity_map(n),
+        );
+    }
+    let new_schema = Arc::new(Schema::new(fields));
+    (
+        LogicalPlan::Scan {
+            table,
+            schema: new_schema,
+            alias,
+            projection: Some(names),
+            filters,
+            stats,
+        },
+        out_map,
+    )
+}
+
+fn prune_join(plan: LogicalPlan, keep: &BTreeSet<usize>) -> (LogicalPlan, HashMap<usize, usize>) {
+    let LogicalPlan::Join {
+        left,
+        right,
+        join_type,
+        on,
+        schema,
+    } = plan
+    else {
+        unreachable!("prune_join");
+    };
+    let ln = left.schema().fields().len();
+    let mut need = keep.clone();
+    if let Some(pred) = &on {
+        collect_refs(pred, schema.as_ref(), &mut need);
+    }
+    let mut left_keep = BTreeSet::new();
+    let mut right_keep = BTreeSet::new();
+    for i in &need {
+        if *i < ln {
+            left_keep.insert(*i);
+        } else {
+            right_keep.insert(*i - ln);
+        }
+    }
+    left_keep.extend(plan_required_nths(&left));
+    right_keep.extend(plan_required_nths(&right));
+    match join_type {
+        JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti => {
+            for i in keep {
+                if *i < ln {
+                    left_keep.insert(*i);
                 }
             }
-            other => LogicalPlan::Project {
-                input: Box::new(other),
-                exprs,
-                schema: out_schema,
-            },
-        },
-        other => other,
+        }
+        _ => {}
     }
+    if left_keep.is_empty() && !left.schema().fields().is_empty() {
+        left_keep.insert(0);
+    }
+    if right_keep.is_empty() && !right.schema().fields().is_empty() {
+        right_keep.insert(0);
+    }
+    let (left, left_map) = prune_child(*left, &left_keep);
+    let (right, right_map) = prune_child(*right, &right_keep);
+    let new_ln = left.schema().fields().len();
+    let mut join_map = HashMap::new();
+    for (old, new) in &left_map {
+        join_map.insert(*old, *new);
+    }
+    for (old, new) in &right_map {
+        join_map.insert(ln + *old, new_ln + *new);
+    }
+    let on = on.map(|pred| map_nth(pred, &join_map));
+    let new_schema = match join_type {
+        JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti => left.schema().clone(),
+        _ => join_schema(left.schema(), right.schema()),
+    };
+    let plan = LogicalPlan::Join {
+        left: Box::new(left),
+        right: Box::new(right),
+        join_type,
+        on,
+        schema: new_schema,
+    };
+    (plan, restrict_map(&join_map, keep))
 }
 
 fn conjuncts(expr: Expr) -> Vec<Expr> {
@@ -2016,6 +2450,86 @@ mod tests {
         assert!(text.contains("filters=["), "{text}");
         assert!(!text.contains("Filter"), "{text}");
         assert_idempotent(plan_sql("SELECT a FROM t WHERE a > 1", &catalog()).unwrap());
+    }
+
+    #[test]
+    fn unused_columns_do_not_survive_joins_or_aggregates() {
+        let sql = "SELECT t.a, SUM(u.x) FROM t JOIN u ON t.a = u.id GROUP BY t.a";
+        let text = explain_sql(sql);
+        assert!(text.contains("projection=[a]"), "{text}");
+        assert!(!text.contains("projection=[a, b]"), "{text}");
+        assert!(text.contains("sum("), "{text}");
+        assert_idempotent(plan_sql(sql, &catalog()).unwrap());
+
+        let sql = "SELECT t.a, u.id FROM t JOIN u ON t.a = u.id";
+        let text = explain_sql(sql);
+        assert!(text.contains("projection=[a]"), "{text}");
+        assert!(text.contains("projection=[id]"), "{text}");
+        assert!(!text.contains("projection=[id, x]"), "{text}");
+        assert_idempotent(plan_sql(sql, &catalog()).unwrap());
+    }
+
+    #[test]
+    fn wide_scan_drops_payload_columns_before_join() {
+        let mut c = Catalog::new();
+        c.register(
+            "customer",
+            Arc::new(Schema::new(vec![
+                Field::new("c_custkey", DataType::Int64, true),
+                Field::new("c_name", DataType::Utf8, true),
+                Field::new("c_mktsegment", DataType::Utf8, true),
+            ])),
+        )
+        .unwrap();
+        c.register(
+            "orders",
+            Arc::new(Schema::new(vec![
+                Field::new("o_orderkey", DataType::Int64, true),
+                Field::new("o_custkey", DataType::Int64, true),
+                Field::new("o_orderdate", DataType::Int64, true),
+                Field::new("o_comment", DataType::Utf8, true),
+                Field::new("o_shippriority", DataType::Int64, true),
+            ])),
+        )
+        .unwrap();
+        c.register(
+            "lineitem",
+            Arc::new(Schema::new(vec![
+                Field::new("l_orderkey", DataType::Int64, true),
+                Field::new("l_partkey", DataType::Int64, true),
+                Field::new("l_extendedprice", DataType::Float64, true),
+                Field::new("l_discount", DataType::Float64, true),
+                Field::new("l_tax", DataType::Float64, true),
+                Field::new("l_comment", DataType::Utf8, true),
+                Field::new("l_shipdate", DataType::Int64, true),
+            ])),
+        )
+        .unwrap();
+        let sql = "SELECT l_orderkey, o_orderdate, o_shippriority, \
+                   SUM(l_extendedprice * (1.0 - l_discount)) AS revenue \
+                   FROM customer \
+                   JOIN orders ON c_custkey = o_custkey \
+                   JOIN lineitem ON l_orderkey = o_orderkey \
+                   WHERE c_mktsegment = 'BUILDING' \
+                   AND o_orderdate < 1169 \
+                   AND l_shipdate > 1169 \
+                   GROUP BY l_orderkey, o_orderdate, o_shippriority";
+        let text = optimize(plan_sql(sql, &c).unwrap()).unwrap().explain();
+        assert!(text.contains("projection=["), "{text}");
+        assert!(!text.contains("l_comment"), "{text}");
+        assert!(!text.contains("l_partkey"), "{text}");
+        assert!(!text.contains("l_tax"), "{text}");
+        assert!(!text.contains("o_comment"), "{text}");
+        assert!(!text.contains("c_name"), "{text}");
+        assert_idempotent(plan_sql(sql, &c).unwrap());
+    }
+
+    #[test]
+    fn join_filter_keeps_predicate_columns() {
+        let sql = "SELECT t.a, u.id FROM t JOIN u ON t.a = u.id WHERE COALESCE(u.x, 0) > 1";
+        let text = explain_sql(sql);
+        assert!(text.contains("x"), "{text}");
+        assert_idempotent(plan_sql(sql, &catalog()).unwrap());
     }
 
     #[test]

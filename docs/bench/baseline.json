@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "regression_factor": 1.2,
+  "min_sf1_duckdb_ratio": 0.33,
+  "min_abs_ms": 5.0,
+  "tiny": {
+    "tpch_q1": { "mizuchi_ms": 1.472 },
+    "tpch_q3": { "mizuchi_ms": 1.801 },
+    "tpch_q6": { "mizuchi_ms": 0.462 },
+    "tpcds_store_sales": { "mizuchi_ms": 0.787 }
+  }
+}

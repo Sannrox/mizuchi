@@ -17,7 +17,7 @@ use super::{Exec, Session, collect, filter_batch, physical, project_batch};
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::expr::Expr;
-use crate::plan::{AggCall, LogicalPlan, NamedExpr};
+use crate::plan::{AggCall, JoinType, LogicalPlan, NamedExpr};
 
 pub(super) fn try_parallel(
     plan: &LogicalPlan,
@@ -102,6 +102,32 @@ pub(super) fn try_parallel(
                     pool,
                 )?));
             }
+            if let Some(fused) = inner_join_under_project(input, group, aggs) {
+                let l = plan_batches(fused.left, session, pool)?;
+                let r = plan_batches(fused.right, session, pool)?;
+                return Ok(Some(join::run_then_agg(
+                    Box::new(Exec::Scan {
+                        batches: l,
+                        index: 0,
+                    }),
+                    Box::new(Exec::Scan {
+                        batches: r,
+                        index: 0,
+                    }),
+                    JoinSpec {
+                        join_type: JoinType::Inner,
+                        on: fused.on,
+                        left_schema: fused.left.schema().clone(),
+                        right_schema: fused.right.schema().clone(),
+                        schema: fused.join_schema,
+                    },
+                    &fused.group,
+                    &fused.aggs,
+                    schema.clone(),
+                    session,
+                    pool,
+                )?));
+            }
             let child = plan_batches(input, session, pool)?;
             Ok(Some(agg_from_batches(
                 child,
@@ -149,6 +175,195 @@ pub(super) fn try_parallel(
             }
             Ok(None)
         }
+    }
+}
+
+struct FusedJoinAgg<'a> {
+    left: &'a LogicalPlan,
+    right: &'a LogicalPlan,
+    on: Option<&'a Expr>,
+    join_schema: SchemaRef,
+    group: Vec<NamedExpr>,
+    aggs: Vec<(String, AggCall)>,
+}
+
+/// Binder wraps join outputs in a Project. Remap grouping and aggregate
+/// expressions onto the inner join so the unique-key fold can run.
+fn inner_join_under_project<'a>(
+    input: &'a LogicalPlan,
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+) -> Option<FusedJoinAgg<'a>> {
+    let (join, group, aggs) = match input {
+        LogicalPlan::Join {
+            join_type: JoinType::Inner,
+            ..
+        } => (input, group.to_vec(), aggs.to_vec()),
+        LogicalPlan::Project {
+            input: child,
+            exprs,
+            ..
+        } => {
+            let LogicalPlan::Join {
+                join_type: JoinType::Inner,
+                schema,
+                ..
+            } = child.as_ref()
+            else {
+                return None;
+            };
+            let group = remap_named(group, exprs, schema)?;
+            let aggs = remap_aggs(aggs, exprs, schema)?;
+            (child.as_ref(), group, aggs)
+        }
+        _ => return None,
+    };
+    let LogicalPlan::Join {
+        left,
+        right,
+        on,
+        schema,
+        ..
+    } = join
+    else {
+        return None;
+    };
+    Some(FusedJoinAgg {
+        left,
+        right,
+        on: on.as_ref(),
+        join_schema: schema.clone(),
+        group,
+        aggs,
+    })
+}
+
+fn remap_named(
+    group: &[NamedExpr],
+    project: &[NamedExpr],
+    join_schema: &arrow::datatypes::Schema,
+) -> Option<Vec<NamedExpr>> {
+    group
+        .iter()
+        .map(|g| {
+            let expr = through_project(&g.expr, project)?;
+            let expr = resolve_nth(&expr, join_schema)?;
+            Some(NamedExpr {
+                expr,
+                name: g.name.clone(),
+            })
+        })
+        .collect()
+}
+
+fn remap_aggs(
+    aggs: &[(String, AggCall)],
+    project: &[NamedExpr],
+    join_schema: &arrow::datatypes::Schema,
+) -> Option<Vec<(String, AggCall)>> {
+    aggs.iter()
+        .map(|(name, call)| {
+            let call = map_agg(call, |e| {
+                let e = through_project(e, project)?;
+                resolve_nth(&e, join_schema)
+            })?;
+            Some((name.clone(), call))
+        })
+        .collect()
+}
+
+fn map_agg(call: &AggCall, mut f: impl FnMut(&Expr) -> Option<Expr>) -> Option<AggCall> {
+    Some(match call {
+        AggCall::CountStar => AggCall::CountStar,
+        AggCall::Count(e) => AggCall::Count(f(e)?),
+        AggCall::CountDistinct(e) => AggCall::CountDistinct(f(e)?),
+        AggCall::Sum(e) => AggCall::Sum(f(e)?),
+        AggCall::Avg(e) => AggCall::Avg(f(e)?),
+        AggCall::Min(e) => AggCall::Min(f(e)?),
+        AggCall::Max(e) => AggCall::Max(f(e)?),
+        AggCall::User { name, arg, agg } => AggCall::User {
+            name: name.clone(),
+            arg: f(arg)?,
+            agg: agg.clone(),
+        },
+    })
+}
+
+fn through_project(expr: &Expr, project: &[NamedExpr]) -> Option<Expr> {
+    map_expr(expr, &|e| match e {
+        Expr::Nth(i) => project.get(*i).map(|n| n.expr.clone()),
+        Expr::Column(name) => project
+            .iter()
+            .find(|n| n.name == *name)
+            .map(|n| n.expr.clone()),
+        other => Some(other.clone()),
+    })
+}
+
+fn resolve_nth(expr: &Expr, schema: &arrow::datatypes::Schema) -> Option<Expr> {
+    map_expr(expr, &|e| match e {
+        Expr::Column(name) => schema.index_of(name).ok().map(Expr::nth),
+        Expr::Nth(i) if *i < schema.fields().len() => Some(e.clone()),
+        Expr::Nth(_) => None,
+        other => Some(other.clone()),
+    })
+}
+
+fn map_expr(expr: &Expr, leaf: &impl Fn(&Expr) -> Option<Expr>) -> Option<Expr> {
+    match expr {
+        Expr::Nth(_) | Expr::Column(_) | Expr::Literal(_) => leaf(expr),
+        Expr::Binary(op, l, r) => Some(Expr::Binary(
+            *op,
+            Box::new(map_expr(l, leaf)?),
+            Box::new(map_expr(r, leaf)?),
+        )),
+        Expr::Unary(op, e) => Some(Expr::Unary(*op, Box::new(map_expr(e, leaf)?))),
+        Expr::Cast { expr, data_type } => Some(Expr::Cast {
+            expr: Box::new(map_expr(expr, leaf)?),
+            data_type: data_type.clone(),
+        }),
+        Expr::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => Some(Expr::Case {
+            operand: match operand.as_deref() {
+                Some(e) => Some(Box::new(map_expr(e, leaf)?)),
+                None => None,
+            },
+            when_then: when_then
+                .iter()
+                .map(|(w, t)| Some((map_expr(w, leaf)?, map_expr(t, leaf)?)))
+                .collect::<Option<_>>()?,
+            else_expr: match else_expr.as_deref() {
+                Some(e) => Some(Box::new(map_expr(e, leaf)?)),
+                None => None,
+            },
+        }),
+        Expr::Coalesce(args) => Some(Expr::Coalesce(
+            args.iter()
+                .map(|e| map_expr(e, leaf))
+                .collect::<Option<_>>()?,
+        )),
+        Expr::Concat(args) => Some(Expr::Concat(
+            args.iter()
+                .map(|e| map_expr(e, leaf))
+                .collect::<Option<_>>()?,
+        )),
+        Expr::Substring {
+            expr,
+            start,
+            length,
+        } => Some(Expr::Substring {
+            expr: Box::new(map_expr(expr, leaf)?),
+            start: *start,
+            length: *length,
+        }),
+        Expr::Array(args) => Some(Expr::Array(
+            args.iter()
+                .map(|e| map_expr(e, leaf))
+                .collect::<Option<_>>()?,
+        )),
     }
 }
 
@@ -407,19 +622,19 @@ fn apply_filters(mut batch: Batch, filters: &[Expr]) -> Result<Option<Batch>> {
 }
 
 fn apply_pipe(pipe: &Pipeline, batch: Batch) -> Result<Option<Batch>> {
+    let project_first = pipe
+        .projection
+        .as_ref()
+        .is_some_and(|names| super::filters_on_projected(&pipe.scan_filters, names));
+    let batch = match &pipe.projection {
+        Some(names) if project_first => super::project_named(batch, names)?,
+        _ => batch,
+    };
     let Some(mut batch) = apply_filters(batch, &pipe.scan_filters)? else {
         return Ok(None);
     };
-    if let Some(names) = &pipe.projection {
-        let mut indices = Vec::with_capacity(names.len());
-        for name in names {
-            let idx = batch
-                .schema()
-                .index_of(name)
-                .map_err(|e| Error::Plan(format!("scan projection: {e}")))?;
-            indices.push(idx);
-        }
-        batch = batch.project(&indices)?;
+    if !project_first && let Some(names) = &pipe.projection {
+        batch = super::project_named(batch, names)?;
     }
     let Some(mut batch) = apply_filters(batch, &pipe.extra_filters)? else {
         return Ok(None);
