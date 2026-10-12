@@ -1,7 +1,8 @@
 //! In-process cluster coordinator: workers, resources, dynamic allocation.
 //!
-//! The engine opens TCP only when the embedder grants network. A runner maps these worker
-//! slots onto processes or pods using the manifests under `deploy/`.
+//! The engine opens TCP only when the embedder grants network. In-process
+//! slots stay here; process workers use Arrow Flight (`RemoteCluster`).
+//! A runner maps workers onto processes or pods using `deploy/`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
