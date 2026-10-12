@@ -8,7 +8,7 @@
 //! micro-batch id so a replay of the same id replaces the same file.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -916,10 +916,7 @@ fn write_offset(checkpoint: &Path, id: u64, body: &Value, replace: bool) -> Resu
     let path = checkpoint.join("offsets").join(id.to_string());
     let bytes = serde_json::to_vec_pretty(body).map_err(|e| Error::Io(e.to_string()))?;
     if replace {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-        }
-        fs::write(&path, bytes).map_err(|e| io_err(&path, e))
+        write_complete(&path, &bytes)
     } else if path.exists() {
         Ok(())
     } else {
@@ -956,24 +953,24 @@ fn write_state(checkpoint: &Path, id: u64, q: &StreamQuery) -> Result<()> {
         q.cfg.group.len(),
         q.cfg.value.is_some(),
     )?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-    }
-    if path.exists() {
-        fs::remove_file(&path).map_err(|e| io_err(&path, e))?;
-    }
-    let file = File::create(&path).map_err(|e| io_err(&path, e))?;
-    let mut writer =
-        FileWriter::try_new(file, schema.as_ref()).map_err(|e| Error::Io(e.to_string()))?;
-    for batch in &batches {
-        if batch.num_rows() > 0 {
-            writer
-                .write(batch.as_arrow())
-                .map_err(|e| Error::Io(e.to_string()))?;
+    let (tmp, file) = create_tmp_file(&path)?;
+    let result = (|| {
+        let mut writer =
+            FileWriter::try_new(file, schema.as_ref()).map_err(|e| Error::Io(e.to_string()))?;
+        for batch in &batches {
+            if batch.num_rows() > 0 {
+                writer
+                    .write(batch.as_arrow())
+                    .map_err(|e| Error::Io(e.to_string()))?;
+            }
         }
+        writer.finish().map_err(|e| Error::Io(e.to_string()))?;
+        publish_replace(&tmp, &path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    writer.finish().map_err(|e| Error::Io(e.to_string()))?;
-    Ok(())
+    result
 }
 
 struct StateRow {
@@ -1183,13 +1180,17 @@ fn list_numeric_names(dir: &Path) -> Result<Vec<u64>> {
 }
 
 fn write_schema_file(path: &Path, schema: SchemaRef) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+    let (tmp, file) = create_tmp_file(path)?;
+    let result = (|| {
+        let mut writer =
+            FileWriter::try_new(file, schema.as_ref()).map_err(|e| Error::Io(e.to_string()))?;
+        writer.finish().map_err(|e| Error::Io(e.to_string()))?;
+        publish_replace(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    let file = File::create(path).map_err(|e| io_err(path, e))?;
-    let mut writer =
-        FileWriter::try_new(file, schema.as_ref()).map_err(|e| Error::Io(e.to_string()))?;
-    writer.finish().map_err(|e| Error::Io(e.to_string()))
+    result
 }
 
 fn read_schema_file(path: &Path) -> Result<SchemaRef> {
@@ -1199,24 +1200,24 @@ fn read_schema_file(path: &Path) -> Result<SchemaRef> {
 }
 
 fn write_parquet_file(path: &Path, batches: &[Batch], schema: SchemaRef) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-    }
-    if path.exists() {
-        fs::remove_file(path).map_err(|e| io_err(path, e))?;
-    }
-    let file = File::create(path).map_err(|e| io_err(path, e))?;
-    let mut writer =
-        ArrowWriter::try_new(file, schema, None).map_err(|e| Error::Io(e.to_string()))?;
-    for batch in batches {
-        if batch.num_rows() > 0 {
-            writer
-                .write(batch.as_arrow())
-                .map_err(|e| Error::Io(e.to_string()))?;
+    let (tmp, file) = create_tmp_file(path)?;
+    let result = (|| {
+        let mut writer =
+            ArrowWriter::try_new(file, schema, None).map_err(|e| Error::Io(e.to_string()))?;
+        for batch in batches {
+            if batch.num_rows() > 0 {
+                writer
+                    .write(batch.as_arrow())
+                    .map_err(|e| Error::Io(e.to_string()))?;
+            }
         }
+        writer.close().map_err(|e| Error::Io(e.to_string()))?;
+        publish_replace(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    writer.close().map_err(|e| Error::Io(e.to_string()))?;
-    Ok(())
+    result
 }
 
 fn read_sink_file(path: &Path) -> Result<Vec<Batch>> {
@@ -1237,25 +1238,70 @@ fn read_sink_file(path: &Path) -> Result<Vec<Batch>> {
     Ok(out)
 }
 
-fn create_exclusive(path: &Path, bytes: Vec<u8>) -> Result<()> {
+fn tmp_sibling(path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!("{name}.tmp-{}", std::process::id()))
+}
+
+fn create_tmp_file(path: &Path) -> Result<(PathBuf, File)> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
     }
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    let mut file = match opts.open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(Error::Io(format!(
-                "concurrent writer conflict: {}",
-                path.display()
-            )));
+    let tmp = tmp_sibling(path);
+    let file = File::create(&tmp).map_err(|e| io_err(&tmp, e))?;
+    Ok((tmp, file))
+}
+
+fn write_tmp(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    let (tmp, mut file) = create_tmp_file(path)?;
+    file.write_all(bytes).map_err(|e| io_err(&tmp, e))?;
+    file.sync_all().map_err(|e| io_err(&tmp, e))?;
+    Ok(tmp)
+}
+
+/// Dest appears only after `tmp` is durable. Replaces an existing dest.
+fn publish_replace(tmp: &Path, dest: &Path) -> Result<()> {
+    {
+        let file = File::open(tmp).map_err(|e| io_err(tmp, e))?;
+        file.sync_all().map_err(|e| io_err(tmp, e))?;
+    }
+    fs::rename(tmp, dest).map_err(|e| {
+        let _ = fs::remove_file(tmp);
+        io_err(dest, e)
+    })
+}
+
+/// Dest appears only after the bytes are durable, so a kill cannot leave a
+/// truncated offset or commit that `recover` would try to parse.
+fn write_complete(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = write_tmp(path, bytes)?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        io_err(path, e)
+    })
+}
+
+fn create_exclusive(path: &Path, bytes: Vec<u8>) -> Result<()> {
+    let tmp = write_tmp(path, &bytes)?;
+    let publish = exclusive_publish(&tmp, path);
+    if publish.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    publish
+}
+
+fn exclusive_publish(tmp: &Path, dest: &Path) -> Result<()> {
+    match fs::hard_link(tmp, dest) {
+        Ok(()) => {
+            let _ = fs::remove_file(tmp);
+            Ok(())
         }
-        Err(e) => return Err(io_err(path, e)),
-    };
-    file.write_all(&bytes).map_err(|e| io_err(path, e))?;
-    file.sync_all().map_err(|e| io_err(path, e))?;
-    Ok(())
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Error::Io(format!(
+            "concurrent writer conflict: {}",
+            dest.display()
+        ))),
+        Err(e) => Err(io_err(dest, e)),
+    }
 }
 
 fn io_err(path: &Path, err: std::io::Error) -> Error {
