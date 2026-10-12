@@ -56,9 +56,9 @@ pub use plan::{
 };
 pub use postgres::{PostgresReadOptions, PostgresSource, postgres_scan_sql, read_postgres};
 pub use read::{
-    AvroReadOptions, ColumnRange, CsvReadOptions, JsonReadOptions, OrcReadOptions,
-    ParquetReadOptions, RowGroupStats, read_avro, read_csv, read_json, read_orc, read_parquet,
-    row_group_cannot_match,
+    AvroReadOptions, ColumnRange, CsvReadOptions, FloatRange, JsonReadOptions, OrcReadOptions,
+    ParquetReadOptions, ParquetScanStats, RowGroupStats, read_avro, read_csv, read_json, read_orc,
+    read_parquet, read_parquet_reported, row_group_cannot_match,
 };
 pub use schema::{from_arrow_schema, is_supported_data_type, to_arrow_schema};
 pub use sql::parse_sql;

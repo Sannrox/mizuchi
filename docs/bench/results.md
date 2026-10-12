@@ -32,6 +32,27 @@ Scan-heavy `tpch_q6` is the closest gap. Grouped aggregation (`tpch_q1`) and
 the three-way joins (`tpch_q3`, `tpcds_store_sales`) remain behind the
 reference engines at both scales.
 
+## Parquet scan pushdown
+
+Published SF1/SF10 walls above still time in-memory queries after a full
+`read_parquet` load (method unchanged). File scans with
+`ParquetReadOptions::filters` skip work before decode. Default tests in
+`crates/mizuchi/src/read.rs` assert the skip ratios; compressed-byte
+counts are writer-dependent so tests check `kept < total`.
+
+| case | row groups kept / total | bytes | rows returned |
+| --- | ---: | --- | ---: |
+| clustered q6 `l_shipdate` in `[731, 1096)` | 1 / 4 | projected compressed bytes drop | 4 |
+| `id > 2` on two Int64 groups | 1 / 2 | projected compressed bytes drop | 2 |
+| `price >= 0.05` on two Float64 groups | 1 / 2 | projected compressed bytes drop | 2 |
+| bloom equality `id = 3` (stats off) | 1 / 2 | projected compressed bytes drop | 1 |
+| mixed-group `id > 2` (late materialization) | 1 / 1 | all groups kept; predicate columns first | 2 |
+| page index `id >= 1000` (40 rows, 10-row pages) | 1 / 1 | unmatched pages skipped | 20 |
+
+Filtered q6-style scans therefore read one clustered date group instead of
+all four, and mixed-group filters decode surviving columns after the
+predicate rather than the whole file.
+
 ## SF1 worker scaling
 
 Same SF1 Parquet and method (`gb_bench run --sf 1 --workers N --repeats 3`).

@@ -49,7 +49,9 @@ Runners open a [`Session`](crates/mizuchi/src/exec/mod.rs) from
 `SessionConfig` (memory limit, worker count, spill directory, allowed
 read/write paths, network grant), register Arrow record batches,
 Parquet/CSV/JSON/Avro/ORC files, Delta or Iceberg snapshots, or an
-Arrow C stream, and pull result batches. Cooperative cancellation is a
+Arrow C stream, and pull result batches. Parquet reads project to
+requested columns, skip row groups and pages that cannot match
+(`ParquetReadOptions::filters`), and late-materialize remaining columns. Cooperative cancellation is a
 `CancelToken`. `execute_sql_reported` / `write_parquet_reported` return
 a `QueryReport` (inputs after partition prune, outputs, version, plan).
 `write_delta` / `write_iceberg` commit a new snapshot; `TimeTravel`

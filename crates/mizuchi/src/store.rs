@@ -19,7 +19,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::expr::{BinaryOp, Expr};
-use crate::read::{ParquetReadOptions, read_parquet_from_builder};
+use crate::read::{ParquetReadOptions, parquet_reader_options, read_parquet_from_builder};
 use crate::write::{
     ParquetWriteOptions, WriteMode, split_partitions, take_rows, validate_partitions,
 };
@@ -75,9 +75,12 @@ fn read_parquet_store_counted(
     for loc in kept {
         let get = block_on(store.get(&loc)).map_err(store_err)?;
         let bytes = block_on(get.bytes()).map_err(store_err)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
-            .map_err(|e| Error::Io(format!("{loc}: {e}")))?;
-        out.extend(read_parquet_from_builder(builder, &opts, loc.as_ref())?);
+        let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            bytes.clone(),
+            parquet_reader_options(),
+        )
+        .map_err(|e| Error::Io(format!("{loc}: {e}")))?;
+        out.extend(read_parquet_from_builder(builder, &opts, loc.as_ref(), Some(&bytes))?.0);
     }
     let mut columns: Vec<String> = opts.projection.map(|p| p.to_vec()).unwrap_or_else(|| {
         out.first()
