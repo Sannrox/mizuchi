@@ -41,8 +41,8 @@ fn release_workflow_is_tag_dispatch_dry_run() {
         !yml.contains("pull_request"),
         "release workflow must not run on pull_request"
     );
-    assert!(yml.contains("cargo publish --locked --dry-run -p mizuchi"));
-    assert!(yml.contains("cargo package --list --locked -p mizuchi"));
+    assert!(yml.contains("cargo publish --locked --dry-run -p mizuchi-core"));
+    assert!(yml.contains("cargo package --list --locked -p"));
     for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {
         assert!(yml.contains(os), "wheels matrix missing {os}");
     }
@@ -107,15 +107,33 @@ fn package_list_includes_readme() {
         String::from_utf8_lossy(&out.stderr)
     );
     let list = String::from_utf8_lossy(&out.stdout);
-    for name in [
-        "README.md",
-        "src/lib.rs",
-        "Cargo.toml",
-        "schemas/query-api-v1.json",
-    ] {
+    for name in ["README.md", "src/lib.rs", "Cargo.toml"] {
         assert!(
             list.lines().any(|l| l == name),
             "package list missing {name}:\n{list}"
         );
     }
+    let exec = std::process::Command::new("cargo")
+        .args([
+            "package",
+            "--list",
+            "--locked",
+            "--offline",
+            "--allow-dirty",
+            "-p",
+            "mizuchi-exec",
+        ])
+        .current_dir(root())
+        .output()
+        .expect("cargo package --list -p mizuchi-exec");
+    assert!(
+        exec.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+    let exec_list = String::from_utf8_lossy(&exec.stdout);
+    assert!(
+        exec_list.lines().any(|l| l == "schemas/query-api-v1.json"),
+        "mizuchi-exec package list missing schema:\n{exec_list}"
+    );
 }

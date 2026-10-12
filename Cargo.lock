@@ -1523,20 +1523,86 @@ name = "mizuchi"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "arrow-avro",
- "arrow-flight",
- "bytes",
- "futures",
  "landlock",
- "native-tls",
+ "mizuchi-core",
+ "mizuchi-exec",
+ "mizuchi-flight",
+ "mizuchi-io",
+ "mizuchi-plan",
+ "mizuchi-postgres",
  "object_store",
  "parquet",
- "postgres",
- "postgres-native-tls",
- "serde_json",
  "sqlparser",
  "tokio",
+]
+
+[[package]]
+name = "mizuchi-core"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+]
+
+[[package]]
+name = "mizuchi-exec"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "mizuchi-core",
+ "mizuchi-io",
+ "mizuchi-plan",
+ "mizuchi-postgres",
+ "object_store",
+ "serde_json",
+ "sqlparser",
+]
+
+[[package]]
+name = "mizuchi-flight"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "futures",
+ "mizuchi-core",
+ "mizuchi-exec",
+ "tokio",
  "tonic",
+]
+
+[[package]]
+name = "mizuchi-io"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-avro",
+ "bytes",
+ "futures",
+ "mizuchi-core",
+ "object_store",
+ "parquet",
+ "serde_json",
+]
+
+[[package]]
+name = "mizuchi-plan"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "mizuchi-core",
+ "serde_json",
+ "sqlparser",
+]
+
+[[package]]
+name = "mizuchi-postgres"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "mizuchi-core",
+ "native-tls",
+ "postgres",
+ "postgres-native-tls",
 ]
 
 [[package]]

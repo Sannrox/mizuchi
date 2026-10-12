@@ -36,6 +36,6 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
       - name: Pushdown SQL (default tests)
-        run: cargo test --locked --lib postgres::tests
+        run: cargo test --locked -p mizuchi-postgres --lib
       - name: Live source
         run: cargo test --locked --test postgres --features postgres -- --ignored --test-threads=1

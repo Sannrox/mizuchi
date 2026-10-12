@@ -1,6 +1,21 @@
 [workspace]
-members = ["crates/mizuchi"]
-default-members = ["crates/mizuchi"]
+members = [
+    "crates/mizuchi-core",
+    "crates/mizuchi-plan",
+    "crates/mizuchi-io",
+    "crates/mizuchi-postgres",
+    "crates/mizuchi-exec",
+    "crates/mizuchi-flight",
+    "crates/mizuchi",
+]
+default-members = [
+    "crates/mizuchi-core",
+    "crates/mizuchi-plan",
+    "crates/mizuchi-io",
+    "crates/mizuchi-postgres",
+    "crates/mizuchi-exec",
+    "crates/mizuchi",
+]
 exclude = ["python", "fuzz"]
 resolver = "2"
 
@@ -12,6 +27,11 @@ repository = "https://github.com/Sannrox/mizuchi"
 publish = false
 
 [workspace.dependencies]
+mizuchi-core = { path = "crates/mizuchi-core", version = "0.1.0" }
+mizuchi-plan = { path = "crates/mizuchi-plan", version = "0.1.0" }
+mizuchi-io = { path = "crates/mizuchi-io", version = "0.1.0" }
+mizuchi-postgres = { path = "crates/mizuchi-postgres", version = "0.1.0" }
+mizuchi-exec = { path = "crates/mizuchi-exec", version = "0.1.0" }
 arrow = { version = "60.0.0", default-features = false, features = ["csv", "ipc", "ffi", "json"] }
 arrow-avro = { version = "60.0.0", default-features = false }
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }

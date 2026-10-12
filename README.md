@@ -23,12 +23,18 @@ distributed later.
   ([coverage](docs/sql-coverage.md)) and benchmark comparisons against DuckDB
   and DataFusion.
 
-## Architecture (planned)
+## Architecture
 
 ```text
 SQL / DataFrame -> logical plan -> optimizer -> physical plan -> execution
                                                      (vectorized, morsel-driven)
 ```
+
+Workspace crates (ADR [0013](docs/decisions/0013-workspace-crate-graph.md)):
+`mizuchi-core` (batches, expressions, cancellation), `mizuchi-plan` (SQL and
+optimizer), `mizuchi-io` (files and lake tables), `mizuchi-postgres`,
+`mizuchi-exec` (operators and `Session`), `mizuchi-flight` (optional), and
+the `mizuchi` facade that embedders depend on.
 
 ## Roadmap
 
@@ -45,7 +51,7 @@ Tracked as GitHub Issues and milestones:
 
 ## Embedding
 
-Runners open a [`Session`](crates/mizuchi/src/exec/mod.rs) from
+Runners open a [`Session`](crates/mizuchi-exec/src/lib.rs) from
 `SessionConfig` (memory limit, worker count, spill directory, allowed
 read/write paths, network grant), register Arrow record batches,
 Parquet/CSV/JSON/Avro/ORC files, Delta or Iceberg snapshots, or an
@@ -70,7 +76,7 @@ optionally from a directory of JSON + Arrow schema files
 serves a versioned HTTP API (`/v1`, contract `mizuchi.query-api/v1` in
 `/healthz`) so external UIs can list completed queries, inspect plans and
 operator metrics, watch running queries, and cancel (ADR 0012). The JSON
-schema is `crates/mizuchi/schemas/query-api-v1.json`. Bind address, optional bearer
+schema is `crates/mizuchi-exec/schemas/query-api-v1.json`. Bind address, optional bearer
 token, history path, and optional unpacked console directory (`ui_dir`, served
 at `/ui/`) are set by the embedder (ADR 0014); loopback listens do not
 require `allow_network`.

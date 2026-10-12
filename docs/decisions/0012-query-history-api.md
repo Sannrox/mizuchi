@@ -17,7 +17,7 @@ runners already own bind addresses, authentication, and path grants
 
 - The observability contract is HTTP JSON under `/v1`, identified as
   `mizuchi.query-api/v1` in `/healthz`. The JSON Schema lives in
-  `crates/mizuchi/schemas/query-api-v1.json` and is served at `/v1/schema`.
+  `crates/mizuchi-exec/schemas/query-api-v1.json` and is served at `/v1/schema`.
 - History, running-query, and cancel behavior exist on `QueryLog` in
   the library. `QueryApiServer` is a thin HTTP front over that log.
 - The API is off until the embedder sets `SessionConfig.query_api`.

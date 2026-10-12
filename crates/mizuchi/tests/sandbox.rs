@@ -190,9 +190,14 @@ fn memory_cap_without_spill_is_memory() {
 
 #[test]
 fn crate_sources_have_no_sandbox_backend() {
-    let src = root().join("crates/mizuchi/src");
+    let crates = root().join("crates");
     let mut files = Vec::new();
-    walk_rs(&src, &mut files);
+    for dir in std::fs::read_dir(&crates).unwrap() {
+        let src = dir.unwrap().path().join("src");
+        if src.is_dir() {
+            walk_rs(&src, &mut files);
+        }
+    }
     assert!(!files.is_empty());
     for path in files {
         let text = std::fs::read_to_string(&path).unwrap();

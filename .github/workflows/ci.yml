@@ -23,9 +23,9 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --locked --workspace --all-targets
+        run: cargo build --locked --workspace --all-targets --exclude mizuchi-flight
       - name: Test
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --exclude mizuchi-flight
 
   fmt:
     name: Rustfmt
@@ -50,7 +50,7 @@ jobs:
           toolchain: 1.97.1
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets --exclude mizuchi-flight -- -D warnings
 
   workflow-skills:
     name: Workflow Skills

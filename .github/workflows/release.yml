@@ -22,9 +22,16 @@ jobs:
           toolchain: 1.97.1
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
-      - name: Dry-run crates.io pack
-        run: cargo publish --locked --dry-run -p mizuchi
-      - name: Package contains readme and license
+      - name: Package workspace crates
+        run: |
+          for p in mizuchi-core mizuchi-plan mizuchi-io mizuchi-postgres mizuchi-exec mizuchi; do
+            echo "::group::$p"
+            cargo package --list --locked -p "$p"
+            echo "::endgroup::"
+          done
+      - name: Dry-run crates.io pack (mizuchi-core)
+        run: cargo publish --locked --dry-run -p mizuchi-core
+      - name: Facade package contains readme
         run: |
           list=$(cargo package --list --locked -p mizuchi)
           printf '%s\n' "$list"
