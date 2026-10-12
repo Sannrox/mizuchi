@@ -3,9 +3,10 @@
 An Arrow-native query and transform engine written in Rust. Single-node first,
 distributed later.
 
-> Status: side project, pre-alpha. Nothing executes yet. Transform runners keep
-> using existing engines until mizuchi passes a defined bar
-> (see [ADR 0002](docs/decisions/0002-own-query-engine.md)).
+> Status: side project, experimental 0.1. Embedding runners should keep using
+> their current engines until mizuchi passes a defined bar
+> (see [ADR 0002](docs/decisions/0002-own-query-engine.md)). A 0.y release may
+> break the public surface.
 
 ## Goals
 
@@ -83,6 +84,16 @@ deploy are under `deploy/`.
 
 Pre-1.0. The public surface, SemVer rules, deprecation window, and tag
 dry-run job are [ADR 0007](docs/decisions/0007-api-stability-and-releases.md).
+The `mizuchi` crate is packagable (`publish = true`); the Python cdylib
+stays `publish = false` and ships as a wheel.
+
+1. Move `CHANGELOG.md` Unreleased notes into a versioned section.
+2. Tag `v<version>` on `main` (0.1 is experimental).
+3. Wait for `.github/workflows/release.yml` on that tag (or
+   `workflow_dispatch`): `cargo publish --locked --dry-run -p mizuchi`
+   plus `maturin build` wheels on Linux, macOS, and Windows.
+4. A maintainer publishes to crates.io and PyPI only after that job is
+   green. The workflow does not upload.
 
 ## Development
 

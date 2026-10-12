@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = true
+readme = "../../README.md"
 description = "Arrow-native query and transform engine in Rust: single-node first, distributed later."
 keywords = ["sql", "arrow", "query-engine", "dataframe", "data"]
 categories = ["database-implementations"]

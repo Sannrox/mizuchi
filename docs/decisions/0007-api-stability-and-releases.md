@@ -53,8 +53,10 @@ in the next 0.y.
    green, using tokens stored as GitHub secrets. The workflow does not
    upload by default.
 
-The `mizuchi` crate may be packaged (`publish = true`). The Python
-cdylib crate stays `publish = false`; it ships as a wheel.
+The `mizuchi` crate may be packaged (`publish = true`) with license,
+readme, repository, and keywords. The Python cdylib crate stays
+`publish = false`; it ships as a wheel. Tag `v0.1.0` only after the
+dry-run job on that tag is green; 0.1 is experimental.
 
 ## Consequences
 

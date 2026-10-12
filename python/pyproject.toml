@@ -8,6 +8,11 @@ version = "0.1.0"
 description = "Python DataFrame API for the mizuchi query engine."
 requires-python = ">=3.10"
 license = "Apache-2.0"
+readme = "../README.md"
+keywords = ["sql", "arrow", "query-engine", "dataframe"]
+
+[project.urls]
+Repository = "https://github.com/Sannrox/mizuchi"
 
 [project.optional-dependencies]
 arrow = ["pyarrow>=14"]
