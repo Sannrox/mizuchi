@@ -7,6 +7,8 @@ mod cache;
 mod cluster;
 mod config;
 mod engine;
+#[cfg(feature = "flight")]
+mod flight;
 mod incremental;
 mod join;
 mod key;
@@ -50,6 +52,8 @@ use crate::udaf::CombineAgg;
 pub use cluster::{Cluster, ClusterConfig, WorkerResources};
 pub use config::SessionConfig;
 pub use engine::Engine;
+#[cfg(feature = "flight")]
+pub use flight::{RemoteCluster, serve_worker, spawn_worker};
 pub use incremental::MicroBatchAgg;
 pub use merge::MergeStats;
 pub use metrics::OperatorMetrics;

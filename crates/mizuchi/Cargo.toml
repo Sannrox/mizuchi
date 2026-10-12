@@ -23,6 +23,9 @@ serde_json = { workspace = true }
 postgres = { workspace = true, optional = true }
 postgres-native-tls = { workspace = true, optional = true }
 native-tls = { workspace = true, optional = true }
+arrow-flight = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -35,6 +38,19 @@ sandbox = []
 # Optional PostgreSQL source. Opens TCP only when the embedder sets
 # `SessionConfig.allow_network`. Default tests do not enable this.
 postgres = ["dep:postgres", "dep:postgres-native-tls", "dep:native-tls"]
+# Optional Arrow Flight workers. Binds TCP only when the embedder sets
+# `SessionConfig.allow_network`. Default tests do not enable this.
+flight = ["dep:arrow-flight", "dep:tonic", "dep:tokio"]
+
+[[bin]]
+name = "mizuchi"
+path = "src/bin/mizuchi.rs"
+required-features = ["flight"]
+
+[[test]]
+name = "flight_cluster"
+path = "tests/flight_cluster.rs"
+required-features = ["flight"]
 
 [dev-dependencies]
 arrow = { workspace = true }

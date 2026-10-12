@@ -14,5 +14,6 @@ Decisions that must outlive a single PR.
 | [0008](0008-network-sources-require-grant.md) | Network sources require an embedder grant | Accepted |
 | [0009](0009-stream-watermarks-and-checkpoints.md) | Continuous queries: watermarks, windows, checkpoints | Accepted |
 | [0010](0010-pluggable-catalog.md) | Pluggable catalog: namespaces, backends, partition metadata | Accepted |
+| [0011](0011-flight-workers.md) | Flight workers are separate processes | Accepted |
 
 Template: short context, decision, consequences, rejected alternatives.

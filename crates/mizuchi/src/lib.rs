@@ -38,6 +38,8 @@ pub use exec::{
     OperatorMetrics, OutputWrite, QueryReport, QueryResult, Session, SessionConfig, StreamOutput,
     StreamQuery, StreamQueryConfig, StreamTrigger, WorkerResources,
 };
+#[cfg(feature = "flight")]
+pub use exec::{RemoteCluster, serve_worker, spawn_worker};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lake::{
     LakeSnapshot, SchemaEvolution, TimeTravel, delta_head, delta_head_store, evolve_delta,

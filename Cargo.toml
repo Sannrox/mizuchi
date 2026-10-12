@@ -23,3 +23,6 @@ serde_json = { version = "1.0.152", default-features = false, features = ["std"]
 postgres = { version = "0.19.10" }
 postgres-native-tls = { version = "0.5.2" }
 native-tls = { version = "0.2.14" }
+arrow-flight = { version = "60.0.0", default-features = false }
+tonic = { version = "0.14.1", default-features = false, features = ["transport", "codegen", "router"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "macros", "sync"] }

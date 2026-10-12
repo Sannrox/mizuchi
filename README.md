@@ -79,8 +79,11 @@ grant is denied. Optional Linux filesystem-limit tests use
 -- --ignored`) run in default CI against MinIO; the job fails if they
 are skipped. Lake REST HTTP remains `.github/workflows/lake-store.yml`
 (`workflow_dispatch` only). `Cluster` sizes in-process workers, scales
-them, and may run speculative task copies. Layouts for a runner to
-deploy are under `deploy/`.
+them, and may run speculative task copies. Flight workers
+(`--features flight`, ADR 0011) are separate processes; the engine
+binds TCP only with `allow_network`. Layouts for a runner to
+deploy are under `deploy/`. Optional Flight tests use
+`.github/workflows/flight.yml` (`workflow_dispatch` only).
 
 ## Releases
 
