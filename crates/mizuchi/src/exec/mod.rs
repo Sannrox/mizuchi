@@ -17,6 +17,7 @@ mod merge;
 mod metrics;
 mod op;
 mod query_api;
+mod query_ui;
 mod recursive;
 mod report;
 mod schedule;

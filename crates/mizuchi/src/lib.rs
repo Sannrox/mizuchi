@@ -14,7 +14,8 @@
 //! memory caps surface as [`Error::Io`] and [`Error::Memory`].
 //! Query history and the versioned metrics HTTP API (`/v1`,
 //! [`QUERY_API_CONTRACT`]) stay off until
-//! [`SessionConfig::query_api`] is set (ADR 0012).
+//! [`SessionConfig::query_api`] is set (ADR 0012). An optional console
+//! directory is served at `/ui/` (ADR 0014).
 //! [`VERSION`] and [`Session::explain`] are the strings a runner records.
 //! See `crates/mizuchi/examples/embed.rs`.
 
