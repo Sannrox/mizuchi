@@ -55,6 +55,20 @@ this method and the committed results table are in git.
 Ratio in the results table is `reference_ms / mizuchi_ms` (same convention as
 `tests/engine_compare.rs`). Values below 1 mean the reference finished faster.
 
+## Operator profiles
+
+`Session::query_metrics` records inclusive `elapsed_ns` and pool `peak_bytes`
+per physical operator. Exclusive time is inclusive minus the children's
+inclusive times. Rank exclusive time for the CPU profile of the plan.
+`peak_bytes` is the allocation profile: join and aggregate reserve only when
+a `memory_limit` is set, so `gb_bench profile` uses a 24 GiB cap. `gb_bench
+run` stays unbounded so SF10 wall times match [results.md](results.md).
+Reproduce a
+Parquet run with `bash scripts/profile-suite.sh tiny` (or `1` / `10` when
+those scales are generated). Default `cargo test` uses the tiny in-memory
+suite (`tests/suite_profile.rs`), not SF1 files. Findings and the ranked
+limiters are in [limiters.md](limiters.md).
+
 ## What this is not
 
 - Not the default offline `cargo test` bar.

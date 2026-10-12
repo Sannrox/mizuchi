@@ -4,7 +4,7 @@
 //! builds the same operator tree with no timing.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::CancelToken;
@@ -27,11 +27,72 @@ pub struct OperatorMetrics {
     pub elapsed_ns: u64,
     /// High-water of the query memory pool observed here.
     pub peak_bytes: u64,
+    /// True when `elapsed_ns` is a blocking build recorded after children
+    /// already ran (join, aggregate, sort). Those child times are disjoint.
+    pub blocking: bool,
     /// Child operators, left to right.
     pub children: Vec<OperatorMetrics>,
 }
 
 impl OperatorMetrics {
+    /// Time spent in this operator excluding nested pulls.
+    ///
+    /// Pipelined children (`Scan`, `Filter`, `Project`) run inside this
+    /// node's `elapsed_ns`. Blocking children (join/aggregate/sort) already
+    /// finished during `build_physical`; subtracting them would undercount
+    /// nested joins. Exclusive time is the CPU profile of the plan.
+    pub fn exclusive_ns(&self) -> u64 {
+        let nested: u64 = self
+            .children
+            .iter()
+            .filter(|c| !c.blocking)
+            .map(|c| c.elapsed_ns)
+            .sum();
+        self.elapsed_ns.saturating_sub(nested)
+    }
+
+    /// Depth-first visit of this node and every descendant.
+    pub fn walk<'a>(&'a self, out: &mut Vec<&'a OperatorMetrics>) {
+        out.push(self);
+        for child in &self.children {
+            child.walk(out);
+        }
+    }
+
+    /// Every operator, highest exclusive time first.
+    pub fn ranked_exclusive(&self) -> Vec<&OperatorMetrics> {
+        let mut nodes = Vec::new();
+        self.walk(&mut nodes);
+        nodes.sort_by_key(|b| std::cmp::Reverse(b.exclusive_ns()));
+        nodes
+    }
+
+    /// Ranked exclusive-time rows as a JSON array (no nested children).
+    pub fn ranked_exclusive_json(&self) -> String {
+        let ranked = self.ranked_exclusive();
+        let mut out = String::from("[");
+        for (i, n) in ranked.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"name\":\"");
+            out.push_str(&n.name);
+            out.push_str("\",\"exclusive_ns\":");
+            out.push_str(&n.exclusive_ns().to_string());
+            out.push_str(",\"elapsed_ns\":");
+            out.push_str(&n.elapsed_ns.to_string());
+            out.push_str(",\"peak_bytes\":");
+            out.push_str(&n.peak_bytes.to_string());
+            out.push_str(",\"rows\":");
+            out.push_str(&n.rows.to_string());
+            out.push_str(",\"batches\":");
+            out.push_str(&n.batches.to_string());
+            out.push('}');
+        }
+        out.push(']');
+        out
+    }
+
     /// JSON object for runners and the Python API. No extra crate.
     pub fn to_json(&self) -> String {
         let mut out = String::new();
@@ -48,6 +109,10 @@ impl OperatorMetrics {
         out.push_str(&self.batches.to_string());
         out.push_str(",\"elapsed_ns\":");
         out.push_str(&self.elapsed_ns.to_string());
+        out.push_str(",\"exclusive_ns\":");
+        out.push_str(&self.exclusive_ns().to_string());
+        out.push_str(",\"blocking\":");
+        out.push_str(if self.blocking { "true" } else { "false" });
         out.push_str(",\"peak_bytes\":");
         out.push_str(&self.peak_bytes.to_string());
         out.push_str(",\"children\":[");
@@ -67,6 +132,7 @@ pub(super) struct Counters {
     batches: AtomicU64,
     elapsed_ns: AtomicU64,
     peak_bytes: AtomicU64,
+    blocking: AtomicBool,
 }
 
 pub(super) struct PhysNode {
@@ -83,6 +149,7 @@ impl PhysNode {
             batches: self.metrics.batches.load(Ordering::Relaxed),
             elapsed_ns: self.metrics.elapsed_ns.load(Ordering::Relaxed),
             peak_bytes: self.metrics.peak_bytes.load(Ordering::Relaxed),
+            blocking: self.metrics.blocking.load(Ordering::Relaxed),
             children: self.children.iter().map(PhysNode::snapshot).collect(),
         }
     }
@@ -98,8 +165,13 @@ impl PhysNode {
         if analyze {
             let snap = self.snapshot();
             out.push_str(&format!(
-                "{pad}{} rows={} batches={} elapsed_ns={} peak_bytes={}\n",
-                snap.name, snap.rows, snap.batches, snap.elapsed_ns, snap.peak_bytes
+                "{pad}{} rows={} batches={} elapsed_ns={} exclusive_ns={} peak_bytes={}\n",
+                snap.name,
+                snap.rows,
+                snap.batches,
+                snap.elapsed_ns,
+                snap.exclusive_ns(),
+                snap.peak_bytes
             ));
         } else {
             out.push_str(&format!("{pad}{}\n", self.name));
@@ -198,6 +270,7 @@ pub(super) fn add_blocking(node: &PhysNode, elapsed_ns: u64, peak_bytes: u64) {
     node.metrics
         .peak_bytes
         .fetch_max(peak_bytes, Ordering::Relaxed);
+    node.metrics.blocking.store(true, Ordering::Relaxed);
 }
 
 struct Metered {
@@ -222,5 +295,66 @@ impl Operator for Metered {
             .peak_bytes
             .fetch_max(self.used.load(Ordering::Relaxed), Ordering::Relaxed);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OperatorMetrics;
+
+    fn node(
+        name: &str,
+        elapsed_ns: u64,
+        peak_bytes: u64,
+        blocking: bool,
+        children: Vec<OperatorMetrics>,
+    ) -> OperatorMetrics {
+        OperatorMetrics {
+            name: name.into(),
+            rows: 1,
+            batches: 1,
+            elapsed_ns,
+            peak_bytes,
+            blocking,
+            children,
+        }
+    }
+
+    #[test]
+    fn ranked_exclusive_orders_by_self_time() {
+        let scan_hot = node("Scan", 80, 100, false, Vec::new());
+        let scan_cold = node("Scan", 10, 50, false, Vec::new());
+        let join = node("HashJoin", 120, 200, false, vec![scan_hot, scan_cold]);
+        assert_eq!(join.exclusive_ns(), 30);
+        let ranked = join.ranked_exclusive();
+        assert_eq!(ranked.len(), 3);
+        assert_eq!(ranked[0].name, "Scan");
+        assert_eq!(ranked[0].exclusive_ns(), 80);
+        assert_eq!(ranked[1].name, "HashJoin");
+        assert_eq!(ranked[1].exclusive_ns(), 30);
+        assert_eq!(ranked[2].name, "Scan");
+        assert_eq!(ranked[2].exclusive_ns(), 10);
+        let json = join.ranked_exclusive_json();
+        assert!(
+            json.starts_with("[{\"name\":\"Scan\",\"exclusive_ns\":80"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"name\":\"HashJoin\",\"exclusive_ns\":30"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn exclusive_skips_already_finished_blocking_children() {
+        let scan = node("Scan", 100, 50, false, Vec::new());
+        let inner = node("HashJoin", 336_000, 200, true, vec![scan.clone()]);
+        let outer = node("HashJoin", 1_274_000, 400, true, vec![inner, scan]);
+        // Inner build is disjoint; only the pipelined Scan is nested in outer.
+        assert_eq!(outer.exclusive_ns(), 1_274_000 - 100);
+        assert_eq!(outer.children[0].exclusive_ns(), 336_000 - 100);
+        let json = outer.to_json();
+        assert!(json.contains("\"blocking\":true"), "{json}");
+        assert!(json.contains("\"blocking\":false"), "{json}");
     }
 }

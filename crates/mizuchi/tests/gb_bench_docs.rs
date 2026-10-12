@@ -29,6 +29,8 @@ fn methodology_records_hardware_and_method() {
         "DuckDB",
         "DataFusion",
         "scripts/bench-gb.sh",
+        "scripts/profile-suite.sh",
+        "query_metrics",
     ] {
         assert!(text.contains(needle), "methodology missing {needle}");
     }
@@ -66,13 +68,43 @@ fn results_table_covers_sf1_and_sf10() {
 }
 
 #[test]
+fn limiters_rank_suite_queries_and_follow_ups() {
+    let text = read("docs/bench/limiters.md");
+    for needle in [
+        "tpch_q1",
+        "tpch_q3",
+        "tpch_q6",
+        "tpcds_store_sales",
+        "exclusive",
+        "peak_bytes",
+        "Scan",
+        "Expression",
+        "Hash aggregate",
+        "Hash join",
+        "Copies",
+        "Scheduling",
+        "#103",
+        "#104",
+        "#105",
+        "#106",
+        "#107",
+        "query_metrics",
+        "scripts/profile-suite.sh",
+    ] {
+        assert!(text.contains(needle), "limiters missing {needle}");
+    }
+}
+
+#[test]
 fn harness_and_optional_workflow_exist() {
     let root = root();
     for rel in [
         "scripts/bench-gb.sh",
         "scripts/bench_gb_ref.py",
+        "scripts/profile-suite.sh",
         "crates/mizuchi/examples/gb_bench.rs",
         ".github/workflows/bench-gb.yml",
+        "docs/bench/limiters.md",
     ] {
         assert!(root.join(rel).is_file(), "missing {rel}");
     }
@@ -85,4 +117,10 @@ fn harness_and_optional_workflow_exist() {
     let script = read("scripts/bench-gb.sh");
     assert!(script.contains("gb_bench"));
     assert!(script.contains("bench_gb_ref.py"));
+    let profile = read("scripts/profile-suite.sh");
+    assert!(profile.contains("gb_bench"));
+    assert!(profile.contains("profile"));
+    let example = read("crates/mizuchi/examples/gb_bench.rs");
+    assert!(example.contains("\"profile\""));
+    assert!(example.contains("query_metrics"));
 }
