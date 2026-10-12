@@ -1523,6 +1523,7 @@ name = "mizuchi"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "futures",
  "landlock",
  "mizuchi-core",
  "mizuchi-exec",

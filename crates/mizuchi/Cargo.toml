@@ -41,6 +41,7 @@ required-features = ["flight"]
 
 [dev-dependencies]
 arrow = { workspace = true }
+futures = { workspace = true }
 parquet = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time"] }
 
