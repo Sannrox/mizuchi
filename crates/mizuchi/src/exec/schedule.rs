@@ -24,7 +24,7 @@ pub(super) fn try_parallel(
     session: &Session,
     pool: &MemoryPool,
 ) -> Result<Option<Vec<Batch>>> {
-    session.cancel.check()?;
+    session.exec_token().check()?;
     match plan {
         LogicalPlan::Sort { input, order } => {
             let Some(child) = try_parallel(input, session, pool)? else {
@@ -41,7 +41,7 @@ pub(super) fn try_parallel(
                 None,
                 &session.policy,
                 pool,
-                &session.cancel,
+                &session.exec_token(),
             )?))
         }
         LogicalPlan::Limit { input, skip, fetch } => match input.as_ref() {
@@ -63,7 +63,7 @@ pub(super) fn try_parallel(
                     *fetch,
                     &session.policy,
                     pool,
-                    &session.cancel,
+                    &session.exec_token(),
                 )?))
             }
             _ => {
@@ -79,7 +79,7 @@ pub(super) fn try_parallel(
                         skip: *skip,
                         fetch: *fetch,
                     }),
-                    &session.cancel,
+                    &session.exec_token(),
                 )?))
             }
         },
@@ -165,7 +165,7 @@ pub(super) fn try_parallel(
                 },
                 &session.policy,
                 pool,
-                &session.cancel,
+                &session.exec_token(),
                 session.workers,
             )?))
         }
@@ -381,7 +381,7 @@ fn plan_batches(plan: &LogicalPlan, session: &Session, pool: &MemoryPool) -> Res
     if let Some(out) = try_parallel(plan, session, pool)? {
         return Ok(out);
     }
-    collect(physical(plan, session, pool)?, &session.cancel)
+    collect(physical(plan, session, pool)?, &session.exec_token())
 }
 
 struct Pipeline {
@@ -466,7 +466,7 @@ fn agg_from_batches(
             schema,
             &session.policy,
             pool,
-            &session.cancel,
+            &session.exec_token(),
         );
     }
     let n = session.workers.max(1).min(morsels.len());
@@ -478,28 +478,35 @@ fn agg_from_batches(
         let partials = Mutex::new(Vec::new());
         thread::scope(|scope| -> Result<()> {
             let mut handles = Vec::new();
+            let token = session.exec_token();
             for chunk in chunks {
                 let partials = &partials;
                 let schema = schema.clone();
+                let token = token.clone();
                 handles.push(scope.spawn(move || -> Result<()> {
-                    session.cancel.check()?;
-                    let out = super::agg::run(
-                        Box::new(Exec::Scan {
-                            batches: chunk,
-                            index: 0,
-                        }),
-                        group,
-                        aggs,
-                        schema,
-                        &session.policy,
-                        pool,
-                        &session.cancel,
-                    )?;
-                    partials
-                        .lock()
-                        .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?
-                        .extend(out);
-                    Ok(())
+                    let prev = Session::push_cancel(token);
+                    let result = (|| {
+                        session.exec_token().check()?;
+                        let out = super::agg::run(
+                            Box::new(Exec::Scan {
+                                batches: chunk,
+                                index: 0,
+                            }),
+                            group,
+                            aggs,
+                            schema,
+                            &session.policy,
+                            pool,
+                            &session.exec_token(),
+                        )?;
+                        partials
+                            .lock()
+                            .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?
+                            .extend(out);
+                        Ok(())
+                    })();
+                    Session::restore_cancel(prev);
+                    result
                 }));
             }
             for h in handles {
@@ -516,17 +523,24 @@ fn agg_from_batches(
     let tables = Mutex::new(Vec::new());
     thread::scope(|scope| -> Result<()> {
         let mut handles = Vec::new();
+        let token = session.exec_token();
         for chunk in chunks {
             let tables = &tables;
             let schema = schema.clone();
+            let token = token.clone();
             handles.push(scope.spawn(move || -> Result<()> {
-                session.cancel.check()?;
-                let table = super::agg::fold_batches(chunk, group, aggs, schema)?;
-                tables
-                    .lock()
-                    .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?
-                    .push(table);
-                Ok(())
+                let prev = Session::push_cancel(token);
+                let result = (|| {
+                    session.exec_token().check()?;
+                    let table = super::agg::fold_batches(chunk, group, aggs, schema)?;
+                    tables
+                        .lock()
+                        .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?
+                        .push(table);
+                    Ok(())
+                })();
+                Session::restore_cancel(prev);
+                result
             }));
         }
         for h in handles {
@@ -553,7 +567,7 @@ fn map_morsels(
     if n == 1 {
         let mut out = Vec::new();
         for batch in morsels {
-            session.cancel.check()?;
+            session.exec_token().check()?;
             if let Some(batch) = f(batch)? {
                 out.push(batch);
             }
@@ -569,29 +583,36 @@ fn map_morsels(
     let collected = Mutex::new(Vec::new());
     thread::scope(|scope| -> Result<()> {
         let mut handles = Vec::new();
+        let token = session.exec_token();
         for _ in 0..n {
             let queue = &queue;
             let collected = &collected;
             let f = &f;
+            let token = token.clone();
             handles.push(scope.spawn(move || -> Result<()> {
-                loop {
-                    session.cancel.check()?;
-                    let item = {
-                        let mut g = queue
-                            .lock()
-                            .map_err(|_| Error::Eval("morsel queue lock poisoned".into()))?;
-                        g.pop()
-                    };
-                    let Some((i, batch)) = item else {
-                        return Ok(());
-                    };
-                    if let Some(out) = f(batch)? {
-                        collected
-                            .lock()
-                            .map_err(|_| Error::Eval("morsel output lock poisoned".into()))?
-                            .push((i, out));
+                let prev = Session::push_cancel(token);
+                let result = (|| {
+                    loop {
+                        session.exec_token().check()?;
+                        let item = {
+                            let mut g = queue
+                                .lock()
+                                .map_err(|_| Error::Eval("morsel queue lock poisoned".into()))?;
+                            g.pop()
+                        };
+                        let Some((i, batch)) = item else {
+                            return Ok(());
+                        };
+                        if let Some(out) = f(batch)? {
+                            collected
+                                .lock()
+                                .map_err(|_| Error::Eval("morsel output lock poisoned".into()))?
+                                .push((i, out));
+                        }
                     }
-                }
+                })();
+                Session::restore_cancel(prev);
+                result
             }));
         }
         for h in handles {

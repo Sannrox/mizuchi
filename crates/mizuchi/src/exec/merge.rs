@@ -117,8 +117,8 @@ fn scan_table(table: String, schema: SchemaRef) -> LogicalPlan {
 }
 
 fn exec_plan(session: &Session, plan: &LogicalPlan, pool: &MemoryPool) -> Result<Vec<Batch>> {
-    session.cancel.check()?;
-    collect(physical(plan, session, pool)?, &session.cancel)
+    session.exec_token().check()?;
+    collect(physical(plan, session, pool)?, &session.exec_token())
 }
 
 fn concat_or_empty<'a>(

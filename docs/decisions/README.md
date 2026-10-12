@@ -15,5 +15,6 @@ Decisions that must outlive a single PR.
 | [0009](0009-stream-watermarks-and-checkpoints.md) | Continuous queries: watermarks, windows, checkpoints | Accepted |
 | [0010](0010-pluggable-catalog.md) | Pluggable catalog: namespaces, backends, partition metadata | Accepted |
 | [0011](0011-flight-workers.md) | Flight workers are separate processes | Accepted |
+| [0012](0012-query-history-api.md) | Query history and metrics HTTP API | Accepted |
 
 Template: short context, decision, consequences, rejected alternatives.

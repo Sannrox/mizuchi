@@ -34,6 +34,9 @@ pub struct SessionConfig {
     /// Query-start clock in microseconds since the Unix epoch. `CURRENT_DATE`
     /// and `NOW()` bind to this instant. `None` uses the process clock.
     pub now_micros: Option<i64>,
+    /// When set, the session records query history and may serve the
+    /// versioned metrics HTTP API (ADR 0012). Default is off.
+    pub query_api: Option<super::query_api::QueryApiConfig>,
 }
 
 pub(super) fn resolve_roots(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {

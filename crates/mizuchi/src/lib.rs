@@ -12,6 +12,9 @@
 //! The engine opens TCP only when
 //! [`SessionConfig::allow_network`] is set; denied paths, denied network, and
 //! memory caps surface as [`Error::Io`] and [`Error::Memory`].
+//! Query history and the versioned metrics HTTP API (`/v1`,
+//! [`QUERY_API_CONTRACT`]) stay off until
+//! [`SessionConfig::query_api`] is set (ADR 0012).
 //! [`VERSION`] and [`Session::explain`] are the strings a runner records.
 //! See `crates/mizuchi/examples/embed.rs`.
 
@@ -35,8 +38,10 @@ pub use batch::{Batch, BatchPolicy, BorrowedBatch, DEFAULT_MAX_ROWS};
 pub use error::{Error, Result};
 pub use exec::{
     CancelToken, Cluster, ClusterConfig, Engine, EventWindow, InputScan, MergeStats, MicroBatchAgg,
-    OperatorMetrics, OutputWrite, QueryReport, QueryResult, Session, SessionConfig, StreamOutput,
-    StreamQuery, StreamQueryConfig, StreamTrigger, WorkerResources,
+    OperatorMetrics, OutputWrite, QUERY_API_CONTRACT, QUERY_API_SCHEMA, QueryApiConfig,
+    QueryApiServer, QueryLog, QueryRecord, QueryReport, QueryResult, QueryRetention, QueryStatus,
+    RunningQuery, Session, SessionConfig, StreamOutput, StreamQuery, StreamQueryConfig,
+    StreamTrigger, WorkerResources,
 };
 #[cfg(feature = "flight")]
 pub use exec::{RemoteCluster, serve_worker, spawn_worker};

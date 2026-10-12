@@ -16,6 +16,7 @@ mod memory;
 mod merge;
 mod metrics;
 mod op;
+mod query_api;
 mod recursive;
 mod report;
 mod schedule;
@@ -25,6 +26,7 @@ mod stage;
 mod stream;
 mod window;
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -58,13 +60,27 @@ pub use incremental::MicroBatchAgg;
 pub use merge::MergeStats;
 pub use metrics::OperatorMetrics;
 pub use op::{CpuLowering, Lowering, Operator};
+pub use query_api::{
+    QUERY_API_CONTRACT, QUERY_API_SCHEMA, QueryApiConfig, QueryApiServer, QueryLog, QueryRecord,
+    QueryRetention, QueryStatus, RunningQuery,
+};
 pub use report::{InputScan, OutputWrite, QueryReport, QueryResult};
 pub use stream::{EventWindow, StreamOutput, StreamQuery, StreamQueryConfig, StreamTrigger};
 
 /// Cooperative cancellation flag. Operators check it between morsels.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CancelToken {
     flag: Arc<AtomicBool>,
+    extra: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
+}
+
+impl Default for CancelToken {
+    fn default() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            extra: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
 }
 
 impl CancelToken {
@@ -80,7 +96,13 @@ impl CancelToken {
 
     /// Whether [`Self::cancel`] has been called.
     pub fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
+        if self.flag.load(Ordering::SeqCst) {
+            return true;
+        }
+        match self.extra.lock() {
+            Ok(extra) => extra.iter().any(|f| f.load(Ordering::SeqCst)),
+            Err(_) => true,
+        }
     }
 
     pub(crate) fn check(&self) -> Result<()> {
@@ -90,6 +112,26 @@ impl CancelToken {
             Ok(())
         }
     }
+
+    /// A token that is cancelled when either `self` or `other` is cancelled.
+    /// Does not mutate either input, so concurrent queries stay isolated.
+    pub(crate) fn merge(&self, other: &CancelToken) -> CancelToken {
+        let mut extra = self.extra_flags();
+        extra.push(other.flag.clone());
+        extra.extend(other.extra_flags());
+        CancelToken {
+            flag: self.flag.clone(),
+            extra: Arc::new(Mutex::new(extra)),
+        }
+    }
+
+    fn extra_flags(&self) -> Vec<Arc<AtomicBool>> {
+        self.extra.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
+thread_local! {
+    static ACTIVE_CANCEL: RefCell<Option<CancelToken>> = const { RefCell::new(None) };
 }
 
 /// In-memory tables plus a batch-size policy.
@@ -129,6 +171,8 @@ pub struct Session {
     /// Query-start clock in microseconds since the Unix epoch. `None` uses
     /// the process clock when binding `CURRENT_DATE` / `NOW()`.
     now_micros: Option<i64>,
+    query_log: Option<Arc<query_api::QueryLog>>,
+    query_api: Option<query_api::QueryApiConfig>,
 }
 
 impl Default for Session {
@@ -153,6 +197,8 @@ impl Default for Session {
             speculate: false,
             udafs: BTreeMap::new(),
             now_micros: None,
+            query_log: None,
+            query_api: None,
         }
     }
 }
@@ -181,6 +227,8 @@ impl Clone for Session {
             speculate: self.speculate,
             udafs: self.udafs.clone(),
             now_micros: self.now_micros,
+            query_log: self.query_log.clone(),
+            query_api: self.query_api.clone(),
         }
     }
 }
@@ -226,6 +274,24 @@ impl Session {
         session.allowed_write_paths = config::resolve_roots(cfg.allowed_write_paths)?;
         session.allow_network = cfg.allow_network;
         session.now_micros = cfg.now_micros;
+        if let Some(api) = cfg.query_api {
+            if api.auth_token.as_ref().is_some_and(|t| t.is_empty()) {
+                return Err(Error::Plan("query API auth_token must be non-empty".into()));
+            }
+            if !api.bind.ip().is_loopback() && !session.allow_network {
+                return Err(Error::Io(
+                    "query API non-loopback bind requires allow_network".into(),
+                ));
+            }
+            let log = if let Some(path) = &api.history_path {
+                config::assert_allowed(path, &session.allowed_write_paths)?;
+                query_api::QueryLog::open(path, api.retention.clone())?
+            } else {
+                query_api::QueryLog::memory(api.retention.clone())
+            };
+            session.query_log = Some(Arc::new(log));
+            session.query_api = Some(api);
+        }
         Ok(session)
     }
 
@@ -267,6 +333,49 @@ impl Session {
     pub fn with_cancel(mut self, token: CancelToken) -> Self {
         self.cancel = token;
         self
+    }
+
+    /// Token for the execute currently in `with_query_span`, else the session token.
+    pub(super) fn exec_token(&self) -> CancelToken {
+        ACTIVE_CANCEL
+            .with(|c| c.borrow().clone())
+            .unwrap_or_else(|| self.cancel.clone())
+    }
+
+    pub(super) fn push_cancel(token: CancelToken) -> Option<CancelToken> {
+        ACTIVE_CANCEL.with(|c| c.replace(Some(token)))
+    }
+
+    pub(super) fn restore_cancel(prev: Option<CancelToken>) {
+        ACTIVE_CANCEL.with(|c| {
+            *c.borrow_mut() = prev;
+        });
+    }
+
+    /// Record executes into `log`. Off unless the embedder attaches a log
+    /// or sets [`SessionConfig::query_api`].
+    pub fn with_query_log(mut self, log: Arc<query_api::QueryLog>) -> Self {
+        self.query_log = Some(log);
+        self
+    }
+
+    /// History and running-query log, when recording is enabled.
+    pub fn query_log(&self) -> Option<Arc<query_api::QueryLog>> {
+        self.query_log.clone()
+    }
+
+    /// Bind the configured query API. Fails when [`SessionConfig::query_api`]
+    /// was not set.
+    pub fn serve_query_api(&self) -> Result<query_api::QueryApiServer> {
+        let cfg = self
+            .query_api
+            .as_ref()
+            .ok_or_else(|| Error::Plan("query API is not configured".into()))?;
+        let log = self
+            .query_log
+            .clone()
+            .ok_or_else(|| Error::Plan("query API is not configured".into()))?;
+        query_api::QueryApiServer::bind_with_network(log, cfg, self.allow_network)
     }
 
     /// Directory for shuffle files written as Arrow IPC. The engine never
@@ -998,12 +1107,18 @@ impl Session {
 
     /// [`Self::execute`] plus a [`QueryReport`].
     pub fn execute_reported(&self, plan: &LogicalPlan) -> Result<QueryResult> {
-        self.cancel.check()?;
-        let plan = crate::opt::optimize(plan.clone())?;
-        let batches = self.execute_optimized(&plan)?;
-        Ok(QueryResult {
-            report: self.report_for(&plan),
-            batches,
+        let plan_sql = report::plan_text(plan);
+        self.with_query_span(&plan_sql, |instrument| {
+            self.exec_token().check()?;
+            let plan = crate::opt::optimize(plan.clone())?;
+            let (batches, stats) = self.execute_run(&plan, instrument)?;
+            Ok((
+                QueryResult {
+                    report: self.report_for(&plan),
+                    batches,
+                },
+                stats,
+            ))
         })
     }
 
@@ -1015,31 +1130,61 @@ impl Session {
 
     /// Plan and run `sql` against registered tables.
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<Batch>> {
-        self.cancel.check()?;
-        if let Ok(Ddl::ShowTables { namespace }) = bind_ddl(sql) {
-            return self.show_tables(namespace.as_deref());
-        }
-        if let Some((analyze, inner)) = explain_sql(sql)? {
-            let text = if analyze {
-                self.explain_analyze(&inner)?
-            } else {
-                self.explain(&inner)?
-            };
-            return plan_text_batch(&text);
-        }
-        let plan = self.bind_optimized(sql)?;
-        self.execute_optimized(&plan)
+        Ok(self.execute_sql_reported(sql)?.batches)
     }
 
     /// [`Self::execute_sql`] plus a [`QueryReport`].
     pub fn execute_sql_reported(&self, sql: &str) -> Result<QueryResult> {
-        self.cancel.check()?;
+        self.with_query_span(sql, |instrument| self.execute_sql_inner(sql, instrument))
+    }
+
+    fn with_query_span(
+        &self,
+        sql: &str,
+        run: impl FnOnce(bool) -> Result<(QueryResult, query_api::RunStats)>,
+    ) -> Result<QueryResult> {
+        let span = self
+            .query_log
+            .as_ref()
+            .map(|log| query_api::QueryLog::begin_on(log, sql));
+        let instrument = span.is_some();
+        let prev = span
+            .as_ref()
+            .map(|s| Self::push_cancel(s.token().merge(&self.cancel)));
+        let result = run(instrument);
+        if prev.is_some() {
+            Self::restore_cancel(prev.flatten());
+        }
+        match (result, span) {
+            (Ok((qr, stats)), Some(span)) => {
+                let rows: u64 = qr.batches.iter().map(|b| b.num_rows() as u64).sum();
+                span.finish_ok(rows, &qr.report, &stats)?;
+                Ok(qr)
+            }
+            (Err(e), Some(span)) => {
+                span.finish_err(&e);
+                Err(e)
+            }
+            (Ok((qr, _)), None) => Ok(qr),
+            (Err(e), None) => Err(e),
+        }
+    }
+
+    fn execute_sql_inner(
+        &self,
+        sql: &str,
+        instrument: bool,
+    ) -> Result<(QueryResult, query_api::RunStats)> {
+        self.exec_token().check()?;
         if let Ok(Ddl::ShowTables { namespace }) = bind_ddl(sql) {
             let batches = self.show_tables(namespace.as_deref())?;
-            return Ok(QueryResult {
-                batches,
-                report: QueryReport::new("SHOW TABLES".into(), Vec::new()),
-            });
+            return Ok((
+                QueryResult {
+                    batches,
+                    report: QueryReport::new("SHOW TABLES".into(), Vec::new()),
+                },
+                query_api::RunStats::default(),
+            ));
         }
         if let Some((analyze, inner)) = explain_sql(sql)? {
             let text = if analyze {
@@ -1048,23 +1193,53 @@ impl Session {
                 self.explain(&inner)?
             };
             let batches = plan_text_batch(&text)?;
-            return Ok(QueryResult {
-                batches,
-                report: QueryReport::new(text, Vec::new()),
-            });
+            return Ok((
+                QueryResult {
+                    batches,
+                    report: QueryReport::new(text, Vec::new()),
+                },
+                query_api::RunStats::default(),
+            ));
         }
         let plan = self.bind_optimized(sql)?;
-        let batches = self.execute_optimized(&plan)?;
-        Ok(QueryResult {
-            report: self.report_for(&plan),
-            batches,
-        })
+        let (batches, stats) = self.execute_run(&plan, instrument)?;
+        Ok((
+            QueryResult {
+                report: self.report_for(&plan),
+                batches,
+            },
+            stats,
+        ))
     }
 
     fn report_for(&self, plan: &LogicalPlan) -> QueryReport {
         let mut inputs = Vec::new();
         collect_scan_reports(plan, self, &mut inputs);
         QueryReport::new(report::plan_text(plan), inputs)
+    }
+
+    fn execute_run(
+        &self,
+        plan: &LogicalPlan,
+        instrument: bool,
+    ) -> Result<(Vec<Batch>, query_api::RunStats)> {
+        if instrument {
+            let pool = self.memory_pool()?;
+            let (op, tree) = build_physical(plan, self, &pool, true, None)?;
+            let batches = collect(op, &self.exec_token())?;
+            return Ok((
+                batches,
+                query_api::RunStats {
+                    peak_bytes: pool.peak(),
+                    spilled_bytes: pool.spilled(),
+                    metrics: Some(tree.snapshot()),
+                },
+            ));
+        }
+        Ok((
+            self.execute_optimized(plan)?,
+            query_api::RunStats::default(),
+        ))
     }
 
     fn execute_optimized(&self, plan: &LogicalPlan) -> Result<Vec<Batch>> {
@@ -1075,7 +1250,7 @@ impl Session {
             {
                 return Ok(out);
             }
-            collect(physical(plan, self, &pool)?, &self.cancel)
+            collect(physical(plan, self, &pool)?, &self.exec_token())
         })
     }
 
@@ -1094,7 +1269,7 @@ impl Session {
         let plan = self.bind_optimized(sql)?;
         let pool = self.memory_pool()?;
         let (op, tree) = build_physical(&plan, self, &pool, true, None)?;
-        let _ = collect(op, &self.cancel)?;
+        let _ = collect(op, &self.exec_token())?;
         Ok(tree.snapshot())
     }
 
@@ -1105,7 +1280,18 @@ impl Session {
 
     /// Run `sql` as shuffle-map and result stages on `workers` threads.
     pub fn execute_staged(&self, sql: &str) -> Result<Vec<Batch>> {
-        stage::execute_staged(&self.bind_optimized(sql)?, self)
+        self.with_query_span(sql, |instrument| {
+            let plan = self.bind_optimized(sql)?;
+            let (batches, stats) = stage::execute_staged_traced(&plan, self, instrument)?;
+            Ok((
+                QueryResult {
+                    report: self.report_for(&plan),
+                    batches,
+                },
+                stats,
+            ))
+        })
+        .map(|r| r.batches)
     }
 
     /// Run the query and print logical/physical plans with per-operator
@@ -1115,7 +1301,7 @@ impl Session {
         let plan = self.bind_optimized(sql)?;
         let pool = self.memory_pool()?;
         let (op, tree) = build_physical(&plan, self, &pool, true, None)?;
-        let _batches = collect(op, &self.cancel)?;
+        let _batches = collect(op, &self.exec_token())?;
         let mut text = format!(
             "== Logical Plan ==\n{}== Physical Plan ==\n{}",
             plan.explain(),
@@ -1560,7 +1746,7 @@ pub(super) fn physical_with_work(
     Ok(build_physical(plan, session, pool, analyze, work)?.0)
 }
 
-fn build_physical(
+pub(super) fn build_physical(
     plan: &LogicalPlan,
     session: &Session,
     pool: &memory::MemoryPool,
@@ -1677,7 +1863,7 @@ fn build_physical(
                 schema.clone(),
                 &session.policy,
                 pool,
-                &session.cancel,
+                &session.exec_token(),
             )?;
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let (op, node) = metrics::finish(
@@ -1720,7 +1906,7 @@ fn build_physical(
                 },
                 &session.policy,
                 pool,
-                &session.cancel,
+                &session.exec_token(),
                 session.workers,
             )?;
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1753,7 +1939,7 @@ fn build_physical(
                 None,
                 &session.policy,
                 pool,
-                &session.cancel,
+                &session.exec_token(),
             )?;
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let (op, node) = metrics::finish(
@@ -1789,7 +1975,7 @@ fn build_physical(
                     *fetch,
                     &session.policy,
                     pool,
-                    &session.cancel,
+                    &session.exec_token(),
                 )?;
                 let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 let (op, node) = metrics::finish(
@@ -1840,7 +2026,7 @@ fn build_physical(
                 *all,
                 &session.policy,
                 pool,
-                &session.cancel,
+                &session.exec_token(),
             )?;
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let (op, node) =
@@ -1872,7 +2058,7 @@ fn build_physical(
                 *all,
                 &session.policy,
                 pool,
-                &session.cancel,
+                &session.exec_token(),
             )?;
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let (op, node) = metrics::finish(
@@ -1909,7 +2095,7 @@ fn build_physical(
                 *all,
                 &session.policy,
                 pool,
-                &session.cancel,
+                &session.exec_token(),
             )?;
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let (op, node) = metrics::finish(
@@ -1980,7 +2166,7 @@ fn build_physical(
                 schema.clone(),
                 &session.policy,
                 pool,
-                &session.cancel,
+                &session.exec_token(),
             )?;
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let (op, node) = metrics::finish(
@@ -2004,7 +2190,7 @@ fn build_physical(
             let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
             let t0 = Instant::now();
             let copied0 = pool.copied();
-            let batches = collect(child, &session.cancel)?;
+            let batches = collect(child, &session.exec_token())?;
             let out = scalar_one_row(batches, schema.clone())?;
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let (op, node) = metrics::finish(

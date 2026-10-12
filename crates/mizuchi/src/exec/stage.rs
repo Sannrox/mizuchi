@@ -22,6 +22,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use arrow::array::BooleanArray;
 use arrow::compute::filter_record_batch;
@@ -32,7 +33,9 @@ use arrow::ipc::writer::FileWriter;
 use super::join::{self, JoinSpec};
 use super::key;
 use super::memory::batch_bytes;
-use super::{Operator, Session, collect, physical};
+use super::metrics::{self, OperatorMetrics};
+use super::query_api::RunStats;
+use super::{Operator, Session, build_physical, collect};
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::expr::Expr;
@@ -1112,16 +1115,29 @@ struct TaskCtx {
     shuffle: Arc<ShuffleStore>,
     pool: Arc<super::memory::MemoryPool>,
     map_filter: HashMap<usize, Vec<usize>>,
+    analyze: bool,
 }
 
-pub(super) fn execute_staged(logical: &LogicalPlan, session: &Session) -> Result<Vec<Batch>> {
+#[derive(Clone)]
+struct StageExec {
+    shuffle: Arc<ShuffleStore>,
+    pool: Arc<super::memory::MemoryPool>,
+    analyze: bool,
+    metrics: Arc<Mutex<Vec<OperatorMetrics>>>,
+}
+
+pub(super) fn execute_staged_traced(
+    logical: &LogicalPlan,
+    session: &Session,
+    instrument: bool,
+) -> Result<(Vec<Batch>, RunStats)> {
     let mut notes = Vec::new();
-    execute_staged_inner(logical, session, &mut notes)
+    execute_staged_inner(logical, session, &mut notes, instrument)
 }
 
 pub(super) fn explain_analyze(logical: &LogicalPlan, session: &Session) -> Result<String> {
     let mut notes = Vec::new();
-    let batches = execute_staged_inner(logical, session, &mut notes)?;
+    let batches = execute_staged_inner(logical, session, &mut notes, false)?.0;
     let mut text = explain_stages(logical, session.workers.max(1))?;
     if notes.is_empty() {
         text.push_str("Adaptive: no partition splits\n");
@@ -1142,7 +1158,8 @@ fn execute_staged_inner(
     logical: &LogicalPlan,
     session: &Session,
     notes: &mut Vec<String>,
-) -> Result<Vec<Batch>> {
+    instrument: bool,
+) -> Result<(Vec<Batch>, RunStats)> {
     let workers = session.workers.max(1);
     let stages = plan_stages(logical, workers);
     let job = match &session.shuffle_dir {
@@ -1159,20 +1176,38 @@ fn execute_staged_inner(
             dir: None,
         },
     };
-    let pool = Arc::new(session.memory_pool()?);
+    let exec = StageExec {
+        shuffle: job.store.clone(),
+        pool: Arc::new(session.memory_pool()?),
+        analyze: instrument,
+        metrics: Arc::new(Mutex::new(Vec::new())),
+    };
     let mut result = Vec::new();
     for stage in &stages {
         let tasks = if join_shuffle_reads(&stage.plan).is_some() {
-            adaptive_tasks(stage, &job.store, session, notes)?
+            adaptive_tasks(stage, &exec.shuffle, session, notes)?
         } else {
             default_tasks(stage.partitions)
         };
-        let out = run_stage(stage, session, &job.store, workers, pool.clone(), tasks)?;
+        let out = run_stage(stage, session, workers, tasks, &exec)?;
         if stage.kind == StageKind::Result {
             result = out;
         }
     }
-    Ok(result)
+    let stats = if instrument {
+        RunStats {
+            peak_bytes: exec.pool.peak(),
+            spilled_bytes: exec.pool.spilled(),
+            metrics: exec
+                .metrics
+                .lock()
+                .ok()
+                .and_then(|g| combine_metrics(g.clone())),
+        }
+    } else {
+        RunStats::default()
+    };
+    Ok((result, stats))
 }
 
 fn default_tasks(partitions: usize) -> Vec<TaskSpec> {
@@ -1358,10 +1393,9 @@ fn group_maps(maps: &[(usize, u64)], target: u64) -> Vec<Vec<usize>> {
 fn run_stage(
     stage: &Stage,
     session: &Session,
-    shuffle: &Arc<ShuffleStore>,
     workers: usize,
-    pool: Arc<super::memory::MemoryPool>,
     tasks: Vec<TaskSpec>,
+    exec: &StageExec,
 ) -> Result<Vec<Batch>> {
     let n = stage.partitions.max(1);
     let mut queued = Vec::new();
@@ -1406,80 +1440,90 @@ fn run_stage(
             let pending = pending.clone();
             let abort = abort.clone();
             let in_flight = in_flight.clone();
-            let shuffle = shuffle.clone();
+            let exec = exec.clone();
             let session = session.clone();
             let plan = stage.plan.clone();
             let write = stage.write.clone();
-            let pool = pool.clone();
             let kind = stage.kind;
             let committed = committed.clone();
+            let token = session.exec_token();
             handles.push(thread::spawn(move || -> Result<Vec<Batch>> {
-                let mut local = Vec::new();
-                loop {
-                    if abort
-                        .lock()
-                        .map_err(|_| Error::Eval("abort lock poisoned".into()))?
-                        .is_some()
-                    {
-                        break;
-                    }
-                    session.cancel.check()?;
-                    let job = {
-                        let mut g = pending
+                let prev = Session::push_cancel(token);
+                let result = (|| {
+                    let mut local = Vec::new();
+                    loop {
+                        if abort
                             .lock()
-                            .map_err(|_| Error::Eval("task queue lock poisoned".into()))?;
-                        g.pop()
-                    };
-                    let Some(job) = job else {
-                        break;
-                    };
-                    {
-                        let mut g = in_flight
-                            .lock()
-                            .map_err(|_| Error::Eval("in-flight lock poisoned".into()))?;
-                        g[i] = Some(job.clone());
-                    }
-                    let ran = panic::catch_unwind(AssertUnwindSafe(|| {
-                        if !job.speculative {
-                            inject_straggler();
+                            .map_err(|_| Error::Eval("abort lock poisoned".into()))?
+                            .is_some()
+                        {
+                            break;
                         }
-                        inject_failure(kind);
-                        run_one_task(&plan, &write, &session, &job.spec, n, &shuffle, &pool)
-                    }));
-                    {
-                        let mut g = in_flight
-                            .lock()
-                            .map_err(|_| Error::Eval("in-flight lock poisoned".into()))?;
-                        g[i] = None;
-                    }
-                    match ran {
-                        Ok(Ok(batches)) => {
-                            let mut g = committed
+                        session.exec_token().check()?;
+                        let job = {
+                            let mut g = pending
                                 .lock()
-                                .map_err(|_| Error::Eval("commit lock poisoned".into()))?;
-                            if g.insert((job.spec.partition, job.spec.output_map)) {
-                                local.extend(batches);
-                            } else {
-                                #[cfg(test)]
-                                SPECULATIVE_DISCARDS.fetch_add(1, Ordering::Relaxed);
+                                .map_err(|_| Error::Eval("task queue lock poisoned".into()))?;
+                            g.pop()
+                        };
+                        let Some(job) = job else {
+                            break;
+                        };
+                        {
+                            let mut g = in_flight
+                                .lock()
+                                .map_err(|_| Error::Eval("in-flight lock poisoned".into()))?;
+                            g[i] = Some(job.clone());
+                        }
+                        let ran = panic::catch_unwind(AssertUnwindSafe(|| {
+                            if !job.speculative {
+                                inject_straggler();
+                            }
+                            inject_failure(kind);
+                            run_one_task(&plan, &write, &session, &job.spec, n, &exec)
+                        }));
+                        {
+                            let mut g = in_flight
+                                .lock()
+                                .map_err(|_| Error::Eval("in-flight lock poisoned".into()))?;
+                            g[i] = None;
+                        }
+                        match ran {
+                            Ok(Ok((batches, metrics))) => {
+                                let mut g = committed
+                                    .lock()
+                                    .map_err(|_| Error::Eval("commit lock poisoned".into()))?;
+                                if g.insert((job.spec.partition, job.spec.output_map)) {
+                                    local.extend(batches);
+                                    if let Some(snap) = metrics
+                                        && let Ok(mut sink) = exec.metrics.lock()
+                                    {
+                                        sink.push(snap);
+                                    }
+                                } else {
+                                    #[cfg(test)]
+                                    SPECULATIVE_DISCARDS.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                requeue_or_abort(&pending, &abort, job, e, &write, &exec.shuffle)?;
+                            }
+                            Err(_) => {
+                                requeue_or_abort(
+                                    &pending,
+                                    &abort,
+                                    job,
+                                    Error::Eval("worker panicked".into()),
+                                    &write,
+                                    &exec.shuffle,
+                                )?;
                             }
                         }
-                        Ok(Err(e)) => {
-                            requeue_or_abort(&pending, &abort, job, e, &write, &shuffle)?;
-                        }
-                        Err(_) => {
-                            requeue_or_abort(
-                                &pending,
-                                &abort,
-                                job,
-                                Error::Eval("worker panicked".into()),
-                                &write,
-                                &shuffle,
-                            )?;
-                        }
                     }
-                }
-                Ok(local)
+                    Ok(local)
+                })();
+                Session::restore_cancel(prev);
+                result
             }));
         }
         for (i, h) in handles.into_iter().enumerate() {
@@ -1507,7 +1551,7 @@ fn run_stage(
                             job,
                             Error::Eval("worker panicked".into()),
                             &stage.write,
-                            shuffle,
+                            &exec.shuffle,
                         )?;
                     }
                 }
@@ -1563,29 +1607,32 @@ fn run_one_task(
     session: &Session,
     spec: &TaskSpec,
     partitions: usize,
-    shuffle: &Arc<ShuffleStore>,
-    pool: &Arc<super::memory::MemoryPool>,
-) -> Result<Vec<Batch>> {
+    exec: &StageExec,
+) -> Result<(Vec<Batch>, Option<OperatorMetrics>)> {
     let ctx = TaskCtx {
         session: session.clone(),
         partition: spec.partition,
         partitions,
-        shuffle: shuffle.clone(),
-        pool: pool.clone(),
+        shuffle: exec.shuffle.clone(),
+        pool: exec.pool.clone(),
         map_filter: spec.maps.clone(),
+        analyze: exec.analyze,
     };
-    let batches = collect(execute_physical(plan, &ctx)?, &session.cancel)?;
+    let (op, tree) = execute_physical(plan, &ctx)?;
+    let batches = collect(op, &session.exec_token())?;
+    let metrics = exec.analyze.then(|| tree.snapshot());
     if let Some(write) = write {
         let parts = partition_batches(&batches, &write.keys, write.partitions)?;
         let schema = plan.schema().clone();
         for (r, part) in parts.into_iter().enumerate() {
-            shuffle.write(write.shuffle_id, spec.output_map, r, schema.clone(), part)?;
+            exec.shuffle
+                .write(write.shuffle_id, spec.output_map, r, schema.clone(), part)?;
         }
         #[cfg(test)]
         MAP_COMMITS.fetch_add(1, Ordering::Relaxed);
-        Ok(Vec::new())
+        Ok((Vec::new(), metrics))
     } else {
-        Ok(batches)
+        Ok((batches, metrics))
     }
 }
 
@@ -1633,10 +1680,98 @@ fn requeue_or_abort(
     Ok(())
 }
 
-fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operator>> {
+fn meter(
+    name: &'static str,
+    op: Result<Box<dyn Operator>>,
+    children: Vec<metrics::PhysNode>,
+    ctx: &TaskCtx,
+) -> Result<(Box<dyn Operator>, metrics::PhysNode)> {
+    Ok(metrics::finish(
+        name,
+        op?,
+        children,
+        ctx.analyze,
+        ctx.pool.as_ref(),
+    ))
+}
+
+fn meter_blocking(
+    name: &'static str,
+    op: Result<Box<dyn Operator>>,
+    children: Vec<metrics::PhysNode>,
+    ctx: &TaskCtx,
+    elapsed_ns: u64,
+    copied_bytes: u64,
+) -> Result<(Box<dyn Operator>, metrics::PhysNode)> {
+    let (op, node) = meter(name, op, children, ctx)?;
+    if ctx.analyze {
+        metrics::add_blocking(&node, elapsed_ns, ctx.pool.peak(), copied_bytes);
+    }
+    Ok((op, node))
+}
+
+fn same_shape(a: &OperatorMetrics, b: &OperatorMetrics) -> bool {
+    a.name == b.name
+        && a.children.len() == b.children.len()
+        && a.children
+            .iter()
+            .zip(&b.children)
+            .all(|(l, r)| same_shape(l, r))
+}
+
+fn merge_metrics(into: &mut OperatorMetrics, other: &OperatorMetrics) {
+    into.rows = into.rows.saturating_add(other.rows);
+    into.batches = into.batches.saturating_add(other.batches);
+    into.elapsed_ns = into.elapsed_ns.saturating_add(other.elapsed_ns);
+    into.copied_bytes = into.copied_bytes.saturating_add(other.copied_bytes);
+    into.peak_bytes = into.peak_bytes.max(other.peak_bytes);
+    into.blocking |= other.blocking;
+    for (child, other_child) in into.children.iter_mut().zip(&other.children) {
+        merge_metrics(child, other_child);
+    }
+}
+
+fn combine_metrics(snaps: Vec<OperatorMetrics>) -> Option<OperatorMetrics> {
+    if snaps.is_empty() {
+        return None;
+    }
+    let mut groups: Vec<OperatorMetrics> = Vec::new();
+    for snap in snaps {
+        if let Some(existing) = groups.iter_mut().find(|g| same_shape(g, &snap)) {
+            merge_metrics(existing, &snap);
+        } else {
+            groups.push(snap);
+        }
+    }
+    if groups.len() == 1 {
+        return groups.pop();
+    }
+    let rows = groups.iter().map(|g| g.rows).sum();
+    let batches = groups.iter().map(|g| g.batches).sum();
+    let elapsed_ns = groups.iter().map(|g| g.elapsed_ns).sum();
+    let copied_bytes = groups.iter().map(|g| g.copied_bytes).sum();
+    let peak_bytes = groups.iter().map(|g| g.peak_bytes).max().unwrap_or(0);
+    Some(OperatorMetrics {
+        name: "Staged".into(),
+        rows,
+        batches,
+        elapsed_ns,
+        peak_bytes,
+        copied_bytes,
+        blocking: false,
+        children: groups,
+    })
+}
+
+fn execute_physical(
+    plan: &PhysicalPlan,
+    ctx: &TaskCtx,
+) -> Result<(Box<dyn Operator>, metrics::PhysNode)> {
     let lowering = ctx.session.lowering.0.as_ref();
     match plan {
-        PhysicalPlan::Empty { schema } => lowering.empty(schema.clone()),
+        PhysicalPlan::Empty { schema } => {
+            meter("Empty", lowering.empty(schema.clone()), Vec::new(), ctx)
+        }
         PhysicalPlan::Scan {
             table,
             projection,
@@ -1651,51 +1786,82 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
                 filters: filters.clone(),
                 stats: None,
             };
-            let batches = collect(
-                physical(&logical, &ctx.session, ctx.pool.as_ref())?,
-                &ctx.session.cancel,
-            )?;
-            lowering.scan(slice_partition(
-                batches,
-                plan.schema().clone(),
-                ctx.partition,
-                ctx.partitions,
-            )?)
+            let (op, node) =
+                build_physical(&logical, &ctx.session, ctx.pool.as_ref(), ctx.analyze, None)?;
+            let batches = collect(op, &ctx.session.exec_token())?;
+            meter(
+                "Scan",
+                lowering.scan(slice_partition(
+                    batches,
+                    plan.schema().clone(),
+                    ctx.partition,
+                    ctx.partitions,
+                )?),
+                vec![node],
+                ctx,
+            )
         }
         PhysicalPlan::WorkScan { name, .. } => {
             Err(Error::Plan(format!("working table {name} is not in scope")))
         }
         PhysicalPlan::Scalar { input, schema } => {
-            let batches = collect(
-                physical(input, &ctx.session, ctx.pool.as_ref())?,
-                &ctx.session.cancel,
-            )?;
-            lowering.scan(vec![super::scalar_one_row(batches, schema.clone())?])
+            let (op, node) =
+                build_physical(input, &ctx.session, ctx.pool.as_ref(), ctx.analyze, None)?;
+            let batches = collect(op, &ctx.session.exec_token())?;
+            meter(
+                "Scalar",
+                lowering.scan(vec![super::scalar_one_row(batches, schema.clone())?]),
+                vec![node],
+                ctx,
+            )
         }
         PhysicalPlan::ShuffleRead {
             shuffle_id, schema, ..
         } => {
             let maps = ctx.map_filter.get(shuffle_id).map(|v| v.as_slice());
-            lowering.scan(
-                ctx.shuffle
-                    .read(*shuffle_id, ctx.partition, schema.clone(), maps)?,
+            meter(
+                "ShuffleRead",
+                lowering.scan(ctx.shuffle.read(
+                    *shuffle_id,
+                    ctx.partition,
+                    schema.clone(),
+                    maps,
+                )?),
+                Vec::new(),
+                ctx,
             )
         }
         PhysicalPlan::Filter { input, predicate } => {
-            lowering.filter(execute_physical(input, ctx)?, predicate.clone())
+            let (child, node) = execute_physical(input, ctx)?;
+            meter(
+                "Filter",
+                lowering.filter(child, predicate.clone()),
+                vec![node],
+                ctx,
+            )
         }
         PhysicalPlan::Project {
             input,
             exprs,
             schema,
-        } => lowering.project(execute_physical(input, ctx)?, exprs.clone(), schema.clone()),
+        } => {
+            let (child, node) = execute_physical(input, ctx)?;
+            meter(
+                "Project",
+                lowering.project(child, exprs.clone(), schema.clone()),
+                vec![node],
+                ctx,
+            )
+        }
         PhysicalPlan::Aggregate {
             input,
             group,
             aggs,
             schema,
         } => {
-            let child = execute_physical(input, ctx)?;
+            let (child, node) = execute_physical(input, ctx)?;
+            let t0 = Instant::now();
+            let copied0 = ctx.pool.copied();
             let batches = super::agg::run(
                 child,
                 group,
@@ -1703,9 +1869,17 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
                 schema.clone(),
                 &ctx.session.policy,
                 ctx.pool.as_ref(),
-                &ctx.session.cancel,
+                &ctx.session.exec_token(),
             )?;
-            lowering.scan(batches)
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            meter_blocking(
+                "HashAggregate",
+                lowering.scan(batches),
+                vec![node],
+                ctx,
+                ns,
+                ctx.pool.copied().saturating_sub(copied0),
+            )
         }
         PhysicalPlan::Join {
             left,
@@ -1714,9 +1888,13 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
             on,
             schema,
         } => {
+            let (left_op, left_node) = execute_physical(left, ctx)?;
+            let (right_op, right_node) = execute_physical(right, ctx)?;
+            let t0 = Instant::now();
+            let copied0 = ctx.pool.copied();
             let batches = join::run(
-                execute_physical(left, ctx)?,
-                execute_physical(right, ctx)?,
+                left_op,
+                right_op,
                 JoinSpec {
                     join_type: *join_type,
                     on: on.as_ref(),
@@ -1726,42 +1904,80 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
                 },
                 &ctx.session.policy,
                 ctx.pool.as_ref(),
-                &ctx.session.cancel,
+                &ctx.session.exec_token(),
                 ctx.session.workers,
             )?;
-            lowering.scan(batches)
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            meter_blocking(
+                "HashJoin",
+                lowering.scan(batches),
+                vec![left_node, right_node],
+                ctx,
+                ns,
+                ctx.pool.copied().saturating_sub(copied0),
+            )
         }
         PhysicalPlan::Sort { input, order } => {
+            let (child, node) = execute_physical(input, ctx)?;
+            let t0 = Instant::now();
+            let copied0 = ctx.pool.copied();
             let batches = super::sort::ordered(
-                execute_physical(input, ctx)?,
+                child,
                 input.schema().clone(),
                 order,
                 0,
                 None,
                 &ctx.session.policy,
                 ctx.pool.as_ref(),
-                &ctx.session.cancel,
+                &ctx.session.exec_token(),
             )?;
-            lowering.scan(batches)
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            meter_blocking(
+                "Sort",
+                lowering.scan(batches),
+                vec![node],
+                ctx,
+                ns,
+                ctx.pool.copied().saturating_sub(copied0),
+            )
         }
         PhysicalPlan::Limit { input, skip, fetch } => match input.as_ref() {
             PhysicalPlan::Sort {
                 input: sorted,
                 order,
             } => {
+                let (child, node) = execute_physical(sorted, ctx)?;
+                let t0 = Instant::now();
+                let copied0 = ctx.pool.copied();
                 let batches = super::sort::ordered(
-                    execute_physical(sorted, ctx)?,
+                    child,
                     sorted.schema().clone(),
                     order,
                     *skip,
                     *fetch,
                     &ctx.session.policy,
                     ctx.pool.as_ref(),
-                    &ctx.session.cancel,
+                    &ctx.session.exec_token(),
                 )?;
-                lowering.scan(batches)
+                let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                meter_blocking(
+                    "Sort",
+                    lowering.scan(batches),
+                    vec![node],
+                    ctx,
+                    ns,
+                    ctx.pool.copied().saturating_sub(copied0),
+                )
             }
-            _ => lowering.limit(execute_physical(input, ctx)?, *skip, *fetch),
+            _ => {
+                let (child, node) = execute_physical(input, ctx)?;
+                meter(
+                    "Limit",
+                    lowering.limit(child, *skip, *fetch),
+                    vec![node],
+                    ctx,
+                )
+            }
         },
         PhysicalPlan::Union {
             inputs,
@@ -1769,18 +1985,31 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
             all,
         } => {
             let mut ops = Vec::with_capacity(inputs.len());
+            let mut nodes = Vec::with_capacity(inputs.len());
             for input in inputs {
-                ops.push(execute_physical(input, ctx)?);
+                let (op, node) = execute_physical(input, ctx)?;
+                ops.push(op);
+                nodes.push(node);
             }
+            let t0 = Instant::now();
+            let copied0 = ctx.pool.copied();
             let batches = super::setop::union(
                 ops,
                 schema.clone(),
                 *all,
                 &ctx.session.policy,
                 ctx.pool.as_ref(),
-                &ctx.session.cancel,
+                &ctx.session.exec_token(),
             )?;
-            lowering.scan(batches)
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            meter_blocking(
+                "Union",
+                lowering.scan(batches),
+                nodes,
+                ctx,
+                ns,
+                ctx.pool.copied().saturating_sub(copied0),
+            )
         }
         PhysicalPlan::Intersect {
             left,
@@ -1788,16 +2017,28 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
             schema,
             all,
         } => {
+            let (left_op, left_node) = execute_physical(left, ctx)?;
+            let (right_op, right_node) = execute_physical(right, ctx)?;
+            let t0 = Instant::now();
+            let copied0 = ctx.pool.copied();
             let batches = super::setop::intersect(
-                execute_physical(left, ctx)?,
-                execute_physical(right, ctx)?,
+                left_op,
+                right_op,
                 schema.clone(),
                 *all,
                 &ctx.session.policy,
                 ctx.pool.as_ref(),
-                &ctx.session.cancel,
+                &ctx.session.exec_token(),
             )?;
-            lowering.scan(batches)
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            meter_blocking(
+                "Intersect",
+                lowering.scan(batches),
+                vec![left_node, right_node],
+                ctx,
+                ns,
+                ctx.pool.copied().saturating_sub(copied0),
+            )
         }
         PhysicalPlan::Except {
             left,
@@ -1805,16 +2046,28 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
             schema,
             all,
         } => {
+            let (left_op, left_node) = execute_physical(left, ctx)?;
+            let (right_op, right_node) = execute_physical(right, ctx)?;
+            let t0 = Instant::now();
+            let copied0 = ctx.pool.copied();
             let batches = super::setop::except(
-                execute_physical(left, ctx)?,
-                execute_physical(right, ctx)?,
+                left_op,
+                right_op,
                 schema.clone(),
                 *all,
                 &ctx.session.policy,
                 ctx.pool.as_ref(),
-                &ctx.session.cancel,
+                &ctx.session.exec_token(),
             )?;
-            lowering.scan(batches)
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            meter_blocking(
+                "Except",
+                lowering.scan(batches),
+                vec![left_node, right_node],
+                ctx,
+                ns,
+                ctx.pool.copied().saturating_sub(copied0),
+            )
         }
         PhysicalPlan::Recursive {
             name,
@@ -1822,6 +2075,8 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
             step,
             schema,
         } => {
+            let t0 = Instant::now();
+            let copied0 = ctx.pool.copied();
             let batches = super::recursive::run(
                 name,
                 anchors,
@@ -1831,7 +2086,15 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
                 ctx.pool.as_ref(),
                 false,
             )?;
-            lowering.scan(batches)
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            meter_blocking(
+                "Recursive",
+                lowering.scan(batches),
+                Vec::new(),
+                ctx,
+                ns,
+                ctx.pool.copied().saturating_sub(copied0),
+            )
         }
         PhysicalPlan::Window {
             input,
@@ -1841,7 +2104,9 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
             fns,
             schema,
         } => {
-            let child = execute_physical(input, ctx)?;
+            let (child, node) = execute_physical(input, ctx)?;
+            let t0 = Instant::now();
+            let copied0 = ctx.pool.copied();
             let batches = super::window::run(
                 child,
                 input.schema().clone(),
@@ -1852,9 +2117,17 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
                 schema.clone(),
                 &ctx.session.policy,
                 ctx.pool.as_ref(),
-                &ctx.session.cancel,
+                &ctx.session.exec_token(),
             )?;
-            lowering.scan(batches)
+            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            meter_blocking(
+                "Window",
+                lowering.scan(batches),
+                vec![node],
+                ctx,
+                ns,
+                ctx.pool.copied().saturating_sub(copied0),
+            )
         }
         PhysicalPlan::Exchange { .. } => {
             Err(Error::Plan("exchange survived stage fragmentation".into()))

@@ -66,6 +66,13 @@ checkpointed Parquet sink (ADR 0009).
 optionally from a directory of JSON + Arrow schema files
 (`Catalog::open_file`). `Session::execute_ddl` runs `CREATE` / `DROP` /
 `ALTER TABLE`; `SHOW TABLES` lists a namespace (ADR 0010).
+`SessionConfig.query_api` (off by default) records query history and
+serves a versioned HTTP API (`/v1`, contract `mizuchi.query-api/v1` in
+`/healthz`) so external UIs can list completed queries, inspect plans and
+operator metrics, watch running queries, and cancel (ADR 0012). The JSON
+schema is `crates/mizuchi/schemas/query-api-v1.json`. Bind address, optional bearer
+token, and history path are set by the embedder; loopback listens do not
+require `allow_network`.
 `mizuchi::VERSION` and `Session::explain` are the strings a runner
 records. A complete walk-through is `cargo run -p mizuchi --example embed`.
 The engine opens TCP only when `SessionConfig.allow_network` is set
