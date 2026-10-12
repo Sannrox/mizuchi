@@ -55,6 +55,14 @@ fn results_table_covers_sf1_and_sf10() {
         );
     }
     assert!(text.contains("ratio"), "results missing ratio column");
+    for needle in [
+        "Parquet scan pushdown",
+        "row groups kept",
+        "clustered q6",
+        "late materialization",
+    ] {
+        assert!(text.contains(needle), "results missing pushdown {needle}");
+    }
     for needle in ["worker scaling", "1 worker", "8 ms"] {
         assert!(text.contains(needle), "results missing scaling {needle}");
     }

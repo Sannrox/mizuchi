@@ -47,9 +47,10 @@ and copies into the operator that allocates.
 In-memory table Scan after `read_parquet` + `Session::register`. Load time is
 outside the query (same as the wall-time method). At SF1 the working set is
 562_033_392 bytes. Scan exclusive time is small next to hash build/probe and
-grouped updates. Parquet projection, predicate, and row-group pruning would
-cut decode and the registered working set; they do not run on this in-memory
-path today.
+grouped updates. Parquet projection, footer/page/bloom predicate skip, and
+late materialization run on file and object-store reads
+(`ParquetReadOptions::filters`); the GB bench still loads full tables so
+published walls isolate compute. Skip ratios: [results.md](results.md).
 
 ### Expression eval
 
@@ -110,8 +111,9 @@ operator time at SF1 from `gb_bench profile --sf 1`.
 5. **Batch and key copies** between collect, hash tables, and spill (the
    2–4 GiB peaks). [#107](https://github.com/Sannrox/mizuchi/issues/107)
 6. **Scan/decode working set** (Scan exclusive is 0.77 ms on q1 and 0.06 ms
-   on q6; Parquet projection and row-group skip would shrink the registered
-   tables). [#106](https://github.com/Sannrox/mizuchi/issues/106)
+   on q6 after a full in-memory load). Parquet file scans now project,
+   skip row groups and pages, and late-materialize remaining columns
+   ([#106](https://github.com/Sannrox/mizuchi/issues/106)).
 
 q6 stays the control: ungrouped SUM over a pushed-down Scan, 7.4 ms
 HashAggregate exclusive at SF1, published wall 17.7 ms.

@@ -42,7 +42,10 @@ this method and the committed results table are in git.
 2. Each engine loads every table into memory (mizuchi `Session::register` after
    `read_parquet`; DuckDB `CREATE TABLE AS SELECT * FROM read_parquet`;
    DataFusion `register_record_batches` from a pyarrow table). Load time is
-   excluded from query times.
+   excluded from query times. File scans can pass `ParquetReadOptions::filters`
+   to skip row groups, pages, and bloom misses before decode; the GB bench
+   does not, so query times isolate compute. Skip ratios for q6-style
+   predicates are in [results.md](results.md).
 3. Run the four queries from `crates/mizuchi/examples/gb_bench.rs` (same SQL as
    `tests/ds_common`).
 4. Three trials per query. The first trial is warmup and is dropped. The
