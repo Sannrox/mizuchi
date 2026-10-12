@@ -1,17 +1,19 @@
 //! Morsel work queue across a bounded thread pool.
 //!
-//! Independent scan/filter/project morsels and combinable aggregates run on
-//! `Session::with_workers` threads. Operators check cancellation between
-//! morsels. Plans that need a single-threaded pipeline fall back to pull
-//! execution.
+//! Scan/filter/project morsels, combinable aggregates (including AVG via
+//! per-thread sum/count merge), inner hash-join probe, and the Sort/Limit
+//! wrappers around those plans run on `Session::with_workers` threads.
+//! Operators check cancellation between morsels. Plans that still need a
+//! single-threaded pipeline fall back to pull execution.
 
 use std::sync::Mutex;
 use std::thread;
 
 use arrow::datatypes::SchemaRef;
 
+use super::join::{self, JoinSpec};
 use super::memory::MemoryPool;
-use super::{Exec, Session, filter_batch, project_batch};
+use super::{Exec, Session, collect, filter_batch, physical, project_batch};
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::expr::Expr;
@@ -23,31 +25,148 @@ pub(super) fn try_parallel(
     pool: &MemoryPool,
 ) -> Result<Option<Vec<Batch>>> {
     session.cancel.check()?;
-    if let LogicalPlan::Aggregate {
-        input,
-        group,
-        aggs,
-        schema,
-    } = plan
-    {
-        if super::agg::can_combine(aggs)
-            && let Some(pipe) = as_pipeline(input)
-        {
-            return Ok(Some(parallel_agg(
-                &pipe,
+    match plan {
+        LogicalPlan::Sort { input, order } => {
+            let Some(child) = try_parallel(input, session, pool)? else {
+                return Ok(None);
+            };
+            Ok(Some(super::sort::ordered(
+                Box::new(Exec::Scan {
+                    batches: child,
+                    index: 0,
+                }),
+                input.schema().clone(),
+                order,
+                0,
+                None,
+                &session.policy,
+                pool,
+                &session.cancel,
+            )?))
+        }
+        LogicalPlan::Limit { input, skip, fetch } => match input.as_ref() {
+            LogicalPlan::Sort {
+                input: sorted,
+                order,
+            } => {
+                let Some(child) = try_parallel(sorted, session, pool)? else {
+                    return Ok(None);
+                };
+                Ok(Some(super::sort::ordered(
+                    Box::new(Exec::Scan {
+                        batches: child,
+                        index: 0,
+                    }),
+                    sorted.schema().clone(),
+                    order,
+                    *skip,
+                    *fetch,
+                    &session.policy,
+                    pool,
+                    &session.cancel,
+                )?))
+            }
+            _ => {
+                let Some(child) = try_parallel(input, session, pool)? else {
+                    return Ok(None);
+                };
+                Ok(Some(collect(
+                    Box::new(Exec::Limit {
+                        input: Box::new(Exec::Scan {
+                            batches: child,
+                            index: 0,
+                        }),
+                        skip: *skip,
+                        fetch: *fetch,
+                    }),
+                    &session.cancel,
+                )?))
+            }
+        },
+        LogicalPlan::Aggregate {
+            input,
+            group,
+            aggs,
+            schema,
+        } => {
+            if !agg_parallel_ok(aggs, pool) {
+                return Ok(None);
+            }
+            if let Some(pipe) = as_pipeline(input) {
+                return Ok(Some(parallel_agg(
+                    &pipe,
+                    group,
+                    aggs,
+                    schema.clone(),
+                    session,
+                    pool,
+                )?));
+            }
+            let child = plan_batches(input, session, pool)?;
+            Ok(Some(agg_from_batches(
+                child,
                 group,
                 aggs,
                 schema.clone(),
                 session,
                 pool,
-            )?));
+            )?))
         }
-        return Ok(None);
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+            schema,
+        } => {
+            let l = plan_batches(left, session, pool)?;
+            let r = plan_batches(right, session, pool)?;
+            Ok(Some(join::run(
+                Box::new(Exec::Scan {
+                    batches: l,
+                    index: 0,
+                }),
+                Box::new(Exec::Scan {
+                    batches: r,
+                    index: 0,
+                }),
+                JoinSpec {
+                    join_type: *join_type,
+                    on: on.as_ref(),
+                    left_schema: left.schema().clone(),
+                    right_schema: right.schema().clone(),
+                    schema: schema.clone(),
+                },
+                &session.policy,
+                pool,
+                &session.cancel,
+                session.workers,
+            )?))
+        }
+        other => {
+            if let Some(pipe) = as_pipeline(other) {
+                return Ok(Some(parallel_pipeline(&pipe, session)?));
+            }
+            Ok(None)
+        }
     }
-    if let Some(pipe) = as_pipeline(plan) {
-        return Ok(Some(parallel_pipeline(&pipe, session)?));
+}
+
+fn agg_parallel_ok(aggs: &[(String, AggCall)], pool: &MemoryPool) -> bool {
+    if !super::agg::can_combine(aggs) {
+        return false;
     }
-    Ok(None)
+    if pool.has_limit() && !super::agg::can_spill(aggs) {
+        return false;
+    }
+    true
+}
+
+fn plan_batches(plan: &LogicalPlan, session: &Session, pool: &MemoryPool) -> Result<Vec<Batch>> {
+    if let Some(out) = try_parallel(plan, session, pool)? {
+        return Ok(out);
+    }
+    collect(physical(plan, session, pool)?, &session.cancel)
 }
 
 struct Pipeline {
@@ -110,6 +229,17 @@ fn parallel_agg(
     pool: &MemoryPool,
 ) -> Result<Vec<Batch>> {
     let morsels = parallel_pipeline(pipe, session)?;
+    agg_from_batches(morsels, group, aggs, schema, session, pool)
+}
+
+fn agg_from_batches(
+    morsels: Vec<Batch>,
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+    session: &Session,
+    pool: &MemoryPool,
+) -> Result<Vec<Batch>> {
     if morsels.is_empty() {
         return super::agg::run(
             Box::new(Exec::Scan {
@@ -129,30 +259,58 @@ fn parallel_agg(
     for (i, batch) in morsels.into_iter().enumerate() {
         chunks[i % n].push(batch);
     }
-    let partials = Mutex::new(Vec::new());
+    if pool.has_limit() {
+        let partials = Mutex::new(Vec::new());
+        thread::scope(|scope| -> Result<()> {
+            let mut handles = Vec::new();
+            for chunk in chunks {
+                let partials = &partials;
+                let schema = schema.clone();
+                handles.push(scope.spawn(move || -> Result<()> {
+                    session.cancel.check()?;
+                    let out = super::agg::run(
+                        Box::new(Exec::Scan {
+                            batches: chunk,
+                            index: 0,
+                        }),
+                        group,
+                        aggs,
+                        schema,
+                        &session.policy,
+                        pool,
+                        &session.cancel,
+                    )?;
+                    partials
+                        .lock()
+                        .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?
+                        .extend(out);
+                    Ok(())
+                }));
+            }
+            for h in handles {
+                h.join()
+                    .map_err(|_| Error::Eval("worker panicked".into()))??;
+            }
+            Ok(())
+        })?;
+        let partials = partials
+            .into_inner()
+            .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?;
+        return super::agg::combine_partials(partials, group, aggs, schema, &session.policy);
+    }
+    let tables = Mutex::new(Vec::new());
     thread::scope(|scope| -> Result<()> {
         let mut handles = Vec::new();
         for chunk in chunks {
-            let partials = &partials;
+            let tables = &tables;
             let schema = schema.clone();
             handles.push(scope.spawn(move || -> Result<()> {
                 session.cancel.check()?;
-                let out = super::agg::run(
-                    Box::new(Exec::Scan {
-                        batches: chunk,
-                        index: 0,
-                    }),
-                    group,
-                    aggs,
-                    schema,
-                    &session.policy,
-                    pool,
-                    &session.cancel,
-                )?;
-                partials
+                let table = super::agg::fold_batches(chunk, group, aggs, schema)?;
+                tables
                     .lock()
                     .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?
-                    .extend(out);
+                    .push(table);
                 Ok(())
             }));
         }
@@ -162,10 +320,10 @@ fn parallel_agg(
         }
         Ok(())
     })?;
-    let partials = partials
+    let tables = tables
         .into_inner()
         .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?;
-    super::agg::combine_partials(partials, group, aggs, schema, &session.policy)
+    super::agg::merge_finish(tables, group, aggs, schema, &session.policy)
 }
 
 fn map_morsels(

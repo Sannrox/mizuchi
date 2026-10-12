@@ -1727,6 +1727,7 @@ fn execute_physical(plan: &PhysicalPlan, ctx: &TaskCtx) -> Result<Box<dyn Operat
                 &ctx.session.policy,
                 ctx.pool.as_ref(),
                 &ctx.session.cancel,
+                ctx.session.workers,
             )?;
             lowering.scan(batches)
         }

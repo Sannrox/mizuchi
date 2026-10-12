@@ -98,6 +98,11 @@ fn spill_hash(
 }
 
 pub(super) fn can_combine(aggs: &[(String, AggCall)]) -> bool {
+    aggs.iter()
+        .all(|(_, c)| !matches!(c, AggCall::CountDistinct(_)))
+}
+
+pub(super) fn can_spill(aggs: &[(String, AggCall)]) -> bool {
     spill_ok(aggs)
 }
 
@@ -147,6 +152,38 @@ pub(super) fn combine_partials(
         table.update(&batch)?;
     }
     table.finish(policy)
+}
+
+/// Fold `batches` into one hash table. Used by the morsel workers.
+pub(super) fn fold_batches(
+    batches: impl IntoIterator<Item = Batch>,
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+) -> Result<HashAgg> {
+    let mut table = HashAgg::new(group, aggs, schema)?;
+    for batch in batches {
+        table.update(&batch)?;
+    }
+    Ok(table)
+}
+
+/// Merge per-worker tables and emit the finished groups.
+pub(super) fn merge_finish(
+    tables: Vec<HashAgg>,
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+    policy: &BatchPolicy,
+) -> Result<Vec<Batch>> {
+    let mut tables = tables.into_iter();
+    let Some(mut acc) = tables.next() else {
+        return HashAgg::new(group, aggs, schema)?.finish(policy);
+    };
+    for table in tables {
+        acc.merge_table(table)?;
+    }
+    acc.finish(policy)
 }
 
 fn merge_partial_files(
@@ -308,6 +345,27 @@ impl HashAgg {
     fn insert_group(&mut self, key: Vec<Scalar>) -> Result<usize> {
         let h = hash_scalars(&key);
         self.insert_group_hashed(h, key)
+    }
+
+    /// Fold `other`'s groups into this table. AVG keeps sum and count until
+    /// [`Self::finish`], so partials combine with the right weights.
+    pub(super) fn merge_table(&mut self, mut other: HashAgg) -> Result<()> {
+        if other.keys.is_empty() {
+            return Ok(());
+        }
+        if self.keys.is_empty() {
+            *self = other;
+            return Ok(());
+        }
+        for i in 0..other.keys.len() {
+            let key = std::mem::take(&mut other.keys[i]);
+            let accums = std::mem::take(&mut other.accums[i]);
+            let slot = self.ensure_group(key)?;
+            for (dst, src) in self.accums[slot].iter_mut().zip(accums) {
+                dst.merge(src)?;
+            }
+        }
+        Ok(())
     }
 
     fn insert_group_hashed(&mut self, h: u64, key: Vec<Scalar>) -> Result<usize> {
@@ -595,6 +653,103 @@ impl Accum {
                 current.clone().unwrap_or(Scalar::Null)
             }
             Self::User { state, .. } => state.clone(),
+        }
+    }
+
+    fn merge(&mut self, other: Accum) -> Result<()> {
+        match (self, other) {
+            (Self::Count(a), Self::Count(b)) => {
+                *a += b;
+                Ok(())
+            }
+            (Self::CountDistinct(a), Self::CountDistinct(b)) => {
+                a.extend(b);
+                Ok(())
+            }
+            (
+                Self::SumI64 { sum, seen },
+                Self::SumI64 {
+                    sum: add,
+                    seen: had,
+                },
+            ) => {
+                if had {
+                    *sum = sum
+                        .checked_add(add)
+                        .ok_or_else(|| Error::Eval("SUM overflow".into()))?;
+                    *seen = true;
+                }
+                Ok(())
+            }
+            (
+                Self::SumU64 { sum, seen },
+                Self::SumU64 {
+                    sum: add,
+                    seen: had,
+                },
+            ) => {
+                if had {
+                    *sum = sum
+                        .checked_add(add)
+                        .ok_or_else(|| Error::Eval("SUM overflow".into()))?;
+                    *seen = true;
+                }
+                Ok(())
+            }
+            (
+                Self::SumF64 { sum, seen },
+                Self::SumF64 {
+                    sum: add,
+                    seen: had,
+                },
+            ) => {
+                if had {
+                    *sum += add;
+                    *seen = true;
+                }
+                Ok(())
+            }
+            (Self::Avg { sum, count }, Self::Avg { sum: add, count: n }) => {
+                *sum += add;
+                *count += n;
+                Ok(())
+            }
+            (Self::Min { current }, Self::Min { current: other }) => {
+                merge_minmax(current, other, true)
+            }
+            (Self::Max { current }, Self::Max { current: other }) => {
+                merge_minmax(current, other, false)
+            }
+            (Self::User { agg, state, dt, .. }, Self::User { state: other, .. }) => {
+                let left = build_array(std::slice::from_ref(state), dt)?;
+                let right = build_array(std::slice::from_ref(&other), dt)?;
+                let out = agg.merge(left.as_ref(), right.as_ref())?;
+                *state = scalar_at(out.as_ref(), 0)?;
+                Ok(())
+            }
+            _ => Err(Error::Eval("cannot merge accumulators".into())),
+        }
+    }
+}
+
+fn merge_minmax(current: &mut Option<Scalar>, other: Option<Scalar>, is_min: bool) -> Result<()> {
+    let Some(value) = other else {
+        return Ok(());
+    };
+    if value == Scalar::Null {
+        return Ok(());
+    }
+    match current {
+        None => {
+            *current = Some(value);
+            Ok(())
+        }
+        Some(cur) => {
+            let ord = cmp_scalar(cur, &value)?;
+            if (is_min && ord == Ordering::Greater) || (!is_min && ord == Ordering::Less) {
+                *current = Some(value);
+            }
+            Ok(())
         }
     }
 }
