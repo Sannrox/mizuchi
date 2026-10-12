@@ -1,4 +1,4 @@
-//! Micro-benchmarks for columnar filter, projection, and aggregate update.
+//! Micro-benchmarks for columnar filter, projection, aggregate, and hash join.
 //!
 //! Times Arrow-kernel paths over 1_000_000 Int64 rows. Not part of default
 //! `cargo test`. Run:
@@ -29,8 +29,18 @@ fn main() -> mizuchi::Result<()> {
             Arc::new(Int64Array::from(groups)),
         ],
     )?;
+    let dim_schema = Arc::new(mizuchi::Schema::new(vec![mizuchi::Field::new(
+        "id",
+        mizuchi::DataType::Int64,
+        false,
+    )]));
+    let dim = Batch::try_new(
+        dim_schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(0..1_000))],
+    )?;
     let mut session = Session::new();
     session.register("t", schema, vec![batch])?;
+    session.register("u", dim_schema, vec![dim])?;
 
     let cases = [
         ("filter", "SELECT id FROM t WHERE id >= 999000"),
@@ -39,6 +49,10 @@ fn main() -> mizuchi::Result<()> {
         (
             "agg_grouped",
             "SELECT g, COUNT(*) AS c, SUM(id) AS s FROM t GROUP BY g",
+        ),
+        (
+            "join_inner",
+            "SELECT COUNT(*) AS c FROM t JOIN u ON t.id = u.id",
         ),
     ];
     for (name, sql) in cases {

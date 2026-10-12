@@ -1,19 +1,27 @@
 //! Build/probe hash join over Arrow batches.
 //!
-//! Equality conjuncts in `ON` become hash keys. The right input is the build
-//! side, the left input is probed. Null keys never match. Non-equality
-//! conjuncts are a residual filter on candidate pairs. Joins without an
-//! equality key (including CROSS) use a nested loop. LEFT SEMI / ANTI emit
-//! the left schema only.
+//! Equality conjuncts in `ON` become hash keys. Inner joins build the smaller
+//! collected side (row count after filters). Other join types probe left and
+//! build right. Keys are hashed in place; a single integer column uses the
+//! value as the map key. Null keys never match. Non-equality conjuncts are a
+//! residual filter on candidate pairs. Joins without an equality key
+//! (including CROSS) use a nested loop. LEFT SEMI / ANTI emit the left schema
+//! only.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 
-use arrow::array::{ArrayRef, BooleanArray, RecordBatch, UInt32Array, new_null_array};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray, RecordBatch, UInt32Array,
+    new_null_array,
+};
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{concat_batches, take};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{
+    ArrowPrimitiveType, DataType, Int32Type, Int64Type, SchemaRef, UInt32Type, UInt64Type,
+};
 
-use super::key::{Scalar, extract_key};
+use super::key::{hash_row, row_has_null, rows_equal};
 use super::memory::{self, MemoryPool, batch_bytes};
 use super::{CancelToken, Operator, filter_batch};
 use crate::batch::{Batch, BatchPolicy};
@@ -246,30 +254,19 @@ fn probe_equi_hits(
         .iter()
         .map(|(_, r)| r.eval(right))
         .collect::<Result<_>>()?;
-    let mut table: HashMap<Vec<Scalar>, Vec<u32>> = HashMap::new();
-    for row in 0..right.num_rows() {
-        let key = extract_key(&right_keys, row)?;
-        if key.contains(&Scalar::Null) {
-            continue;
-        }
-        table.entry(key).or_default().push(row as u32);
-    }
+    let table = BuildTable::new(&right_keys, &left_keys, right.num_rows())?;
     for (lrow, hit) in hits.iter_mut().enumerate() {
         if *hit {
             continue;
         }
-        let key = extract_key(&left_keys, lrow)?;
-        if key.contains(&Scalar::Null) {
-            continue;
-        }
-        if let Some(rows) = table.get(&key) {
-            for &rrow in rows {
-                if residual_ok(left, right, lrow, rrow as usize, residual)? {
-                    *hit = true;
-                    break;
-                }
+        table.for_matches(&left_keys, lrow, |rrow| {
+            if residual_ok(left, right, lrow, rrow as usize, residual)? {
+                *hit = true;
+                Ok(false)
+            } else {
+                Ok(true)
             }
-        }
+        })?;
     }
     Ok(())
 }
@@ -309,8 +306,7 @@ fn right_has_null_key(right: &Batch, spec: &JoinSpec<'_>) -> Result<bool> {
         .map(|(_, r)| r.eval(right))
         .collect::<Result<_>>()?;
     for row in 0..right.num_rows() {
-        let key = extract_key(&right_keys, row)?;
-        if key.contains(&Scalar::Null) {
+        if row_has_null(&right_keys, row) {
             return Ok(true);
         }
     }
@@ -330,8 +326,7 @@ fn mark_null_left_keys(left: &Batch, spec: &JoinSpec<'_>, hits: &mut [bool]) -> 
         if *hit {
             continue;
         }
-        let key = extract_key(&left_keys, lrow)?;
-        if key.contains(&Scalar::Null) {
+        if row_has_null(&left_keys, lrow) {
             *hit = true;
         }
     }
@@ -409,45 +404,45 @@ fn hash_join(
         .map(|(_, r)| r.eval(right))
         .collect::<Result<_>>()?;
 
-    let mut table: HashMap<Vec<Scalar>, Vec<u32>> = HashMap::new();
-    for row in 0..right.num_rows() {
-        let key = extract_key(&right_keys, row)?;
-        if key.contains(&Scalar::Null) {
-            continue;
-        }
-        table.entry(key).or_default().push(row as u32);
+    if join_type == JoinType::Inner && left.num_rows() < right.num_rows() {
+        return inner_hash_join(left, right, &left_keys, &right_keys, residual, schema, true);
+    }
+    if join_type == JoinType::Inner {
+        return inner_hash_join(
+            left,
+            right,
+            &left_keys,
+            &right_keys,
+            residual,
+            schema,
+            false,
+        );
     }
 
+    let table = BuildTable::new(&right_keys, &left_keys, right.num_rows())?;
     let mut left_idx = Vec::new();
     let mut right_idx = Vec::new();
     let mut unmatched_left = Vec::new();
     let mut build_hit = vec![false; right.num_rows()];
 
     for lrow in 0..left.num_rows() {
-        let key = extract_key(&left_keys, lrow)?;
-        let hits = if key.contains(&Scalar::Null) {
-            None
-        } else {
-            table.get(&key)
-        };
         let mut matched = false;
-        if let Some(hits) = hits {
-            for &rrow in hits {
-                if residual_ok(left, right, lrow, rrow as usize, residual)? {
-                    matched = true;
-                    build_hit[rrow as usize] = true;
-                    left_idx.push(lrow as u32);
-                    right_idx.push(rrow);
-                }
+        table.for_matches(&left_keys, lrow, |rrow| {
+            if residual_ok(left, right, lrow, rrow as usize, residual)? {
+                matched = true;
+                build_hit[rrow as usize] = true;
+                left_idx.push(lrow as u32);
+                right_idx.push(rrow);
             }
-        }
+            Ok(true)
+        })?;
         if !matched {
             unmatched_left.push(lrow as u32);
         }
     }
 
     match join_type {
-        JoinType::Inner => hconcat_take(left, right, &left_idx, &right_idx, schema),
+        JoinType::Inner => unreachable!("inner uses inner_hash_join"),
         JoinType::Left => {
             append_unmatched_left(&mut left_idx, &mut right_idx, &unmatched_left);
             hconcat_take(left, right, &left_idx, &right_idx, schema)
@@ -474,6 +469,178 @@ fn hash_join(
             "internal: CROSS JOIN used the hash path".into(),
         )),
     }
+}
+
+fn inner_hash_join(
+    left: &Batch,
+    right: &Batch,
+    left_keys: &[ArrayRef],
+    right_keys: &[ArrayRef],
+    residual: Option<&Expr>,
+    schema: SchemaRef,
+    build_left: bool,
+) -> Result<Batch> {
+    let (build_keys, probe_keys, n_build, n_probe) = if build_left {
+        (left_keys, right_keys, left.num_rows(), right.num_rows())
+    } else {
+        (right_keys, left_keys, right.num_rows(), left.num_rows())
+    };
+    let table = BuildTable::new(build_keys, probe_keys, n_build)?;
+    let mut left_idx = Vec::new();
+    let mut right_idx = Vec::new();
+    for prow in 0..n_probe {
+        table.for_matches(probe_keys, prow, |brow| {
+            let (lrow, rrow) = if build_left {
+                (brow, prow as u32)
+            } else {
+                (prow as u32, brow)
+            };
+            if residual_ok(left, right, lrow as usize, rrow as usize, residual)? {
+                left_idx.push(lrow);
+                right_idx.push(rrow);
+            }
+            Ok(true)
+        })?;
+    }
+    hconcat_take(left, right, &left_idx, &right_idx, schema)
+}
+
+/// Build-side lookup. A single integer column uses the value as the map key;
+/// otherwise rows are hashed in place and collisions compare cells.
+enum BuildTable {
+    I64(HashMap<i64, Vec<u32>>),
+    I32(HashMap<i32, Vec<u32>>),
+    U64(HashMap<u64, Vec<u32>>),
+    U32(HashMap<u32, Vec<u32>>),
+    Hashed {
+        slots: HashMap<u64, Vec<u32>>,
+        keys: Vec<ArrayRef>,
+    },
+}
+
+impl BuildTable {
+    fn new(build_keys: &[ArrayRef], probe_keys: &[ArrayRef], n_build: usize) -> Result<Self> {
+        if build_keys.len() == 1
+            && probe_keys.len() == 1
+            && build_keys[0].data_type() == probe_keys[0].data_type()
+        {
+            match build_keys[0].data_type() {
+                DataType::Int64 => {
+                    return Ok(Self::I64(int_map::<Int64Type>(
+                        build_keys[0].as_primitive(),
+                        n_build,
+                    )));
+                }
+                DataType::Int32 => {
+                    return Ok(Self::I32(int_map::<Int32Type>(
+                        build_keys[0].as_primitive(),
+                        n_build,
+                    )));
+                }
+                DataType::UInt64 => {
+                    return Ok(Self::U64(int_map::<UInt64Type>(
+                        build_keys[0].as_primitive(),
+                        n_build,
+                    )));
+                }
+                DataType::UInt32 => {
+                    return Ok(Self::U32(int_map::<UInt32Type>(
+                        build_keys[0].as_primitive(),
+                        n_build,
+                    )));
+                }
+                _ => {}
+            }
+        }
+        let mut slots: HashMap<u64, Vec<u32>> = HashMap::new();
+        for row in 0..n_build {
+            if row_has_null(build_keys, row) {
+                continue;
+            }
+            let h = hash_row(build_keys, row)?;
+            slots.entry(h).or_default().push(row as u32);
+        }
+        Ok(Self::Hashed {
+            slots,
+            keys: build_keys.to_vec(),
+        })
+    }
+
+    /// Visit matching build rows. `visit` returns whether to keep scanning
+    /// (`true`) or stop (`false`).
+    fn for_matches(
+        &self,
+        probe_keys: &[ArrayRef],
+        prow: usize,
+        mut visit: impl FnMut(u32) -> Result<bool>,
+    ) -> Result<()> {
+        if row_has_null(probe_keys, prow) {
+            return Ok(());
+        }
+        match self {
+            Self::I64(map) => {
+                int_probe::<Int64Type>(map, probe_keys[0].as_primitive(), prow, visit)
+            }
+            Self::I32(map) => {
+                int_probe::<Int32Type>(map, probe_keys[0].as_primitive(), prow, visit)
+            }
+            Self::U64(map) => {
+                int_probe::<UInt64Type>(map, probe_keys[0].as_primitive(), prow, visit)
+            }
+            Self::U32(map) => {
+                int_probe::<UInt32Type>(map, probe_keys[0].as_primitive(), prow, visit)
+            }
+            Self::Hashed { slots, keys } => {
+                let h = hash_row(probe_keys, prow)?;
+                let Some(cands) = slots.get(&h) else {
+                    return Ok(());
+                };
+                for &brow in cands {
+                    if rows_equal(keys, brow as usize, probe_keys, prow)? && !visit(brow)? {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn int_map<T: ArrowPrimitiveType>(arr: &PrimitiveArray<T>, n: usize) -> HashMap<T::Native, Vec<u32>>
+where
+    T::Native: Hash + Eq,
+{
+    let mut map: HashMap<T::Native, Vec<u32>> = HashMap::new();
+    for row in 0..n {
+        if arr.is_null(row) {
+            continue;
+        }
+        map.entry(arr.value(row)).or_default().push(row as u32);
+    }
+    map
+}
+
+fn int_probe<T: ArrowPrimitiveType>(
+    map: &HashMap<T::Native, Vec<u32>>,
+    arr: &PrimitiveArray<T>,
+    prow: usize,
+    mut visit: impl FnMut(u32) -> Result<bool>,
+) -> Result<()>
+where
+    T::Native: Hash + Eq,
+{
+    if arr.is_null(prow) {
+        return Ok(());
+    }
+    let Some(hits) = map.get(&arr.value(prow)) else {
+        return Ok(());
+    };
+    for &brow in hits {
+        if !visit(brow)? {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 fn nested_loop(

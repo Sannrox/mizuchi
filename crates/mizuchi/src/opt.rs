@@ -177,6 +177,10 @@ impl Optimizer {
                     max_iterations: 16,
                     rules: vec![Rule::PushLimit],
                 },
+                RuleBatch {
+                    max_iterations: 16,
+                    rules: vec![Rule::CollapseProject],
+                },
             ],
         }
     }
@@ -998,12 +1002,127 @@ fn reorder_joins(plan: LogicalPlan) -> LogicalPlan {
     }
 }
 
+/// Put the smaller estimated input on the right (build) side of an inner join.
+fn prefer_smaller_build(plan: LogicalPlan) -> LogicalPlan {
+    let LogicalPlan::Join {
+        left,
+        right,
+        join_type: JoinType::Inner,
+        on: Some(on),
+        schema,
+    } = plan
+    else {
+        return plan;
+    };
+    let (Some(lrows), Some(rrows)) = (estimate_rows(&left), estimate_rows(&right)) else {
+        return LogicalPlan::Join {
+            left,
+            right,
+            join_type: JoinType::Inner,
+            on: Some(on),
+            schema,
+        };
+    };
+    if lrows >= rrows {
+        return LogicalPlan::Join {
+            left,
+            right,
+            join_type: JoinType::Inner,
+            on: Some(on),
+            schema,
+        };
+    }
+    let ln = left.schema().fields().len();
+    let rn = right.schema().fields().len();
+    let on = remap_nth_swap(on, ln, rn);
+    let swapped_schema = join_schema(right.schema(), left.schema());
+    let swapped = LogicalPlan::Join {
+        left: right,
+        right: left,
+        join_type: JoinType::Inner,
+        on: Some(on),
+        schema: swapped_schema,
+    };
+    let mut exprs = Vec::with_capacity(ln + rn);
+    for i in 0..ln {
+        exprs.push(NamedExpr {
+            expr: Expr::nth(rn + i),
+            name: schema.field(i).name().to_string(),
+        });
+    }
+    for j in 0..rn {
+        exprs.push(NamedExpr {
+            expr: Expr::nth(j),
+            name: schema.field(ln + j).name().to_string(),
+        });
+    }
+    LogicalPlan::Project {
+        input: Box::new(swapped),
+        exprs,
+        schema,
+    }
+}
+
+fn remap_nth_swap(expr: Expr, ln: usize, rn: usize) -> Expr {
+    match expr {
+        Expr::Nth(i) if i < ln => Expr::Nth(rn + i),
+        Expr::Nth(i) => Expr::Nth(i - ln),
+        Expr::Binary(op, l, r) => Expr::Binary(
+            op,
+            Box::new(remap_nth_swap(*l, ln, rn)),
+            Box::new(remap_nth_swap(*r, ln, rn)),
+        ),
+        Expr::Unary(op, c) => Expr::Unary(op, Box::new(remap_nth_swap(*c, ln, rn))),
+        Expr::Cast { expr, data_type } => Expr::Cast {
+            expr: Box::new(remap_nth_swap(*expr, ln, rn)),
+            data_type,
+        },
+        Expr::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => Expr::Case {
+            operand: operand.map(|e| Box::new(remap_nth_swap(*e, ln, rn))),
+            when_then: when_then
+                .into_iter()
+                .map(|(w, t)| (remap_nth_swap(w, ln, rn), remap_nth_swap(t, ln, rn)))
+                .collect(),
+            else_expr: else_expr.map(|e| Box::new(remap_nth_swap(*e, ln, rn))),
+        },
+        Expr::Coalesce(args) => Expr::Coalesce(
+            args.into_iter()
+                .map(|e| remap_nth_swap(e, ln, rn))
+                .collect(),
+        ),
+        Expr::Concat(args) => Expr::Concat(
+            args.into_iter()
+                .map(|e| remap_nth_swap(e, ln, rn))
+                .collect(),
+        ),
+        Expr::Substring {
+            expr,
+            start,
+            length,
+        } => Expr::Substring {
+            expr: Box::new(remap_nth_swap(*expr, ln, rn)),
+            start,
+            length,
+        },
+        Expr::Array(args) => Expr::Array(
+            args.into_iter()
+                .map(|e| remap_nth_swap(e, ln, rn))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 fn reorder_inner_join_tree(plan: LogicalPlan) -> LogicalPlan {
     let original_schema = plan.schema().clone();
     let mut items = Vec::new();
     collect_join_items(&plan, &mut items);
     if items.len() < 3 {
-        return plan;
+        return prefer_smaller_build(plan);
     }
     let mut global_eq = Vec::new();
     let mut residuals = Vec::new();
@@ -1287,6 +1406,12 @@ fn connect_joins(
     if !left.items.is_disjoint(&right.items) {
         return None;
     }
+    // Build the smaller estimated side (right child).
+    let (left, right) = if left.rows < right.rows {
+        (right, left)
+    } else {
+        (left, right)
+    };
     let mut eqs = Vec::new();
     for &(ia, ca, ib, cb) in pairs {
         if left.items.contains(&ia) && right.items.contains(&ib) {
@@ -1977,6 +2102,27 @@ mod tests {
         c.set_stats("d0", table_stats(10, 10, 0, 9)).unwrap();
         c.set_stats("d1", table_stats(10, 10, 0, 9)).unwrap();
         c
+    }
+
+    #[test]
+    fn two_table_inner_join_builds_the_smaller_side() {
+        let sql = "SELECT d0.id FROM d0 JOIN fact ON d0.id = fact.id";
+        let plan = optimize(plan_sql(sql, &stats_catalog()).unwrap()).unwrap();
+        let text = plan.explain();
+        let fact = text.find("Scan fact").unwrap_or_else(|| panic!("{text}"));
+        let d0 = text.find("Scan d0").unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            fact < d0,
+            "smaller table must be the right (build) child:\n{text}"
+        );
+        assert_idempotent(plan_sql(sql, &stats_catalog()).unwrap());
+        let out_names: Vec<_> = plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(out_names, vec!["id"]);
     }
 
     #[test]

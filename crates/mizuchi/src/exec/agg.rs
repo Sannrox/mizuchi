@@ -10,7 +10,6 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -26,11 +25,7 @@ use arrow::datatypes::{
 
 use super::CancelToken;
 use super::Operator;
-use super::key::{
-    HASH_BOOL, HASH_F32, HASH_F64, HASH_I8, HASH_I16, HASH_I32, HASH_I64, HASH_NULL, HASH_U8,
-    HASH_U16, HASH_U32, HASH_U64, HASH_UTF8, Scalar, canonical_f32, canonical_f64, dict_utf8_at,
-    eval_all, extract_key, scalar_at,
-};
+use super::key::{Scalar, eval_all, extract_key, hash_row, hash_scalars, row_matches, scalar_at};
 use super::memory::{self, MemoryPool, batch_bytes};
 use crate::batch::{Batch, BatchPolicy};
 use crate::error::{Error, Result};
@@ -712,131 +707,6 @@ fn update_minmax(
         }
     }
     Ok(())
-}
-
-fn hash_scalars(key: &[Scalar]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn hash_row(cols: &[ArrayRef], row: usize) -> Result<u64> {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    cols.len().hash(&mut hasher);
-    for col in cols {
-        hash_cell(col.as_ref(), row, &mut hasher)?;
-    }
-    Ok(hasher.finish())
-}
-
-fn hash_cell(array: &dyn Array, row: usize, hasher: &mut impl Hasher) -> Result<()> {
-    if array.is_null(row) {
-        HASH_NULL.hash(hasher);
-        return Ok(());
-    }
-    match array.data_type() {
-        DataType::Boolean => {
-            HASH_BOOL.hash(hasher);
-            array.as_boolean().value(row).hash(hasher);
-        }
-        DataType::Int8 => {
-            HASH_I8.hash(hasher);
-            array.as_primitive::<Int8Type>().value(row).hash(hasher);
-        }
-        DataType::Int16 => {
-            HASH_I16.hash(hasher);
-            array.as_primitive::<Int16Type>().value(row).hash(hasher);
-        }
-        DataType::Int32 => {
-            HASH_I32.hash(hasher);
-            array.as_primitive::<Int32Type>().value(row).hash(hasher);
-        }
-        DataType::Int64 => {
-            HASH_I64.hash(hasher);
-            array.as_primitive::<Int64Type>().value(row).hash(hasher);
-        }
-        DataType::UInt8 => {
-            HASH_U8.hash(hasher);
-            array.as_primitive::<UInt8Type>().value(row).hash(hasher);
-        }
-        DataType::UInt16 => {
-            HASH_U16.hash(hasher);
-            array.as_primitive::<UInt16Type>().value(row).hash(hasher);
-        }
-        DataType::UInt32 => {
-            HASH_U32.hash(hasher);
-            array.as_primitive::<UInt32Type>().value(row).hash(hasher);
-        }
-        DataType::UInt64 => {
-            HASH_U64.hash(hasher);
-            array.as_primitive::<UInt64Type>().value(row).hash(hasher);
-        }
-        DataType::Float32 => {
-            HASH_F32.hash(hasher);
-            canonical_f32(array.as_primitive::<Float32Type>().value(row).to_bits()).hash(hasher);
-        }
-        DataType::Float64 => {
-            HASH_F64.hash(hasher);
-            canonical_f64(array.as_primitive::<Float64Type>().value(row).to_bits()).hash(hasher);
-        }
-        DataType::Utf8 => {
-            HASH_UTF8.hash(hasher);
-            array.as_string::<i32>().value(row).hash(hasher);
-        }
-        DataType::LargeUtf8 => {
-            HASH_UTF8.hash(hasher);
-            array.as_string::<i64>().value(row).hash(hasher);
-        }
-        DataType::Dictionary(_, _) => {
-            HASH_UTF8.hash(hasher);
-            dict_utf8_at(array, row)?.hash(hasher);
-        }
-        dt => {
-            return Err(Error::Eval(format!(
-                "unsupported grouping or join key type: {dt}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn row_matches(key: &[Scalar], cols: &[ArrayRef], row: usize) -> Result<bool> {
-    if key.len() != cols.len() {
-        return Ok(false);
-    }
-    for (part, col) in key.iter().zip(cols) {
-        if !cell_matches(part, col.as_ref(), row)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn cell_matches(part: &Scalar, array: &dyn Array, row: usize) -> Result<bool> {
-    if array.is_null(row) {
-        return Ok(*part == Scalar::Null);
-    }
-    Ok(match (part, array.data_type()) {
-        (Scalar::Bool(v), DataType::Boolean) => *v == array.as_boolean().value(row),
-        (Scalar::I8(v), DataType::Int8) => *v == array.as_primitive::<Int8Type>().value(row),
-        (Scalar::I16(v), DataType::Int16) => *v == array.as_primitive::<Int16Type>().value(row),
-        (Scalar::I32(v), DataType::Int32) => *v == array.as_primitive::<Int32Type>().value(row),
-        (Scalar::I64(v), DataType::Int64) => *v == array.as_primitive::<Int64Type>().value(row),
-        (Scalar::U8(v), DataType::UInt8) => *v == array.as_primitive::<UInt8Type>().value(row),
-        (Scalar::U16(v), DataType::UInt16) => *v == array.as_primitive::<UInt16Type>().value(row),
-        (Scalar::U32(v), DataType::UInt32) => *v == array.as_primitive::<UInt32Type>().value(row),
-        (Scalar::U64(v), DataType::UInt64) => *v == array.as_primitive::<UInt64Type>().value(row),
-        (Scalar::F32(v), DataType::Float32) => {
-            Scalar::F32(*v) == Scalar::F32(array.as_primitive::<Float32Type>().value(row).to_bits())
-        }
-        (Scalar::F64(v), DataType::Float64) => {
-            Scalar::F64(*v) == Scalar::F64(array.as_primitive::<Float64Type>().value(row).to_bits())
-        }
-        (Scalar::Utf8(v), DataType::Utf8) => v == array.as_string::<i32>().value(row),
-        (Scalar::Utf8(v), DataType::LargeUtf8) => v == array.as_string::<i64>().value(row),
-        (Scalar::Utf8(v), DataType::Dictionary(_, _)) => v == dict_utf8_at(array, row)?,
-        _ => false,
-    })
 }
 
 fn sum_f64_array(array: &dyn Array) -> Result<f64> {

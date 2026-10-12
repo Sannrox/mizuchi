@@ -27,10 +27,10 @@ Same physical shape at every generator scale (tiny, SF1, SF10).
 
 | query | operators | SF1 wall ms | DuckDB ratio |
 | --- | --- | ---: | ---: |
-| tpch_q1 | HashAggregate → Sort over `lineitem` Scan (predicate pushed into Scan) | 776.129 | 0.026 |
-| tpch_q3 | two HashJoins, HashAggregate, Sort/Limit over customer/orders/lineitem | 1536.120 | 0.013 |
-| tpch_q6 | HashAggregate (ungrouped SUM) over `lineitem` Scan (predicate pushed into Scan) | 19.121 | 0.293 |
-| tpcds_store_sales | two HashJoins, HashAggregate, Sort over store_sales/item/date_dim | 695.238 | 0.019 |
+| tpch_q1 | HashAggregate → Sort over `lineitem` Scan (predicate pushed into Scan) | 780.023 | 0.026 |
+| tpch_q3 | two HashJoins, HashAggregate, Sort/Limit over customer/orders/lineitem | 407.372 | 0.047 |
+| tpch_q6 | HashAggregate (ungrouped SUM) over `lineitem` Scan (predicate pushed into Scan) | 15.828 | 0.354 |
+| tpcds_store_sales | two HashJoins, HashAggregate, Sort over store_sales/item/date_dim | 196.232 | 0.066 |
 
 Scan-only `tpch_q6` is the closest gap. Grouped aggregation and the three-way
 joins dominate the rest of the suite.
@@ -69,24 +69,24 @@ accumulators.
 
 ### Hash join
 
-q3 (1536 ms) and store_sales (695 ms) each build two HashJoins. The right
-input is collected and hashed; the left is probed. Both sides are fully
-materialized before probe. Null keys never match. This is the largest wall
-in the suite. Join is not a morsel pipeline, so extra workers do not split
-the build.
+q3 (407 ms) and store_sales (196 ms) each build two HashJoins. Equality keys
+hash in place; a single integer column uses the value as the map key. Inner
+joins build the smaller collected side. Null keys never match. Both sides
+are fully materialized before probe. Join is not a morsel pipeline, so extra
+workers do not split the build.
 
 ### Copies
 
-Join `collect` clones Arrow batches into the build/probe sides. Hash keys
-clone `Scalar` (including `Utf8(String)`) into the table. Spill reload
-clones again. Filter/project emit new batches from Arrow compute; those
-copies are smaller than the hash-table copies on q1/q3/store_sales.
+Join `collect` clones Arrow batches into the build/probe sides. Grouping
+keys still allocate `Scalar` on insert. Spill reload clones again.
+Filter/project emit new batches from Arrow compute; those copies are
+smaller than the materialized join sides on q3/store_sales.
 
 ### Scheduling
 
 `Session::with_workers` runs independent scan/filter/project morsels and
 combinable aggregates. HashJoin, Sort, and Limit stay single-threaded pull.
-q3 and store_sales therefore spend their 1.5 s / 0.7 s on one thread
+q3 and store_sales therefore spend their 0.4 s / 0.2 s on one thread
 regardless of the worker count used for the published SF1 numbers.
 
 ## Ranked limiters
@@ -94,10 +94,10 @@ regardless of the worker count used for the published SF1 numbers.
 Highest impact first, feeding the follow-up Issues. Rank is exclusive
 operator time at SF1 from `gb_bench profile --sf 1`.
 
-1. **Hash join build/probe** on q3 (1334.6 ms + 337.6 ms exclusive) and
-   store_sales (554.3 ms + 238.1 ms). Peak pool 2.62 GiB / 4.10 GiB.
+1. **Hash aggregate updates** on q1 (769.3 ms exclusive, peak 349 MiB).
    [#104](https://github.com/Sannrox/mizuchi/issues/104)
-2. **Hash aggregate updates** on q1 (826.6 ms exclusive, peak 349 MiB).
+2. **Hash join build/probe** on q3 (240.2 ms + 64.4 ms exclusive) and
+   store_sales (103.0 ms + 74.1 ms). Peak pool 2.62 GiB / 4.10 GiB.
    [#104](https://github.com/Sannrox/mizuchi/issues/104)
 3. **Columnar expression and aggregate kernels** (whole-array filter/project
    and ungrouped COUNT/SUM/AVG/MIN/MAX; grouped lookup hashes Utf8 in place).
@@ -106,14 +106,13 @@ operator time at SF1 from `gb_bench profile --sf 1`.
    [#105](https://github.com/Sannrox/mizuchi/issues/105)
 5. **Batch and key copies** between collect, hash tables, and spill (the
    2–4 GiB peaks). [#107](https://github.com/Sannrox/mizuchi/issues/107)
-6. **Scan/decode working set** (Scan exclusive is 0.46 ms on q1 and 0.08 ms
+6. **Scan/decode working set** (Scan exclusive is 0.77 ms on q1 and 0.06 ms
    on q6; Parquet projection and row-group skip would shrink the registered
    tables). [#106](https://github.com/Sannrox/mizuchi/issues/106)
 
-q6 stays the control: ungrouped SUM over a pushed-down Scan, 4.0 ms
-HashAggregate exclusive at SF1 (was 13.1 ms), published wall 19.1 ms.
-q1 wall dropped from 923 ms to 776 ms. Closing (1)–(2) is what the 2–3×
-target still needs on q1/q3.
+q6 stays the control: ungrouped SUM over a pushed-down Scan, 7.4 ms
+HashAggregate exclusive at SF1, published wall 15.8 ms.
+q3 wall dropped from 1536 ms to 407 ms; store_sales from 695 ms to 196 ms.
 
 ## Tiny in-memory profile (default tests)
 
@@ -139,12 +138,12 @@ Times in milliseconds.
 
 | query | peak_bytes | exclusive rank (name, ms) |
 | --- | ---: | --- |
-| tpch_q1 | 349_244_280 | HashAggregate 954.862, Scan 0.505, Sort 0.224 |
-| tpch_q3 | 2_619_712_776 | HashJoin 1663.212, HashJoin 348.528, HashAggregate 64.501 |
-| tpch_q6 | 30_207_160 | HashAggregate 13.074, Scan 0.093 |
-| tpcds_store_sales | 4_100_097_375 | HashJoin 662.997, HashJoin 171.930, HashAggregate 65.228 |
+| tpch_q1 | 349_244_280 | HashAggregate 769.286, Scan 0.769, Sort 0.239 |
+| tpch_q3 | 2_619_712_776 | HashJoin 240.237, HashJoin 64.440, HashAggregate 58.500 |
+| tpch_q6 | 30_207_160 | HashAggregate 7.441, Scan 0.063 |
+| tpcds_store_sales | 4_100_097_375 | HashJoin 103.013, HashJoin 74.112, HashAggregate 23.536 |
 
 HashAggregate / HashJoin exclusive time at SF1 matches the published walls
-in [results.md](results.md) (q1 923 ms, q3 1536 ms, q6 18 ms, store_sales
-695 ms). Exclusive time skips blocking children so nested joins are not
+in [results.md](results.md) (q1 780 ms, q3 407 ms, q6 16 ms, store_sales
+196 ms). Exclusive time skips blocking children so nested joins are not
 undercounted.
