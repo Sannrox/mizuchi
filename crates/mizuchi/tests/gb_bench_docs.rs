@@ -55,6 +55,26 @@ fn results_table_covers_sf1_and_sf10() {
         );
     }
     assert!(text.contains("ratio"), "results missing ratio column");
+    let sf1 = text
+        .split("## sf1")
+        .nth(1)
+        .and_then(|rest| rest.split("## ").next())
+        .expect("sf1 section");
+    for q in ["tpch_q1", "tpch_q3", "tpch_q6", "tpcds_store_sales"] {
+        let line = sf1
+            .lines()
+            .find(|l| l.contains(q))
+            .unwrap_or_else(|| panic!("sf1 missing {q}"));
+        let cols: Vec<&str> = line.split('|').map(str::trim).collect();
+        let ratio: f64 = cols
+            .get(4)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_else(|| panic!("{q} DuckDB ratio: {line}"));
+        assert!(
+            ratio + f64::EPSILON >= 0.33,
+            "{q} SF1 DuckDB ratio {ratio} is below 0.33"
+        );
+    }
     for needle in [
         "Parquet scan pushdown",
         "row groups kept",
@@ -113,15 +133,18 @@ fn harness_and_optional_workflow_exist() {
     for rel in [
         "scripts/bench-gb.sh",
         "scripts/bench_gb_ref.py",
+        "scripts/check-bench-regression.sh",
         "scripts/profile-suite.sh",
         "crates/mizuchi/examples/gb_bench.rs",
         ".github/workflows/bench-gb.yml",
         "docs/bench/limiters.md",
+        "docs/bench/baseline.json",
     ] {
         assert!(root.join(rel).is_file(), "missing {rel}");
     }
     let yml = read(".github/workflows/bench-gb.yml");
     assert!(yml.contains("workflow_dispatch"));
+    assert!(yml.contains("check-bench-regression.sh"));
     assert!(
         !yml.contains("pull_request"),
         "GB bench workflow must not run on pull_request"

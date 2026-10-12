@@ -1605,6 +1605,12 @@ fn build_physical(
             let mut morsels = Vec::new();
             for batch in source {
                 let mut batch = batch.clone();
+                let project_first = projection
+                    .as_ref()
+                    .is_some_and(|names| filters_on_projected(filters, names));
+                if project_first && let Some(names) = projection {
+                    batch = project_named(batch, names)?;
+                }
                 for pred in filters {
                     match filter_batch(&batch, pred)? {
                         Some(kept) => batch = kept,
@@ -1614,16 +1620,8 @@ fn build_physical(
                         }
                     }
                 }
-                if let Some(names) = projection {
-                    let mut indices = Vec::with_capacity(names.len());
-                    for name in names {
-                        let idx = batch
-                            .schema()
-                            .index_of(name)
-                            .map_err(|e| Error::Plan(format!("scan projection: {e}")))?;
-                        indices.push(idx);
-                    }
-                    batch = batch.project(&indices)?;
+                if !project_first && let Some(names) = projection {
+                    batch = project_named(batch, names)?;
                 }
                 morsels.extend(batch.split_by_policy(&session.policy));
             }
@@ -2048,6 +2046,47 @@ pub(super) fn filter_batch(batch: &Batch, predicate: &Expr) -> Result<Option<Bat
     Ok(Some(Batch::from_arrow(filtered)?))
 }
 
+pub(super) fn project_named(batch: Batch, names: &[String]) -> Result<Batch> {
+    let mut indices = Vec::with_capacity(names.len());
+    for name in names {
+        let idx = batch
+            .schema()
+            .index_of(name)
+            .map_err(|e| Error::Plan(format!("scan projection: {e}")))?;
+        indices.push(idx);
+    }
+    batch.project(&indices)
+}
+
+pub(super) fn filters_on_projected(filters: &[Expr], names: &[String]) -> bool {
+    fn walk(expr: &Expr, names: &[String]) -> bool {
+        match expr {
+            Expr::Nth(_) => false,
+            Expr::Column(name) => names.iter().any(|n| n == name),
+            Expr::Literal(_) => true,
+            Expr::Binary(_, l, r) => walk(l, names) && walk(r, names),
+            Expr::Unary(_, c) | Expr::Cast { expr: c, .. } | Expr::Substring { expr: c, .. } => {
+                walk(c, names)
+            }
+            Expr::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                operand.as_deref().is_none_or(|e| walk(e, names))
+                    && when_then
+                        .iter()
+                        .all(|(w, t)| walk(w, names) && walk(t, names))
+                    && else_expr.as_deref().is_none_or(|e| walk(e, names))
+            }
+            Expr::Coalesce(args) | Expr::Concat(args) | Expr::Array(args) => {
+                args.iter().all(|e| walk(e, names))
+            }
+        }
+    }
+    filters.iter().all(|f| walk(f, names))
+}
+
 pub(super) fn project_batch(
     batch: &Batch,
     exprs: &[NamedExpr],
@@ -2436,6 +2475,58 @@ mod tests {
     }
 
     #[test]
+    fn inner_join_matches_across_probe_morsels_and_duplicate_keys() {
+        let l_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let r_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let left = Batch::try_new(
+            l_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1i64, 1, 2]))],
+        )
+        .unwrap();
+        let right_a = Batch::try_new(
+            r_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1i64]))],
+        )
+        .unwrap();
+        let right_b = Batch::try_new(
+            r_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![2i64, 9]))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("t", l_schema, vec![left]).unwrap();
+        s.register("u", r_schema, vec![right_a, right_b]).unwrap();
+        let sql = "SELECT COUNT(*) AS c FROM t JOIN u ON t.a = u.id";
+        let out = s.execute_sql(sql).unwrap();
+        assert_eq!(col_i64(&out, "c"), vec![Some(3)]);
+        let parallel = s.with_workers(2).unwrap().execute_sql(sql).unwrap();
+        assert_eq!(col_i64(&parallel, "c"), vec![Some(3)]);
+    }
+
+    #[test]
+    fn inner_join_sparse_integer_keys_still_match() {
+        let l_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let r_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let left = Batch::try_new(
+            l_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![0i64, 1_000_000_000]))],
+        )
+        .unwrap();
+        let right = Batch::try_new(
+            r_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_000_000_000i64, 2]))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("t", l_schema, vec![left]).unwrap();
+        s.register("u", r_schema, vec![right]).unwrap();
+        let out = s
+            .execute_sql("SELECT COUNT(*) AS c FROM t JOIN u ON t.a = u.id")
+            .unwrap();
+        assert_eq!(col_i64(&out, "c"), vec![Some(1)]);
+    }
+
+    #[test]
     fn inner_join_utf8_keys_hash_without_extract() {
         let l_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
         let r_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
@@ -2652,6 +2743,120 @@ mod tests {
             )
             .unwrap();
         assert_eq!(col_i64(&out, "id"), vec![Some(0), Some(2)]);
+    }
+
+    #[test]
+    fn join_then_agg_folds_into_unique_build() {
+        let dim_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("cat", DataType::Int64, true),
+            Field::new("extra", DataType::Int64, true),
+        ]));
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let dim = Batch::try_new(
+            dim_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])),
+                Arc::new(Int64Array::from(vec![Some(10), Some(10), Some(20)])),
+                Arc::new(Int64Array::from(vec![Some(100), Some(200), Some(300)])),
+            ],
+        )
+        .unwrap();
+        let fact = Batch::try_new(
+            fact_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    Some(3),
+                    Some(9),
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    Some(5),
+                    Some(7),
+                    Some(3),
+                    Some(11),
+                    Some(1),
+                    Some(99),
+                ])),
+            ],
+        )
+        .unwrap();
+        let mut s = Session::new().with_workers(2).unwrap();
+        s.register("dim", dim_schema, vec![dim]).unwrap();
+        s.register("fact", fact_schema.clone(), vec![fact]).unwrap();
+
+        let by_cat = s
+            .execute_sql(
+                "SELECT d.cat, SUM(f.v) AS s FROM fact f JOIN dim d ON f.id = d.id GROUP BY d.cat ORDER BY cat",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&by_cat, "cat"), vec![Some(10), Some(20)]);
+        assert_eq!(col_i64(&by_cat, "s"), vec![Some(15), Some(12)]);
+
+        let by_key = s
+            .execute_sql(
+                "SELECT f.id, d.extra, SUM(f.v) AS s FROM fact f JOIN dim d ON f.id = d.id GROUP BY f.id, d.extra ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&by_key, "id"), vec![Some(1), Some(2), Some(3)]);
+        assert_eq!(
+            col_i64(&by_key, "extra"),
+            vec![Some(100), Some(200), Some(300)]
+        );
+        assert_eq!(col_i64(&by_key, "s"), vec![Some(12), Some(3), Some(12)]);
+
+        let n = crate::batch::DEFAULT_MAX_ROWS + 16;
+        let mut ids = Vec::with_capacity(n);
+        let mut vals = Vec::with_capacity(n);
+        let mut expect = [0i64; 4];
+        for i in 0..n {
+            let id = (i % 3) as i64 + 1;
+            let v = (i % 7) as i64 + 1;
+            ids.push(Some(id));
+            vals.push(Some(v));
+            expect[id as usize] += v;
+        }
+        let wide = Batch::try_new(
+            fact_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(vals)),
+            ],
+        )
+        .unwrap();
+        s.register("fact_wide", fact_schema, vec![wide]).unwrap();
+        let wide_out = s
+            .execute_sql(
+                "SELECT f.id, SUM(f.v) AS s FROM fact_wide f JOIN dim d ON f.id = d.id GROUP BY f.id ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&wide_out, "id"), vec![Some(1), Some(2), Some(3)]);
+        assert_eq!(
+            col_i64(&wide_out, "s"),
+            vec![Some(expect[1]), Some(expect[2]), Some(expect[3])]
+        );
+
+        let root = spill_root("join-fold");
+        let limited = s
+            .clone()
+            .with_memory_limit(64 * 1024)
+            .with_spill_dir(root.clone());
+        let limited_out = limited
+            .execute_sql(
+                "SELECT d.cat, SUM(f.v) AS s FROM fact f JOIN dim d ON f.id = d.id GROUP BY d.cat ORDER BY cat",
+            )
+            .unwrap();
+        assert_eq!(col_i64(&limited_out, "cat"), vec![Some(10), Some(20)]);
+        assert_eq!(col_i64(&limited_out, "s"), vec![Some(15), Some(12)]);
+        let left = leftover(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]

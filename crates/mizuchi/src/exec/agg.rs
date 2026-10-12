@@ -9,7 +9,7 @@
 //! one group.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -25,7 +25,10 @@ use arrow::datatypes::{
 
 use super::CancelToken;
 use super::Operator;
-use super::key::{Scalar, eval_all, extract_key, hash_row, hash_scalars, row_matches, scalar_at};
+use super::key::{
+    IdentityMap, Scalar, eval_all, extract_key, hash_row, hash_scalars, identity_map_with_capacity,
+    row_matches, scalar_at,
+};
 use super::memory::{self, MemoryPool, batch_bytes};
 use crate::batch::{Batch, BatchPolicy};
 use crate::error::{Error, Result};
@@ -168,6 +171,231 @@ pub(super) fn fold_batches(
     Ok(table)
 }
 
+/// Per-build-row cache in front of [`HashAgg`]. The first probe that hits a
+/// unique build row hashes the group key once; later matches only update
+/// accumulators. Used when an inner unique-key join is aggregated immediately.
+pub(super) struct BuildFold {
+    table: HashAgg,
+    by_build: Vec<u32>,
+}
+
+impl BuildFold {
+    pub(super) fn new(
+        group: &[NamedExpr],
+        aggs: &[(String, AggCall)],
+        schema: SchemaRef,
+        n_build: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            table: HashAgg::new(group, aggs, schema)?,
+            by_build: vec![u32::MAX; n_build],
+        })
+    }
+
+    pub(super) fn add(
+        &mut self,
+        group_cols: &[ArrayRef],
+        brow: usize,
+        arg_cols: &[Option<ArrayRef>],
+        prow: usize,
+    ) -> Result<()> {
+        if !self.table.grouped {
+            if self.table.keys.is_empty() {
+                self.table.insert_group(Vec::new())?;
+            }
+            for (accum, arg) in self.table.accums[0].iter_mut().zip(arg_cols.iter()) {
+                accum.update(arg.as_deref(), prow)?;
+            }
+            return Ok(());
+        }
+        let cached = self.by_build[brow];
+        let slot = if cached == u32::MAX {
+            let slot = self.table.ensure_group_row(group_cols, brow)?;
+            self.by_build[brow] = slot as u32;
+            slot
+        } else {
+            cached as usize
+        };
+        for (accum, arg) in self.table.accums[slot].iter_mut().zip(arg_cols.iter()) {
+            accum.update(arg.as_deref(), prow)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_table(self) -> HashAgg {
+        self.table
+    }
+}
+
+/// Accumulators indexed by unique build row. Valid when grouping includes the
+/// unique join key, so each build row is its own group and hashing is skipped.
+pub(super) struct BuildSlots {
+    schema: SchemaRef,
+    group_n: usize,
+    accums: Vec<Option<Vec<Accum>>>,
+    empty: Vec<Accum>,
+}
+
+impl BuildSlots {
+    pub(super) fn new(
+        group: &[NamedExpr],
+        aggs: &[(String, AggCall)],
+        schema: SchemaRef,
+        n_build: usize,
+    ) -> Result<Self> {
+        let group_n = group.len();
+        let empty = aggs
+            .iter()
+            .enumerate()
+            .map(|(i, (_, call))| {
+                Accum::from_call(call, schema.field(group_n + i).data_type(), false)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            schema,
+            group_n,
+            accums: vec![None; n_build],
+            empty,
+        })
+    }
+
+    pub(super) fn add(
+        &mut self,
+        brow: usize,
+        arg_cols: &[Option<ArrayRef>],
+        prow: usize,
+    ) -> Result<()> {
+        let slot = self.accums[brow].get_or_insert_with(|| self.empty.clone());
+        for (accum, arg) in slot.iter_mut().zip(arg_cols.iter()) {
+            accum.update(arg.as_deref(), prow)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn merge_from(&mut self, mut other: Self) -> Result<()> {
+        for (dst, src) in self.accums.iter_mut().zip(other.accums.iter_mut()) {
+            match (dst.as_mut(), src.take()) {
+                (Some(d), Some(s)) => {
+                    for (a, b) in d.iter_mut().zip(s) {
+                        a.merge(b)?;
+                    }
+                }
+                (None, Some(s)) => *dst = Some(s),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish(
+        self,
+        group_cols: &[ArrayRef],
+        policy: &BatchPolicy,
+    ) -> Result<Vec<Batch>> {
+        let hits: Vec<usize> = self
+            .accums
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| a.is_some().then_some(i))
+            .collect();
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
+        for (g, field) in self.schema.fields().iter().enumerate().take(self.group_n) {
+            let values: Vec<super::key::Scalar> = hits
+                .iter()
+                .map(|&i| super::key::scalar_at(group_cols[g].as_ref(), i))
+                .collect::<Result<_>>()?;
+            columns.push(build_array(&values, field.data_type())?);
+        }
+        for (a, field) in self.schema.fields().iter().enumerate().skip(self.group_n) {
+            let ai = a - self.group_n;
+            let values: Vec<super::key::Scalar> = hits
+                .iter()
+                .map(|&i| {
+                    self.accums[i]
+                        .as_ref()
+                        .expect("hit")
+                        .get(ai)
+                        .expect("accum")
+                        .finish()
+                })
+                .collect();
+            columns.push(build_array(&values, field.data_type())?);
+        }
+        let full = Batch::try_new(self.schema, columns)?;
+        Ok(full
+            .split_by_policy(policy)
+            .into_iter()
+            .filter(|b| b.num_rows() > 0)
+            .collect())
+    }
+}
+
+/// One `SUM` of floats per unique build row. Avoids accumulator dispatch on
+/// the probe loop for q3-shaped plans.
+pub(super) struct BuildF64Sums {
+    schema: SchemaRef,
+    group_n: usize,
+    sums: Vec<f64>,
+    hits: Vec<u8>,
+}
+
+impl BuildF64Sums {
+    pub(super) fn new(schema: SchemaRef, group_n: usize, n_build: usize) -> Self {
+        Self {
+            schema,
+            group_n,
+            sums: vec![0.0; n_build],
+            hits: vec![0; n_build],
+        }
+    }
+
+    pub(super) fn add(&mut self, brow: usize, value: f64) {
+        self.sums[brow] += value;
+        self.hits[brow] = 1;
+    }
+
+    pub(super) fn finish(
+        self,
+        group_cols: &[ArrayRef],
+        policy: &BatchPolicy,
+    ) -> Result<Vec<Batch>> {
+        let hits: Vec<usize> = self
+            .hits
+            .iter()
+            .enumerate()
+            .filter_map(|(i, h)| (*h != 0).then_some(i))
+            .collect();
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
+        for (g, field) in self.schema.fields().iter().enumerate().take(self.group_n) {
+            let values: Vec<Scalar> = hits
+                .iter()
+                .map(|&i| scalar_at(group_cols[g].as_ref(), i))
+                .collect::<Result<_>>()?;
+            columns.push(build_array(&values, field.data_type())?);
+        }
+        let sums: Vec<Scalar> = hits
+            .iter()
+            .map(|&i| Scalar::F64(self.sums[i].to_bits()))
+            .collect();
+        columns.push(build_array(
+            &sums,
+            self.schema.field(self.group_n).data_type(),
+        )?);
+        let full = Batch::try_new(self.schema, columns)?;
+        Ok(full
+            .split_by_policy(policy)
+            .into_iter()
+            .filter(|b| b.num_rows() > 0)
+            .collect())
+    }
+}
+
 /// Merge per-worker tables and emit the finished groups.
 pub(super) fn merge_finish(
     tables: Vec<HashAgg>,
@@ -235,9 +463,10 @@ pub(super) struct HashAgg {
     schema: SchemaRef,
     grouped: bool,
     combining: bool,
-    /// Hash of the group key → candidate slots. New groups allocate `Scalar`
-    /// keys once; lookups hash array values in place (no per-row `String`).
-    slots: HashMap<u64, Vec<usize>>,
+    /// Precomputed key hash → candidate slots. The map uses the hash as the
+    /// bucket key. New groups allocate `Scalar` keys once; lookups hash array
+    /// values in place (no per-row `String`).
+    slots: IdentityMap<Vec<usize>>,
     keys: Vec<Vec<Scalar>>,
     accums: Vec<Vec<Accum>>,
 }
@@ -271,7 +500,7 @@ impl HashAgg {
             schema,
             grouped: !group.is_empty(),
             combining,
-            slots: HashMap::new(),
+            slots: identity_map_with_capacity(8),
             keys: Vec::new(),
             accums: Vec::new(),
         })
@@ -298,10 +527,41 @@ impl HashAgg {
         if !self.grouped {
             return self.update_ungrouped(&arg_cols, batch.num_rows());
         }
-        for row in 0..batch.num_rows() {
-            let slot = self.ensure_group_row(&key_cols, row)?;
+        self.update_grouped(&key_cols, &arg_cols, batch.num_rows())
+    }
+
+    /// Assign group slots, then update. Few groups (decision-support q1)
+    /// gather rows and use whole-array kernels; high cardinality stays
+    /// one pass.
+    fn update_grouped(
+        &mut self,
+        key_cols: &[ArrayRef],
+        arg_cols: &[Option<ArrayRef>],
+        n: usize,
+    ) -> Result<()> {
+        let mut row_slot = vec![0usize; n];
+        for (row, slot) in row_slot.iter_mut().enumerate() {
+            *slot = self.ensure_group_row(key_cols, row)?;
+        }
+        let n_groups = self.accums.len();
+        if n_groups > 64 || n < 32 {
+            for (row, &slot) in row_slot.iter().enumerate() {
+                for (accum, arg) in self.accums[slot].iter_mut().zip(arg_cols.iter()) {
+                    accum.update(arg.as_deref(), row)?;
+                }
+            }
+            return Ok(());
+        }
+        let mut rows_for = vec![Vec::new(); n_groups];
+        for (row, &slot) in row_slot.iter().enumerate() {
+            rows_for[slot].push(row as u32);
+        }
+        for (slot, rows) in rows_for.iter().enumerate() {
+            if rows.is_empty() {
+                continue;
+            }
             for (accum, arg) in self.accums[slot].iter_mut().zip(arg_cols.iter()) {
-                accum.update(arg.as_deref(), row)?;
+                accum.update_rows(arg.as_deref(), rows)?;
             }
         }
         Ok(())
@@ -501,6 +761,65 @@ impl Accum {
                 }
             }
         })
+    }
+
+    fn update_rows(&mut self, arg: Option<&dyn Array>, rows: &[u32]) -> Result<()> {
+        match self {
+            Self::Count(n) => {
+                if let Some(array) = arg {
+                    for &row in rows {
+                        if !array.is_null(row as usize) {
+                            *n += 1;
+                        }
+                    }
+                } else {
+                    *n += rows.len() as i64;
+                }
+                Ok(())
+            }
+            Self::SumF64 { sum, seen } => {
+                let array = arg.ok_or_else(|| Error::Eval("SUM needs an argument".into()))?;
+                if array.data_type() == &DataType::Float64 {
+                    let arr = array.as_primitive::<Float64Type>();
+                    for &row in rows {
+                        let i = row as usize;
+                        if !arr.is_null(i) {
+                            *sum += arr.value(i);
+                            *seen = true;
+                        }
+                    }
+                    return Ok(());
+                }
+                for &row in rows {
+                    update_sum_f64(sum, seen, arg, row as usize)?;
+                }
+                Ok(())
+            }
+            Self::SumI64 { sum, seen } => {
+                for &row in rows {
+                    update_sum_i64(sum, seen, arg, row as usize)?;
+                }
+                Ok(())
+            }
+            Self::SumU64 { sum, seen } => {
+                for &row in rows {
+                    update_sum_u64(sum, seen, arg, row as usize)?;
+                }
+                Ok(())
+            }
+            Self::Avg { sum, count } => {
+                for &row in rows {
+                    update_avg(sum, count, arg, row as usize)?;
+                }
+                Ok(())
+            }
+            _ => {
+                for &row in rows {
+                    self.update(arg, row as usize)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn update(&mut self, arg: Option<&dyn Array>, row: usize) -> Result<()> {
@@ -1600,5 +1919,49 @@ mod tests {
                 .value(0),
             3
         );
+    }
+
+    #[test]
+    fn grouped_high_cardinality_keeps_one_row_per_key() {
+        let n = 64usize;
+        let keys: Vec<Option<i64>> = (0..n).map(|i| Some(i as i64)).collect();
+        let qty: Vec<Option<i64>> = (0..n).map(|i| Some((i * 2) as i64)).collect();
+        let batch = Batch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, true),
+                Field::new("qty", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(Int64Array::from(qty)),
+            ],
+        )
+        .unwrap();
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("s", DataType::Int64, true),
+        ]));
+        let mut table = HashAgg::new(
+            &[NamedExpr {
+                expr: Expr::nth(0),
+                name: "k".into(),
+            }],
+            &[("s".into(), AggCall::Sum(Expr::nth(1)))],
+            out_schema,
+        )
+        .unwrap();
+        table.update(&batch).unwrap();
+        let out = table.finish(&BatchPolicy::unlimited()).unwrap();
+        assert_eq!(out[0].num_rows(), n);
+        let sums = out[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut total = 0i64;
+        for i in 0..sums.len() {
+            total += sums.value(i);
+        }
+        assert_eq!(total, (0..n as i64).map(|i| i * 2).sum::<i64>());
     }
 }

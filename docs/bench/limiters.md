@@ -20,7 +20,9 @@ present; those files stay gitignored.
 `EXPLAIN ANALYZE` times the pull operator tree. `execute_sql` with
 `Session::with_workers` > 1 runs scan/filter/project morsels, combinable
 aggregates (AVG merges per-thread sum and count), inner hash-join probe,
-and wrapping sort/limit on that many threads. Join build stays one thread.
+and wrapping sort/limit on that many threads. Integer equi-keys in a tight
+min/max span use a compact range map; unique i64 keys probe with a direct
+index. Grouped aggregates assign group slots then update in a tight loop.
 
 ## Operator mix
 
@@ -28,13 +30,13 @@ Same physical shape at every generator scale (tiny, SF1, SF10).
 
 | query | operators | SF1 wall ms | DuckDB ratio |
 | --- | --- | ---: | ---: |
-| tpch_q1 | HashAggregate → Sort over `lineitem` Scan (predicate pushed into Scan) | 133.510 | 0.149 |
-| tpch_q3 | two HashJoins, HashAggregate, Sort/Limit over customer/orders/lineitem | 338.443 | 0.057 |
-| tpch_q6 | HashAggregate (ungrouped SUM) over `lineitem` Scan (predicate pushed into Scan) | 17.688 | 0.317 |
-| tpcds_store_sales | two HashJoins, HashAggregate, Sort over store_sales/item/date_dim | 93.168 | 0.139 |
+| tpch_q1 | HashAggregate → Sort over `lineitem` Scan (predicate pushed into Scan) | 77.864 | 0.359 |
+| tpch_q3 | two HashJoins, HashAggregate, Sort/Limit over customer/orders/lineitem | 46.580 | 0.674 |
+| tpch_q6 | HashAggregate (ungrouped SUM) over `lineitem` Scan (predicate pushed into Scan) | 13.873 | 0.581 |
+| tpcds_store_sales | two HashJoins, HashAggregate, Sort over store_sales/item/date_dim | 32.766 | 0.497 |
 
-Scan-only `tpch_q6` is the closest gap. Grouped aggregation and the three-way
-joins dominate the rest of the suite.
+SF1 meets the 0.33 DuckDB-ratio target. Grouped aggregation (`tpch_q1`) is
+the remaining gap versus the same-host reference.
 
 ## Breakdown
 
@@ -72,10 +74,11 @@ accumulators.
 ### Hash join
 
 q3 (407 ms) and store_sales (196 ms) each build two HashJoins. Equality keys
-hash in place; a single integer column uses the value as the map key. Inner
-joins build the smaller collected side. Null keys never match. Both sides
-are fully materialized before probe. Inner probe ranges run on worker
-threads; the hash table is still built on one thread.
+hash in place. A single integer column in a tight min/max span uses a
+compact range map; unique i64 keys probe with a direct index. Inner joins
+build the smaller collected side. Null keys never match. Both sides are
+fully materialized before probe. Inner probe ranges run on worker threads;
+the hash table is still built on one thread.
 
 ### Copies
 

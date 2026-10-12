@@ -4,8 +4,11 @@ Release-profile runs of the TPC-H and TPC-DS-style query set at SF1 and SF10,
 compared with DuckDB and DataFusion on the same generated Parquet and the same
 host. Reproduce with `bash scripts/bench-gb.sh 1` and `bash scripts/bench-gb.sh 10`.
 The optional GitHub workflow `.github/workflows/bench-gb.yml` smokes `--sf tiny`
-on `workflow_dispatch` or a weekly schedule. It is not part of pull-request CI
-and not part of default `cargo test`.
+on `workflow_dispatch` or a weekly schedule, writes the ratios to the job
+summary, and fails when any query whose baseline is at least 5 ms is more
+than 20% slower than `docs/bench/baseline.json`. The SF1 target (every
+DuckDB ratio at or above 0.33) is recorded in `results.md`. The workflow is
+not part of pull-request CI and not part of default `cargo test`.
 
 ## Hardware
 

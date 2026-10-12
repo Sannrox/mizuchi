@@ -6,6 +6,7 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- Decision-support SF1 target: grouping and join maps use a cheap hasher, integer equi-keys in a modest span use a compact range map, unique i64 keys probe with a direct index, and an aggregate over a unique-key inner join folds into the build slots. Unused columns are dropped through joins and aggregates before a scan reads them. The scheduled GB bench job publishes ratios and fails when any query is more than 20% slower than `docs/bench/baseline.json`. Every SF1 DuckDB ratio in `docs/bench/results.md` is at least 0.33.
 - Parquet scan pushdown: projection to column chunks, row-group skip from footer min/max (Int64 and Float64) and bloom filters, page-index skip, and late materialization of remaining columns. `read_parquet_reported` returns kept groups and compressed bytes of projected columns. Clustered q6-style skip ratios in `docs/bench/results.md`.
 - Parallel morsel execution: combinable aggregates (AVG keeps sum and count until the merge), inner hash-join probe, and wrapping sort/limit run on `Session::with_workers` threads. SF1 scaling at 1/2/4/8 workers in `docs/bench/results.md`.
 - Hash join and hash aggregate: equality keys hash in place (a single integer column uses the value as the map key). Inner joins build the smaller collected side; the optimizer places the smaller estimated input on the build side from table stats. Micro-benchmarks: `cargo run --release -p mizuchi --example kernel_micro`. SF1 q1/q3/store_sales times in `docs/bench/results.md`.

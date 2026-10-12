@@ -1,10 +1,10 @@
 # Gigabyte-scale decision-support results
 
 Measured 2026-10-11 with the method in [methodology.md](methodology.md); SF1
-re-timed 2026-10-12 after parallel morsel execution (inner join probe, AVG
-combine, Sort/Limit peel). Times are milliseconds. Ratio is
-`reference_ms / mizuchi_ms`. Values below 1 mean the reference engine
-finished faster.
+re-timed 2026-10-12 after unused-column prune and unique-key join fold
+(five trials, drop first, median of the rest). Times are milliseconds.
+Ratio is `reference_ms / mizuchi_ms`. Values below 1 mean the reference
+engine finished faster.
 
 mizuchi working set (sum of registered Arrow batch sizes): SF1 562_033_392
 bytes, SF10 5_617_403_368 bytes. Snappy Parquet on disk: SF1 130_575_375 bytes,
@@ -14,10 +14,10 @@ SF10 1_280_729_644 bytes.
 
 | query | mizuchi ms | DuckDB ms | DuckDB ratio | DataFusion ms | DataFusion ratio |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| tpch_q1 | 133.510 | 19.945 | 0.149 | 30.694 | 0.230 |
-| tpch_q3 | 338.443 | 19.282 | 0.057 | 23.828 | 0.070 |
-| tpch_q6 | 17.688 | 5.609 | 0.317 | 6.712 | 0.379 |
-| tpcds_store_sales | 93.168 | 12.943 | 0.139 | 29.758 | 0.319 |
+| tpch_q1 | 77.864 | 27.995 | 0.359 | 39.155 | 0.503 |
+| tpch_q3 | 46.580 | 31.384 | 0.674 | 35.495 | 0.762 |
+| tpch_q6 | 13.873 | 8.065 | 0.581 | 8.188 | 0.590 |
+| tpcds_store_sales | 32.766 | 16.303 | 0.497 | 45.607 | 1.392 |
 
 ## sf10 (60_000_000 `lineitem` rows)
 
@@ -28,9 +28,9 @@ SF10 1_280_729_644 bytes.
 | tpch_q6 | 226.348 | 49.882 | 0.220 | 54.293 | 0.240 |
 | tpcds_store_sales | 7518.938 | 104.787 | 0.014 | 391.952 | 0.052 |
 
-Scan-heavy `tpch_q6` is the closest gap. Grouped aggregation (`tpch_q1`) and
-the three-way joins (`tpch_q3`, `tpcds_store_sales`) remain behind the
-reference engines at both scales.
+SF1 DuckDB ratios are at or above 0.33 on every query. `tpcds_store_sales`
+is faster than DataFusion at this scale. SF10 walls below were not re-timed
+with this change.
 
 ## Parquet scan pushdown
 
