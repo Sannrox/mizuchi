@@ -105,6 +105,12 @@ cargo test --locked --workspace
 bash scripts/validate-workflow-skills.sh
 ```
 
+Columnar kernel micro-benchmarks (filter, projection, aggregate update):
+
+```sh
+cargo run --release -p mizuchi --example kernel_micro
+```
+
 Python (optional, not part of the default Cargo workspace):
 
 ```sh

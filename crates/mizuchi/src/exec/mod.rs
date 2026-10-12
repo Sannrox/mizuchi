@@ -2072,10 +2072,10 @@ mod tests {
     use super::*;
     use crate::udaf::ProductI64;
     use arrow::array::{
-        Array, ArrayRef, Date32Array, Float64Array, Int64Array, LargeStringArray, StringArray,
-        UInt32Array,
+        Array, ArrayRef, Date32Array, DictionaryArray, Float64Array, Int32Array, Int64Array,
+        LargeStringArray, StringArray, UInt32Array,
     };
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
 
@@ -2594,6 +2594,124 @@ mod tests {
                 (Some(3), Some(1)),
             ]
         );
+    }
+
+    #[test]
+    fn grouped_dictionary_utf8_keys_count() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let keys = Int32Array::from(vec![Some(0), Some(1), Some(0), None, Some(1)]);
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["A", "N"]));
+        let dict = DictionaryArray::try_new(keys, values).unwrap();
+        let batch = Batch::try_new(schema.clone(), vec![Arc::new(dict)]).unwrap();
+        let mut s = Session::new();
+        s.register("d", schema, vec![batch]).unwrap();
+        let out = s
+            .execute_sql("SELECT flag, COUNT(*) AS c FROM d GROUP BY flag")
+            .unwrap();
+        let mut rows: Vec<(Option<String>, Option<i64>)> = Vec::new();
+        for batch in &out {
+            let flags = batch.column_by_name("flag").unwrap();
+            let counts = batch
+                .column_by_name("c")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                let flag = if flags.is_null(i) {
+                    None
+                } else if let Some(utf8) = flags.as_any().downcast_ref::<StringArray>() {
+                    Some(utf8.value(i).to_owned())
+                } else {
+                    let dict = flags
+                        .as_any()
+                        .downcast_ref::<DictionaryArray<Int32Type>>()
+                        .unwrap();
+                    let values = dict
+                        .values()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    Some(values.value(dict.keys().value(i) as usize).to_owned())
+                };
+                let c = if counts.is_null(i) {
+                    None
+                } else {
+                    Some(counts.value(i))
+                };
+                rows.push((flag, c));
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            rows,
+            vec![
+                (None, Some(1)),
+                (Some("A".into()), Some(2)),
+                (Some("N".into()), Some(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn kernel_filter_project_and_ungrouped_agg_one_million_rows() {
+        const N: i64 = 1_000_000;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..N))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("t", schema, vec![batch]).unwrap();
+        let filtered = s
+            .execute_sql("SELECT id FROM t WHERE id >= 999990")
+            .unwrap();
+        assert_eq!(
+            col_i64(&filtered, "id"),
+            vec![
+                Some(999990),
+                Some(999991),
+                Some(999992),
+                Some(999993),
+                Some(999994),
+                Some(999995),
+                Some(999996),
+                Some(999997),
+                Some(999998),
+                Some(999999),
+            ]
+        );
+        let projected = s.execute_sql("SELECT id + 1 AS x FROM t").unwrap();
+        let mut n = 0i64;
+        let mut first = None;
+        let mut last = None;
+        for batch in &projected {
+            let col = batch
+                .column_by_name("x")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            if first.is_none() {
+                first = Some(col.value(0));
+            }
+            last = Some(col.value(col.len() - 1));
+            n += col.len() as i64;
+        }
+        assert_eq!(n, N);
+        assert_eq!(first, Some(1));
+        assert_eq!(last, Some(N));
+        let summed = s
+            .execute_sql("SELECT SUM(id) AS s, COUNT(*) AS c FROM t")
+            .unwrap();
+        assert_eq!(col_i64(&summed, "c"), vec![Some(N)]);
+        let sum = col_i64(&summed, "s")[0].unwrap();
+        assert_eq!(sum, N * (N - 1) / 2);
     }
 
     #[test]
