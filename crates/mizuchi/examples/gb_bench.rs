@@ -653,12 +653,13 @@ fn profile_mizuchi(flags: &Flags) {
         );
         for (i, n) in ranked.iter().take(8).enumerate() {
             eprintln!(
-                "    {}. {} exclusive_ns={} elapsed_ns={} peak_bytes={} rows={}",
+                "    {}. {} exclusive_ns={} elapsed_ns={} peak_bytes={} copied_bytes={} rows={}",
                 i + 1,
                 n.name,
                 n.exclusive_ns(),
                 n.elapsed_ns,
                 n.peak_bytes,
+                n.copied_bytes,
                 n.rows
             );
         }

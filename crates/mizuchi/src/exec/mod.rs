@@ -1665,6 +1665,7 @@ fn build_physical(
         } => {
             let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
             let t0 = Instant::now();
+            let copied0 = pool.copied();
             let batches = agg::run(
                 child,
                 group,
@@ -1683,7 +1684,12 @@ fn build_physical(
                 pool,
             );
             if analyze {
-                metrics::add_blocking(&node, ns, pool.peak());
+                metrics::add_blocking(
+                    &node,
+                    ns,
+                    pool.peak(),
+                    pool.copied().saturating_sub(copied0),
+                );
             }
             Ok((op, node))
         }
@@ -1697,6 +1703,7 @@ fn build_physical(
             let (left_op, left_node) = build_physical(left, session, pool, analyze, work)?;
             let (right_op, right_node) = build_physical(right, session, pool, analyze, work)?;
             let t0 = Instant::now();
+            let copied0 = pool.copied();
             let batches = join::run(
                 left_op,
                 right_op,
@@ -1721,13 +1728,19 @@ fn build_physical(
                 pool,
             );
             if analyze {
-                metrics::add_blocking(&node, ns, pool.peak());
+                metrics::add_blocking(
+                    &node,
+                    ns,
+                    pool.peak(),
+                    pool.copied().saturating_sub(copied0),
+                );
             }
             Ok((op, node))
         }
         LogicalPlan::Sort { input, order } => {
             let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
             let t0 = Instant::now();
+            let copied0 = pool.copied();
             let batches = sort::ordered(
                 child,
                 input.schema().clone(),
@@ -1747,7 +1760,12 @@ fn build_physical(
                 pool,
             );
             if analyze {
-                metrics::add_blocking(&node, ns, pool.peak());
+                metrics::add_blocking(
+                    &node,
+                    ns,
+                    pool.peak(),
+                    pool.copied().saturating_sub(copied0),
+                );
             }
             Ok((op, node))
         }
@@ -1758,6 +1776,7 @@ fn build_physical(
             } => {
                 let (child, child_node) = build_physical(sorted, session, pool, analyze, work)?;
                 let t0 = Instant::now();
+                let copied0 = pool.copied();
                 let batches = sort::ordered(
                     child,
                     sorted.schema().clone(),
@@ -1777,7 +1796,12 @@ fn build_physical(
                     pool,
                 );
                 if analyze {
-                    metrics::add_blocking(&node, ns, pool.peak());
+                    metrics::add_blocking(
+                        &node,
+                        ns,
+                        pool.peak(),
+                        pool.copied().saturating_sub(copied0),
+                    );
                 }
                 Ok((op, node))
             }
@@ -1805,6 +1829,7 @@ fn build_physical(
                 children.push(node);
             }
             let t0 = Instant::now();
+            let copied0 = pool.copied();
             let batches = setop::union(
                 ops,
                 schema.clone(),
@@ -1817,7 +1842,12 @@ fn build_physical(
             let (op, node) =
                 metrics::finish("Union", lowering.scan(batches)?, children, analyze, pool);
             if analyze {
-                metrics::add_blocking(&node, ns, pool.peak());
+                metrics::add_blocking(
+                    &node,
+                    ns,
+                    pool.peak(),
+                    pool.copied().saturating_sub(copied0),
+                );
             }
             Ok((op, node))
         }
@@ -1830,6 +1860,7 @@ fn build_physical(
             let (left_op, left_node) = build_physical(left, session, pool, analyze, work)?;
             let (right_op, right_node) = build_physical(right, session, pool, analyze, work)?;
             let t0 = Instant::now();
+            let copied0 = pool.copied();
             let batches = setop::intersect(
                 left_op,
                 right_op,
@@ -1848,7 +1879,12 @@ fn build_physical(
                 pool,
             );
             if analyze {
-                metrics::add_blocking(&node, ns, pool.peak());
+                metrics::add_blocking(
+                    &node,
+                    ns,
+                    pool.peak(),
+                    pool.copied().saturating_sub(copied0),
+                );
             }
             Ok((op, node))
         }
@@ -1861,6 +1897,7 @@ fn build_physical(
             let (left_op, left_node) = build_physical(left, session, pool, analyze, work)?;
             let (right_op, right_node) = build_physical(right, session, pool, analyze, work)?;
             let t0 = Instant::now();
+            let copied0 = pool.copied();
             let batches = setop::except(
                 left_op,
                 right_op,
@@ -1879,7 +1916,12 @@ fn build_physical(
                 pool,
             );
             if analyze {
-                metrics::add_blocking(&node, ns, pool.peak());
+                metrics::add_blocking(
+                    &node,
+                    ns,
+                    pool.peak(),
+                    pool.copied().saturating_sub(copied0),
+                );
             }
             Ok((op, node))
         }
@@ -1890,6 +1932,7 @@ fn build_physical(
             schema,
         } => {
             let t0 = Instant::now();
+            let copied0 = pool.copied();
             let batches = recursive::run(name, anchors, step, schema, session, pool, analyze)?;
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let mut children: Vec<metrics::PhysNode> =
@@ -1903,7 +1946,12 @@ fn build_physical(
                 pool,
             );
             if analyze {
-                metrics::add_blocking(&node, ns, pool.peak());
+                metrics::add_blocking(
+                    &node,
+                    ns,
+                    pool.peak(),
+                    pool.copied().saturating_sub(copied0),
+                );
             }
             Ok((op, node))
         }
@@ -1917,6 +1965,7 @@ fn build_physical(
         } => {
             let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
             let t0 = Instant::now();
+            let copied0 = pool.copied();
             let batches = window::run(
                 child,
                 input.schema().clone(),
@@ -1938,13 +1987,19 @@ fn build_physical(
                 pool,
             );
             if analyze {
-                metrics::add_blocking(&node, ns, pool.peak());
+                metrics::add_blocking(
+                    &node,
+                    ns,
+                    pool.peak(),
+                    pool.copied().saturating_sub(copied0),
+                );
             }
             Ok((op, node))
         }
         LogicalPlan::Scalar { input, schema } => {
             let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
             let t0 = Instant::now();
+            let copied0 = pool.copied();
             let batches = collect(child, &session.cancel)?;
             let out = scalar_one_row(batches, schema.clone())?;
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1956,7 +2011,12 @@ fn build_physical(
                 pool,
             );
             if analyze {
-                metrics::add_blocking(&node, ns, pool.peak());
+                metrics::add_blocking(
+                    &node,
+                    ns,
+                    pool.peak(),
+                    pool.copied().saturating_sub(copied0),
+                );
             }
             Ok((op, node))
         }
@@ -2244,6 +2304,7 @@ mod tests {
         assert!(text.contains("elapsed_ns="), "{text}");
         assert!(text.contains("exclusive_ns="), "{text}");
         assert!(text.contains("peak_bytes="), "{text}");
+        assert!(text.contains("copied_bytes="), "{text}");
 
         let metrics = s.query_metrics(sql).unwrap();
         assert_eq!(metrics.name, "HashAggregate");
@@ -2272,6 +2333,117 @@ mod tests {
         assert!(json.contains("\"name\":\"HashJoin\""), "{json}");
         assert!(json.contains("\"rows\":"), "{json}");
         assert!(json.contains("\"exclusive_ns\":"), "{json}");
+        assert!(json.contains("\"copied_bytes\":"), "{json}");
+    }
+
+    #[test]
+    fn join_skips_concat_of_probe_morsels() {
+        let build_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let build = Batch::try_new(
+            build_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+        )
+        .unwrap();
+        let probe_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let mut probe = Vec::new();
+        for i in 0..8 {
+            probe.push(
+                Batch::try_new(
+                    probe_schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(vec![i + 1])),
+                        Arc::new(Int64Array::from(vec![i * 10])),
+                    ],
+                )
+                .unwrap(),
+            );
+        }
+        let mut s = Session::new();
+        s.register("dim", build_schema, vec![build]).unwrap();
+        s.register("fact", probe_schema, probe).unwrap();
+        let sql = "SELECT dim.id, fact.v FROM dim JOIN fact ON dim.id = fact.k";
+        let out = s.execute_sql(sql).unwrap();
+        let n: usize = out.iter().map(Batch::num_rows).sum();
+        assert_eq!(n, 3);
+        let metrics = s.query_metrics(sql).unwrap();
+        let text = s.explain_analyze(sql).unwrap();
+        assert!(text.contains("copied_bytes="), "{text}");
+        let mut nodes = Vec::new();
+        metrics.walk(&mut nodes);
+        let join = nodes
+            .iter()
+            .find(|n| n.name == "HashJoin")
+            .expect("HashJoin");
+        assert_eq!(
+            join.copied_bytes, 0,
+            "probe morsels must not be concatenated: {join:?}"
+        );
+    }
+
+    #[test]
+    fn left_join_keeps_unmatched_rows_once_across_probe_morsels() {
+        let left_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let left = Batch::try_new(
+            left_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 99]))],
+        )
+        .unwrap();
+        let right_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let right = vec![
+            Batch::try_new(
+                right_schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1_i64]))],
+            )
+            .unwrap(),
+            Batch::try_new(
+                right_schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![2_i64]))],
+            )
+            .unwrap(),
+        ];
+        let mut s = Session::new();
+        s.register("dim", left_schema, vec![left]).unwrap();
+        s.register("fact", right_schema, right).unwrap();
+        let out = s
+            .execute_sql("SELECT dim.id, fact.k FROM dim LEFT JOIN fact ON dim.id = fact.k")
+            .unwrap();
+        let mut pairs: Vec<(Option<i64>, Option<i64>)> = Vec::new();
+        for batch in &out {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let ks = batch
+                .column_by_name("k")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                pairs.push((
+                    if ids.is_null(i) {
+                        None
+                    } else {
+                        Some(ids.value(i))
+                    },
+                    if ks.is_null(i) {
+                        None
+                    } else {
+                        Some(ks.value(i))
+                    },
+                ));
+            }
+        }
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![(Some(1), Some(1)), (Some(2), Some(2)), (Some(99), None),]
+        );
     }
 
     #[test]

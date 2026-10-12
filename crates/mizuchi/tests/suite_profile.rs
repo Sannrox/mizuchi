@@ -2,7 +2,8 @@
 //!
 //! Drives shipped [`mizuchi::Session::query_metrics`] on the tiny in-memory
 //! generator. Exclusive operator time (`elapsed_ns` minus children) is the
-//! physical-plan CPU profile; `peak_bytes` is the pool high-water. Times are
+//! physical-plan CPU profile; `peak_bytes` is the pool high-water and
+//! `copied_bytes` counts concat/take rewrites. Times are
 //! not hardcoded: the test checks operator mix and tree invariants. SF1 wall
 //! times and ranked limiters live in `docs/bench/limiters.md`.
 
@@ -59,6 +60,11 @@ fn tiny_suite_query_metrics_rank_operators() {
             "{} json {json}",
             spec.id
         );
+        assert!(
+            json.contains("\"copied_bytes\":"),
+            "{} json {json}",
+            spec.id
+        );
         let ranked_json = metrics.ranked_exclusive_json();
         assert!(
             ranked_json.starts_with('['),
@@ -69,9 +75,10 @@ fn tiny_suite_query_metrics_rank_operators() {
         let ranked = metrics.ranked_exclusive();
         assert!(!ranked.is_empty(), "{}", spec.id);
         println!(
-            "{} peak_bytes={} ranked={}",
+            "{} peak_bytes={} copied_bytes={} ranked={}",
             spec.id,
             metrics.peak_bytes,
+            metrics.copied_bytes,
             ranked
                 .iter()
                 .map(|n| format!("{}:{}", n.name, n.exclusive_ns()))

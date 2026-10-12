@@ -3,7 +3,8 @@
 //! A batch is a standard [`RecordBatch`]. Cloning an owned batch is cheap:
 //! arrays share Arrow buffers through `Arc`.
 
-use arrow::array::{ArrayRef, RecordBatch};
+use arrow::array::{ArrayRef, RecordBatch, UInt32Array};
+use arrow::compute::take;
 use arrow::datatypes::SchemaRef;
 
 use crate::error::{Error, Result};
@@ -131,6 +132,25 @@ impl Batch {
         self.inner.column_by_name(name)
     }
 
+    /// Select rows by index. A contiguous run is a zero-copy slice.
+    pub fn gather(&self, indices: &[u32]) -> Result<Self> {
+        if indices.is_empty() {
+            return Self::empty(self.schema());
+        }
+        if let Some((offset, length)) = contiguous_indices(indices) {
+            return self.slice(offset, length);
+        }
+        let idx = UInt32Array::from(indices.to_vec());
+        let mut columns = Vec::with_capacity(self.num_columns());
+        for col in self.as_arrow().columns() {
+            columns.push(
+                take(col.as_ref(), &idx, None)
+                    .map_err(|err| Error::InvalidBatch(err.to_string()))?,
+            );
+        }
+        Self::try_new(self.schema(), columns)
+    }
+
     /// Zero-copy window of `length` rows starting at `offset`.
     pub fn slice(&self, offset: usize, length: usize) -> Result<Self> {
         let rows = self.num_rows();
@@ -171,6 +191,20 @@ impl Batch {
         }
         out
     }
+}
+
+/// Contiguous increasing indices `[start, start+1, …]` with no null sentinels.
+pub(crate) fn contiguous_indices(indices: &[u32]) -> Option<(usize, usize)> {
+    let first = *indices.first()?;
+    if first == u32::MAX {
+        return None;
+    }
+    for (i, &idx) in indices.iter().enumerate() {
+        if idx == u32::MAX || idx != first.checked_add(i as u32)? {
+            return None;
+        }
+    }
+    Some((first as usize, indices.len()))
 }
 
 impl AsRef<RecordBatch> for Batch {
@@ -309,6 +343,25 @@ mod tests {
         assert!(batch.slice(3, 2).is_err());
         assert!(batch.slice(4, 0).is_ok());
         assert!(batch.slice(5, 0).is_err());
+    }
+
+    #[test]
+    fn gather_slices_contiguous_indices() {
+        let (ids, _, batch) = sample();
+        let mid = batch.gather(&[1, 2]).unwrap();
+        assert_eq!(mid.num_rows(), 2);
+        let sliced_ids = mid.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let parent = ids.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(sliced_ids.values().as_ptr(), parent.values()[1..].as_ptr());
+        let scattered = batch.gather(&[3, 0, 2]).unwrap();
+        assert_eq!(scattered.num_rows(), 3);
+        let taken = scattered
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_ne!(taken.values().as_ptr(), parent.values().as_ptr());
+        assert!(batch.gather(&[]).unwrap().num_rows() == 0);
     }
 
     #[test]
