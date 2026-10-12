@@ -3,13 +3,16 @@
 //! Equality conjuncts in `ON` become hash keys. Inner joins build the smaller
 //! collected side (row count after filters). Other join types probe left and
 //! build right. Keys are hashed in place; a single integer column uses the
-//! value as the map key. Null keys never match. Non-equality conjuncts are a
+//! value as the map key. Inner probe ranges run on `Session::workers` threads.
+//! Null keys never match. Non-equality conjuncts are a
 //! residual filter on candidate pairs. Joins without an equality key
 //! (including CROSS) use a nested loop. LEFT SEMI / ANTI emit the left schema
 //! only.
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::Mutex;
+use std::thread;
 
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray, RecordBatch, UInt32Array,
@@ -44,6 +47,7 @@ pub(super) fn run(
     policy: &BatchPolicy,
     pool: &MemoryPool,
     cancel: &CancelToken,
+    workers: usize,
 ) -> Result<Vec<Batch>> {
     let left_chunks = collect_chunks(&mut left, spec.left_schema.clone(), pool, cancel)?;
     let right_chunks = collect_chunks(&mut right, spec.right_schema.clone(), pool, cancel)?;
@@ -67,7 +71,7 @@ pub(super) fn run(
         let l = load_chunk(l, spec.left_schema.clone())?;
         for r in &right_chunks {
             let r = load_chunk(r, spec.right_schema.clone())?;
-            parts.push(join_pair(&l, &r, &spec, policy)?);
+            parts.push(join_pair(&l, &r, &spec, policy, workers)?);
         }
     }
     Ok(parts
@@ -338,6 +342,7 @@ fn join_pair(
     right_batch: &Batch,
     spec: &JoinSpec<'_>,
     policy: &BatchPolicy,
+    workers: usize,
 ) -> Result<Vec<Batch>> {
     let left_ncols = left_batch.num_columns();
     let split = match spec.on {
@@ -363,6 +368,7 @@ fn join_pair(
             &split.keys,
             split.residual.as_ref(),
             spec.schema.clone(),
+            workers,
         )?
     };
     Ok(out
@@ -387,6 +393,7 @@ fn concat_exec(exec: &mut dyn Operator, schema: SchemaRef, cancel: &CancelToken)
     Batch::from_arrow(inner)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hash_join(
     left: &Batch,
     right: &Batch,
@@ -394,6 +401,7 @@ fn hash_join(
     eq_keys: &[(Expr, Expr)],
     residual: Option<&Expr>,
     schema: SchemaRef,
+    workers: usize,
 ) -> Result<Batch> {
     let left_keys: Vec<ArrayRef> = eq_keys
         .iter()
@@ -405,7 +413,16 @@ fn hash_join(
         .collect::<Result<_>>()?;
 
     if join_type == JoinType::Inner && left.num_rows() < right.num_rows() {
-        return inner_hash_join(left, right, &left_keys, &right_keys, residual, schema, true);
+        return inner_hash_join(
+            left,
+            right,
+            &left_keys,
+            &right_keys,
+            residual,
+            schema,
+            true,
+            workers,
+        );
     }
     if join_type == JoinType::Inner {
         return inner_hash_join(
@@ -416,6 +433,7 @@ fn hash_join(
             residual,
             schema,
             false,
+            workers,
         );
     }
 
@@ -471,6 +489,7 @@ fn hash_join(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_hash_join(
     left: &Batch,
     right: &Batch,
@@ -479,6 +498,7 @@ fn inner_hash_join(
     residual: Option<&Expr>,
     schema: SchemaRef,
     build_left: bool,
+    workers: usize,
 ) -> Result<Batch> {
     let (build_keys, probe_keys, n_build, n_probe) = if build_left {
         (left_keys, right_keys, left.num_rows(), right.num_rows())
@@ -486,9 +506,69 @@ fn inner_hash_join(
         (right_keys, left_keys, right.num_rows(), left.num_rows())
     };
     let table = BuildTable::new(build_keys, probe_keys, n_build)?;
+    let n = workers.max(1).min(n_probe.max(1));
+    if n <= 1 {
+        let (left_idx, right_idx) = probe_inner_range(
+            &table, probe_keys, left, right, residual, build_left, 0, n_probe,
+        )?;
+        return hconcat_take(left, right, &left_idx, &right_idx, schema);
+    }
+    let chunk = n_probe.div_ceil(n);
+    let parts = Mutex::new(Vec::new());
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for t in 0..n {
+            let start = t * chunk;
+            let end = (start + chunk).min(n_probe);
+            if start >= end {
+                continue;
+            }
+            let table = &table;
+            let parts = &parts;
+            handles.push(scope.spawn(move || -> Result<()> {
+                let pair = probe_inner_range(
+                    table, probe_keys, left, right, residual, build_left, start, end,
+                )?;
+                parts
+                    .lock()
+                    .map_err(|_| Error::Eval("join probe lock poisoned".into()))?
+                    .push((start, pair));
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join()
+                .map_err(|_| Error::Eval("worker panicked".into()))??;
+        }
+        Ok(())
+    })?;
+    let mut parts = parts
+        .into_inner()
+        .map_err(|_| Error::Eval("join probe lock poisoned".into()))?;
+    parts.sort_by_key(|(start, _)| *start);
     let mut left_idx = Vec::new();
     let mut right_idx = Vec::new();
-    for prow in 0..n_probe {
+    for (_, (l, r)) in parts {
+        left_idx.extend(l);
+        right_idx.extend(r);
+    }
+    hconcat_take(left, right, &left_idx, &right_idx, schema)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_inner_range(
+    table: &BuildTable,
+    probe_keys: &[ArrayRef],
+    left: &Batch,
+    right: &Batch,
+    residual: Option<&Expr>,
+    build_left: bool,
+    start: usize,
+    end: usize,
+) -> Result<(Vec<u32>, Vec<u32>)> {
+    let mut left_idx = Vec::new();
+    let mut right_idx = Vec::new();
+    for prow in start..end {
         table.for_matches(probe_keys, prow, |brow| {
             let (lrow, rrow) = if build_left {
                 (brow, prow as u32)
@@ -502,7 +582,7 @@ fn inner_hash_join(
             Ok(true)
         })?;
     }
-    hconcat_take(left, right, &left_idx, &right_idx, schema)
+    Ok((left_idx, right_idx))
 }
 
 /// Build-side lookup. A single integer column uses the value as the map key;

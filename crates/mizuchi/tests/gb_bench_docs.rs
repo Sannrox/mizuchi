@@ -31,6 +31,7 @@ fn methodology_records_hardware_and_method() {
         "scripts/bench-gb.sh",
         "scripts/profile-suite.sh",
         "query_metrics",
+        "--workers",
     ] {
         assert!(text.contains(needle), "methodology missing {needle}");
     }
@@ -54,6 +55,9 @@ fn results_table_covers_sf1_and_sf10() {
         );
     }
     assert!(text.contains("ratio"), "results missing ratio column");
+    for needle in ["worker scaling", "1 worker", "8 ms"] {
+        assert!(text.contains(needle), "results missing scaling {needle}");
+    }
     // Published times are milliseconds with at least one decimal.
     let has_ms = text.lines().any(|line| {
         line.contains("|")

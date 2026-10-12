@@ -95,6 +95,8 @@ pub struct Session {
     catalog: Catalog,
     policy: BatchPolicy,
     /// Parallel morsel workers. Default 1 keeps the pull iterator path.
+    /// Scan, combinable aggregate, inner join probe, and wrapping
+    /// sort/limit run on this many threads.
     workers: usize,
     /// Caller-provided directory for Arrow IPC shuffle files.
     shuffle_dir: Option<PathBuf>,
@@ -1710,6 +1712,7 @@ fn build_physical(
                 &session.policy,
                 pool,
                 &session.cancel,
+                session.workers,
             )?;
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let (op, node) = metrics::finish(
@@ -2425,10 +2428,11 @@ mod tests {
         let mut s = Session::new();
         s.register("t", l_schema, vec![left]).unwrap();
         s.register("u", r_schema, vec![right]).unwrap();
-        let out = s
-            .execute_sql("SELECT COUNT(*) AS c FROM t JOIN u ON t.a = u.id")
-            .unwrap();
+        let sql = "SELECT COUNT(*) AS c FROM t JOIN u ON t.a = u.id";
+        let out = s.execute_sql(sql).unwrap();
         assert_eq!(col_i64(&out, "c"), vec![Some(1_000)]);
+        let parallel = s.with_workers(4).unwrap().execute_sql(sql).unwrap();
+        assert_eq!(col_i64(&parallel, "c"), vec![Some(1_000)]);
     }
 
     #[test]
@@ -4228,6 +4232,30 @@ mod tests {
         want_rows.sort();
         got_rows.sort();
         assert_eq!(got_rows, want_rows);
+        let avg_sql = "SELECT g, AVG(a) AS v FROM t GROUP BY g ORDER BY g";
+        let want_avg = col_f64(&one.execute_sql(avg_sql).unwrap(), "v");
+        let got_avg = col_f64(&many.execute_sql(avg_sql).unwrap(), "v");
+        assert_eq!(want_avg.len(), got_avg.len());
+        for (w, g) in want_avg.iter().zip(got_avg.iter()) {
+            match (w, g) {
+                (Some(a), Some(b)) => assert!((a - b).abs() < 1e-9, "{a} vs {b}"),
+                (None, None) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        let mut join_s = Session::new();
+        let (t_schema, t_batches) = numbered_batches(16, 64, 0);
+        let (u_schema, u_batches) = numbered_batches(8, 64, 0);
+        join_s.register("t", t_schema, t_batches).unwrap();
+        join_s.register("u", u_schema, u_batches).unwrap();
+        let join_sql = "SELECT COUNT(*) AS c FROM t JOIN u ON t.a = u.a";
+        let one_j = join_s.clone().execute_sql(join_sql).unwrap();
+        let many_j = join_s
+            .with_workers(4)
+            .unwrap()
+            .execute_sql(join_sql)
+            .unwrap();
+        assert_eq!(col_i64(&one_j, "c"), col_i64(&many_j, "c"));
     }
 
     #[test]

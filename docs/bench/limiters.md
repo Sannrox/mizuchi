@@ -17,9 +17,10 @@ on the tiny in-memory generator (`tests/suite_profile.rs`). Release Parquet
 runs use `bash scripts/profile-suite.sh tiny` or `1` when `bench-data/` is
 present; those files stay gitignored.
 
-`EXPLAIN ANALYZE` times the pull operator tree. Combinable aggregates and
-scan/filter/project pipelines may use morsel workers on `execute_sql`; joins,
-sorts, and limits stay on the single-thread pull path.
+`EXPLAIN ANALYZE` times the pull operator tree. `execute_sql` with
+`Session::with_workers` > 1 runs scan/filter/project morsels, combinable
+aggregates (AVG merges per-thread sum and count), inner hash-join probe,
+and wrapping sort/limit on that many threads. Join build stays one thread.
 
 ## Operator mix
 
@@ -27,10 +28,10 @@ Same physical shape at every generator scale (tiny, SF1, SF10).
 
 | query | operators | SF1 wall ms | DuckDB ratio |
 | --- | --- | ---: | ---: |
-| tpch_q1 | HashAggregate → Sort over `lineitem` Scan (predicate pushed into Scan) | 780.023 | 0.026 |
-| tpch_q3 | two HashJoins, HashAggregate, Sort/Limit over customer/orders/lineitem | 407.372 | 0.047 |
-| tpch_q6 | HashAggregate (ungrouped SUM) over `lineitem` Scan (predicate pushed into Scan) | 15.828 | 0.354 |
-| tpcds_store_sales | two HashJoins, HashAggregate, Sort over store_sales/item/date_dim | 196.232 | 0.066 |
+| tpch_q1 | HashAggregate → Sort over `lineitem` Scan (predicate pushed into Scan) | 133.510 | 0.149 |
+| tpch_q3 | two HashJoins, HashAggregate, Sort/Limit over customer/orders/lineitem | 338.443 | 0.057 |
+| tpch_q6 | HashAggregate (ungrouped SUM) over `lineitem` Scan (predicate pushed into Scan) | 17.688 | 0.317 |
+| tpcds_store_sales | two HashJoins, HashAggregate, Sort over store_sales/item/date_dim | 93.168 | 0.139 |
 
 Scan-only `tpch_q6` is the closest gap. Grouped aggregation and the three-way
 joins dominate the rest of the suite.
@@ -72,8 +73,8 @@ accumulators.
 q3 (407 ms) and store_sales (196 ms) each build two HashJoins. Equality keys
 hash in place; a single integer column uses the value as the map key. Inner
 joins build the smaller collected side. Null keys never match. Both sides
-are fully materialized before probe. Join is not a morsel pipeline, so extra
-workers do not split the build.
+are fully materialized before probe. Inner probe ranges run on worker
+threads; the hash table is still built on one thread.
 
 ### Copies
 
@@ -84,26 +85,28 @@ smaller than the materialized join sides on q3/store_sales.
 
 ### Scheduling
 
-`Session::with_workers` runs independent scan/filter/project morsels and
-combinable aggregates. HashJoin, Sort, and Limit stay single-threaded pull.
-q3 and store_sales therefore spend their 0.4 s / 0.2 s on one thread
-regardless of the worker count used for the published SF1 numbers.
+`Session::with_workers` runs scan/filter/project morsels, combinable
+aggregates, inner join probe, and wrapping sort/limit. Join build stays
+single-threaded. SF1 q1 is 5.6× at 8 workers versus 1; q3/store_sales
+scale about 1.4–2.0× because build and materialization remain serial.
 
 ## Ranked limiters
 
 Highest impact first, feeding the follow-up Issues. Rank is exclusive
 operator time at SF1 from `gb_bench profile --sf 1`.
 
-1. **Hash aggregate updates** on q1 (769.3 ms exclusive, peak 349 MiB).
+1. **Hash aggregate updates** on q1 (769.3 ms exclusive on the pull
+   profile; `execute_sql` wall 133.5 ms at 10 workers). Peak 349 MiB.
    [#104](https://github.com/Sannrox/mizuchi/issues/104)
-2. **Hash join build/probe** on q3 (240.2 ms + 64.4 ms exclusive) and
-   store_sales (103.0 ms + 74.1 ms). Peak pool 2.62 GiB / 4.10 GiB.
+2. **Hash join build/probe** on q3 (240.2 ms + 64.4 ms exclusive pull) and
+   store_sales (103.0 ms + 74.1 ms). Peak pool 2.62 GiB / 4.10 GiB. Probe
+   ranges are parallel on `execute_sql`; build is not.
    [#104](https://github.com/Sannrox/mizuchi/issues/104)
 3. **Columnar expression and aggregate kernels** (whole-array filter/project
    and ungrouped COUNT/SUM/AVG/MIN/MAX; grouped lookup hashes Utf8 in place).
    [#103](https://github.com/Sannrox/mizuchi/issues/103)
-4. **Single-thread join/sort** (morsel workers unused on the join plans).
-   [#105](https://github.com/Sannrox/mizuchi/issues/105)
+4. **Join build and materialization** (probe is parallel; both sides still
+   fully collected). [#105](https://github.com/Sannrox/mizuchi/issues/105)
 5. **Batch and key copies** between collect, hash tables, and spill (the
    2–4 GiB peaks). [#107](https://github.com/Sannrox/mizuchi/issues/107)
 6. **Scan/decode working set** (Scan exclusive is 0.77 ms on q1 and 0.06 ms
@@ -111,8 +114,8 @@ operator time at SF1 from `gb_bench profile --sf 1`.
    tables). [#106](https://github.com/Sannrox/mizuchi/issues/106)
 
 q6 stays the control: ungrouped SUM over a pushed-down Scan, 7.4 ms
-HashAggregate exclusive at SF1, published wall 15.8 ms.
-q3 wall dropped from 1536 ms to 407 ms; store_sales from 695 ms to 196 ms.
+HashAggregate exclusive at SF1, published wall 17.7 ms.
+q1 wall dropped from 780 ms to 134 ms with 10 workers.
 
 ## Tiny in-memory profile (default tests)
 
