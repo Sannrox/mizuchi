@@ -2200,6 +2200,7 @@ mod tests {
         assert!(text.contains("rows="), "{text}");
         assert!(text.contains("batches="), "{text}");
         assert!(text.contains("elapsed_ns="), "{text}");
+        assert!(text.contains("exclusive_ns="), "{text}");
         assert!(text.contains("peak_bytes="), "{text}");
 
         let metrics = s.query_metrics(sql).unwrap();
@@ -2209,10 +2210,26 @@ mod tests {
         assert!(metrics.elapsed_ns > 0, "{metrics:?}");
         assert_eq!(metrics.children.len(), 1);
         assert_eq!(metrics.children[0].name, "HashJoin");
+        assert!(metrics.blocking, "HashAggregate is a blocking build");
+        assert!(metrics.children[0].blocking, "HashJoin is a blocking build");
+        let nested: u64 = metrics
+            .children
+            .iter()
+            .filter(|c| !c.blocking)
+            .map(|c| c.elapsed_ns)
+            .sum();
+        assert_eq!(
+            metrics.exclusive_ns(),
+            metrics.elapsed_ns.saturating_sub(nested)
+        );
+        let ranked = metrics.ranked_exclusive();
+        assert!(!ranked.is_empty());
+        assert!(ranked.iter().any(|n| n.name == "HashJoin"), "{ranked:?}");
         let json = metrics.to_json();
         assert!(json.contains("\"name\":\"HashAggregate\""), "{json}");
         assert!(json.contains("\"name\":\"HashJoin\""), "{json}");
         assert!(json.contains("\"rows\":"), "{json}");
+        assert!(json.contains("\"exclusive_ns\":"), "{json}");
     }
 
     #[test]

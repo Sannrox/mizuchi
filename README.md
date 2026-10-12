@@ -137,7 +137,9 @@ bash scripts/bench-gb.sh 10   # SF10
 ```
 
 Method and committed results: [docs/bench/methodology.md](docs/bench/methodology.md),
-[docs/bench/results.md](docs/bench/results.md). Data lands in `bench-data/` (gitignored).
+[docs/bench/results.md](docs/bench/results.md). Operator exclusive-time
+profiles and ranked limiters: [docs/bench/limiters.md](docs/bench/limiters.md)
+(`bash scripts/profile-suite.sh tiny`). Data lands in `bench-data/` (gitignored).
 CI may smoke `scripts/bench-gb.sh tiny` from `.github/workflows/bench-gb.yml` on
 manual dispatch; pull-request CI does not run it.
 
