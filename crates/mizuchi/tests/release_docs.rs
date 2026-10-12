@@ -107,7 +107,12 @@ fn package_list_includes_readme() {
         String::from_utf8_lossy(&out.stderr)
     );
     let list = String::from_utf8_lossy(&out.stdout);
-    for name in ["README.md", "src/lib.rs", "Cargo.toml"] {
+    for name in [
+        "README.md",
+        "src/lib.rs",
+        "Cargo.toml",
+        "schemas/query-api-v1.json",
+    ] {
         assert!(
             list.lines().any(|l| l == name),
             "package list missing {name}:\n{list}"

@@ -94,8 +94,7 @@ fn spill_hash(
     if finished.is_empty() {
         return Ok(());
     }
-    let path = pool.spill_path()?;
-    memory::write_spill(&path, schema, &finished)?;
+    let path = pool.write_spill_file(schema, &finished)?;
     partials.push(path);
     Ok(())
 }

@@ -24,7 +24,7 @@ pub(super) fn run(
     for anchor in anchors {
         working.extend(collect(
             super::physical_with_work(anchor, session, pool, analyze, None)?,
-            &session.cancel,
+            &session.exec_token(),
         )?);
     }
     // Seed batches stay live as the first working table while `out` holds a copy.
@@ -33,7 +33,7 @@ pub(super) fn run(
     let mut out = working.clone();
     let mut iter = 0u32;
     loop {
-        session.cancel.check()?;
+        session.exec_token().check()?;
         if working.iter().all(|b| b.num_rows() == 0) {
             break;
         }
@@ -43,7 +43,7 @@ pub(super) fn run(
         }
         working = collect(
             super::physical_with_work(step, session, pool, analyze, Some((name, &working)))?,
-            &session.cancel,
+            &session.exec_token(),
         )?;
         // The step result stays live as the next working table; reserve the
         // extra copy that `out` will hold.

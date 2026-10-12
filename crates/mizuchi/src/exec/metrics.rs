@@ -133,7 +133,7 @@ impl OperatorMetrics {
 }
 
 #[derive(Default)]
-pub(super) struct Counters {
+pub(crate) struct Counters {
     rows: AtomicU64,
     batches: AtomicU64,
     elapsed_ns: AtomicU64,
@@ -142,7 +142,7 @@ pub(super) struct Counters {
     blocking: AtomicBool,
 }
 
-pub(super) struct PhysNode {
+pub(crate) struct PhysNode {
     pub name: &'static str,
     pub metrics: Arc<Counters>,
     pub children: Vec<PhysNode>,

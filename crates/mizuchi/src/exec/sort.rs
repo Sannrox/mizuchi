@@ -157,9 +157,7 @@ fn spill_sorted_run(
         pool,
         cancel,
     )?;
-    let path = pool.spill_path()?;
-    memory::write_spill(&path, schema, &sorted)?;
-    Ok(path)
+    pool.write_spill_file(schema, &sorted)
 }
 
 fn batches_to_exec(batches: Vec<Batch>, _schema: SchemaRef) -> Box<dyn Operator> {
@@ -179,8 +177,7 @@ fn merge_spilled(
         let left = memory::read_spill(&a, schema.clone())?;
         let right = memory::read_spill(&b, schema.clone())?;
         let merged = merge_sorted_batches(left, right, schema.clone(), order, pool, cancel)?;
-        let path = pool.spill_path()?;
-        memory::write_spill(&path, schema.clone(), &merged)?;
+        let path = pool.write_spill_file(schema.clone(), &merged)?;
         runs.push(path);
     }
     match runs.pop() {

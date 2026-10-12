@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Sannrox/mizuchi/schemas/query-api-v1.json",
+  "title": "mizuchi query API v1",
+  "description": "Contract mizuchi.query-api/v1. Clients vendor this file and generate types from it.",
+  "type": "object",
+  "$defs": {
+    "Health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "contract", "version"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "contract": { "const": "mizuchi.query-api/v1" },
+        "version": { "type": "string" }
+      }
+    },
+    "QueryStatus": {
+      "type": "string",
+      "enum": ["running", "completed", "failed", "cancelled"]
+    },
+    "InputScan": {
+      "type": "object",
+      "required": ["dataset", "partitions", "columns"],
+      "properties": {
+        "dataset": { "type": "string" },
+        "path": { "type": ["string", "null"] },
+        "partitions": { "type": "array", "items": { "type": "string" } },
+        "columns": { "type": "array", "items": { "type": "string" } },
+        "mtime_ms": { "type": ["integer", "null"] },
+        "etag": { "type": ["string", "null"] }
+      }
+    },
+    "OutputWrite": {
+      "type": "object",
+      "required": ["path", "partitions", "mode", "rows", "bytes", "commit_id"],
+      "properties": {
+        "path": { "type": "string" },
+        "partitions": { "type": "array", "items": { "type": "string" } },
+        "mode": { "type": "string" },
+        "rows": { "type": "integer", "minimum": 0 },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "commit_id": { "type": "string" }
+      }
+    },
+    "QueryReport": {
+      "type": "object",
+      "required": ["engine_version", "plan", "inputs", "outputs"],
+      "properties": {
+        "engine_version": { "type": "string" },
+        "plan": { "type": "string" },
+        "inputs": { "type": "array", "items": { "$ref": "#/$defs/InputScan" } },
+        "outputs": { "type": "array", "items": { "$ref": "#/$defs/OutputWrite" } }
+      }
+    },
+    "OperatorMetrics": {
+      "type": "object",
+      "required": [
+        "name",
+        "rows",
+        "batches",
+        "elapsed_ns",
+        "exclusive_ns",
+        "blocking",
+        "peak_bytes",
+        "copied_bytes",
+        "children"
+      ],
+      "properties": {
+        "name": { "type": "string" },
+        "rows": { "type": "integer", "minimum": 0 },
+        "batches": { "type": "integer", "minimum": 0 },
+        "elapsed_ns": { "type": "integer", "minimum": 0 },
+        "exclusive_ns": { "type": "integer", "minimum": 0 },
+        "blocking": { "type": "boolean" },
+        "peak_bytes": { "type": "integer", "minimum": 0 },
+        "copied_bytes": { "type": "integer", "minimum": 0 },
+        "spilled_bytes": { "type": "integer", "minimum": 0 },
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/OperatorMetrics" }
+        }
+      }
+    },
+    "Query": {
+      "type": "object",
+      "required": [
+        "id",
+        "sql",
+        "status",
+        "started_at_us",
+        "ended_at_us",
+        "duration_ns",
+        "rows",
+        "peak_bytes",
+        "spilled_bytes"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "sql": { "type": "string" },
+        "status": { "$ref": "#/$defs/QueryStatus" },
+        "started_at_us": { "type": "integer", "minimum": 0 },
+        "ended_at_us": { "type": ["integer", "null"] },
+        "duration_ns": { "type": "integer", "minimum": 0 },
+        "rows": { "type": "integer", "minimum": 0 },
+        "peak_bytes": { "type": "integer", "minimum": 0 },
+        "spilled_bytes": { "type": "integer", "minimum": 0 },
+        "error": { "type": ["string", "null"] },
+        "plan": { "type": ["string", "null"] },
+        "report": { "oneOf": [{ "$ref": "#/$defs/QueryReport" }, { "type": "null" }] },
+        "metrics": { "oneOf": [{ "$ref": "#/$defs/OperatorMetrics" }, { "type": "null" }] }
+      }
+    },
+    "QueryList": {
+      "type": "object",
+      "required": ["queries", "total", "offset", "limit"],
+      "properties": {
+        "queries": { "type": "array", "items": { "$ref": "#/$defs/Query" } },
+        "total": { "type": "integer", "minimum": 0 },
+        "offset": { "type": "integer", "minimum": 0 },
+        "limit": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "RunningQuery": {
+      "type": "object",
+      "required": ["id", "sql", "status", "started_at_us", "elapsed_ns", "stage"],
+      "properties": {
+        "id": { "type": "string" },
+        "sql": { "type": "string" },
+        "status": { "const": "running" },
+        "started_at_us": { "type": "integer", "minimum": 0 },
+        "elapsed_ns": { "type": "integer", "minimum": 0 },
+        "stage": { "type": "string" }
+      }
+    },
+    "RunningList": {
+      "type": "object",
+      "required": ["queries"],
+      "properties": {
+        "queries": { "type": "array", "items": { "$ref": "#/$defs/RunningQuery" } }
+      }
+    },
+    "CancelResult": {
+      "type": "object",
+      "required": ["id", "cancelled"],
+      "properties": {
+        "id": { "type": "string" },
+        "cancelled": { "type": "boolean" }
+      }
+    },
+    "ErrorBody": {
+      "type": "object",
+      "required": ["error"],
+      "properties": {
+        "error": { "type": "string" }
+      }
+    }
+  }
+}

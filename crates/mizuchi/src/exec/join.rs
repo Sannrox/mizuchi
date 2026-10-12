@@ -77,7 +77,7 @@ pub(super) fn run(
                 let l = load_chunk(l, spec.left_schema.clone(), pool)?;
                 for r in &right_chunks {
                     let r = load_chunk(r, spec.right_schema.clone(), pool)?;
-                    parts.push(join_pair(&l, &r, &spec, policy, workers, pool)?);
+                    parts.push(join_pair(&l, &r, &spec, policy, workers, pool, cancel)?);
                 }
             }
             return Ok(parts
@@ -89,9 +89,9 @@ pub(super) fn run(
         let left = take_batches(left_chunks, spec.left_schema.clone())?;
         let right = take_batches(right_chunks, spec.right_schema.clone())?;
         if left.len() == 1 && right.len() == 1 {
-            return join_pair(&left[0], &right[0], &spec, policy, workers, pool);
+            return join_pair(&left[0], &right[0], &spec, policy, workers, pool, cancel);
         }
-        return hash_join_streamed(&left, &right, &spec, policy, workers, pool);
+        return hash_join_streamed(&left, &right, &spec, policy, workers, pool, cancel);
     }
     // Unmatched rows for LEFT/RIGHT/FULL are relative to the whole opposite
     // side. Concatenate once, then emit unmatched rows a single time.
@@ -105,7 +105,7 @@ pub(super) fn run(
         spec.right_schema.clone(),
         pool,
     )?;
-    join_pair(&left, &right, &spec, policy, workers, pool)
+    join_pair(&left, &right, &spec, policy, workers, pool, cancel)
 }
 
 /// Inner join whose output is aggregated immediately so the wide join
@@ -123,9 +123,18 @@ pub(super) fn run_then_agg(
 ) -> Result<Vec<Batch>> {
     let mut left = left;
     let mut right = right;
-    let left_chunks = collect_chunks(&mut left, spec.left_schema.clone(), pool, &session.cancel)?;
-    let right_chunks =
-        collect_chunks(&mut right, spec.right_schema.clone(), pool, &session.cancel)?;
+    let left_chunks = collect_chunks(
+        &mut left,
+        spec.left_schema.clone(),
+        pool,
+        &session.exec_token(),
+    )?;
+    let right_chunks = collect_chunks(
+        &mut right,
+        spec.right_schema.clone(),
+        pool,
+        &session.exec_token(),
+    )?;
     if pool.has_limit() {
         let mut joined = Vec::new();
         for l in &left_chunks {
@@ -139,6 +148,7 @@ pub(super) fn run_then_agg(
                     &session.policy,
                     session.workers,
                     pool,
+                    &session.exec_token(),
                 )?);
             }
         }
@@ -155,7 +165,7 @@ pub(super) fn run_then_agg(
             out_schema,
             &session.policy,
             pool,
-            &session.cancel,
+            &session.exec_token(),
         );
     }
     let left = take_batches(left_chunks, spec.left_schema.clone())?;
@@ -184,6 +194,7 @@ pub(super) fn run_then_agg(
                 &session.policy,
                 session.workers,
                 pool,
+                &session.exec_token(),
             )?);
         }
     }
@@ -196,13 +207,15 @@ pub(super) fn run_then_agg(
         chunks[i % n].push(batch);
     }
     let tables = Mutex::new(Vec::new());
+    let token = session.exec_token();
     thread::scope(|scope| -> Result<()> {
         let mut handles = Vec::new();
         for chunk in chunks {
             let tables = &tables;
             let out_schema = out_schema.clone();
+            let token = &token;
             handles.push(scope.spawn(move || -> Result<()> {
-                session.cancel.check()?;
+                token.check()?;
                 let table = agg::fold_batches(chunk, group, aggs, out_schema)?;
                 tables
                     .lock()
@@ -361,7 +374,7 @@ fn fold_into_unique_slots(
     if one_f64_sum {
         let mut sums = agg::BuildF64Sums::new(out_schema.clone(), group.len(), n_build);
         for probe in probe_batches {
-            session.cancel.check()?;
+            session.exec_token().check()?;
             if probe.num_rows() == 0 {
                 continue;
             }
@@ -389,13 +402,15 @@ fn fold_into_unique_slots(
     if unique_groups {
         let parts = Mutex::new(Vec::new());
         let parts_ref = &parts;
+        let token = session.exec_token();
         thread::scope(|scope| -> Result<()> {
             let mut handles = Vec::new();
             for _ in 0..n {
                 let out_schema = out_schema.clone();
                 let queue = &queue;
+                let token = &token;
                 handles.push(scope.spawn(move || -> Result<()> {
-                    session.cancel.check()?;
+                    token.check()?;
                     let mut slots_acc = agg::BuildSlots::new(group, aggs, out_schema, n_build)?;
                     drain_probe_queue(
                         queue,
@@ -404,6 +419,7 @@ fn fold_into_unique_slots(
                         probe_aggs,
                         min,
                         slots,
+                        token,
                         |brow, arg_cols, prow| slots_acc.add(brow, arg_cols, prow),
                     )?;
                     parts_ref
@@ -432,13 +448,15 @@ fn fold_into_unique_slots(
     }
     let tables = Mutex::new(Vec::new());
     let tables_ref = &tables;
+    let token = session.exec_token();
     thread::scope(|scope| -> Result<()> {
         let mut handles = Vec::new();
         for _ in 0..n {
             let out_schema = out_schema.clone();
             let queue = &queue;
+            let token = &token;
             handles.push(scope.spawn(move || -> Result<()> {
-                session.cancel.check()?;
+                token.check()?;
                 let mut fold = agg::BuildFold::new(group, aggs, out_schema, n_build)?;
                 drain_probe_queue(
                     queue,
@@ -447,6 +465,7 @@ fn fold_into_unique_slots(
                     probe_aggs,
                     min,
                     slots,
+                    token,
                     |brow, arg_cols, prow| fold.add(group_cols, brow, arg_cols, prow),
                 )?;
                 tables_ref
@@ -474,6 +493,7 @@ fn fold_into_unique_slots(
     )?))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_probe_queue(
     queue: &Mutex<Vec<usize>>,
     probe_batches: &[Batch],
@@ -481,9 +501,11 @@ fn drain_probe_queue(
     probe_aggs: &[AggCall],
     min: i128,
     slots: &[u32],
+    cancel: &CancelToken,
     mut on_match: impl FnMut(usize, &[Option<ArrayRef>], usize) -> Result<()>,
 ) -> Result<()> {
     loop {
+        cancel.check()?;
         let i = {
             let mut q = queue
                 .lock()
@@ -632,8 +654,7 @@ fn collect_chunks(
 
 fn spill_chunk(cur: &[Batch], schema: SchemaRef, pool: &MemoryPool) -> Result<Chunk> {
     let batch = concat_chunk(cur, schema.clone(), pool)?;
-    let path = pool.spill_path()?;
-    memory::write_spill(&path, schema, std::slice::from_ref(&batch))?;
+    let path = pool.write_spill_file(schema, std::slice::from_ref(&batch))?;
     Ok(Chunk::File(path))
 }
 
@@ -847,6 +868,7 @@ fn join_pair(
     policy: &BatchPolicy,
     workers: usize,
     pool: &MemoryPool,
+    cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
     let left_ncols = left_batch.num_columns();
     let split = match spec.on {
@@ -893,6 +915,7 @@ fn join_pair(
             workers,
             policy,
             pool,
+            cancel,
         );
     }
     let out = hash_join(
@@ -921,6 +944,7 @@ fn hash_join_streamed(
     policy: &BatchPolicy,
     workers: usize,
     pool: &MemoryPool,
+    cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
     let left_ncols = spec.left_schema.fields().len();
     let split = match spec.on {
@@ -933,7 +957,7 @@ fn hash_join_streamed(
     if split.keys.is_empty() {
         let l = concat_chunk(left, spec.left_schema.clone(), pool)?;
         let r = concat_chunk(right, spec.right_schema.clone(), pool)?;
-        return join_pair(&l, &r, spec, policy, workers, pool);
+        return join_pair(&l, &r, spec, policy, workers, pool, cancel);
     }
     let ln: usize = left.iter().map(Batch::num_rows).sum();
     let rn: usize = right.iter().map(Batch::num_rows).sum();
@@ -982,6 +1006,7 @@ fn hash_join_streamed(
     if n <= 1 {
         let mut out = Vec::new();
         for probe in probe_batches {
+            cancel.check()?;
             out.extend(probe_inner_batch(
                 &table,
                 &build,
@@ -1008,6 +1033,7 @@ fn hash_join_streamed(
             let probe_key_exprs = &probe_key_exprs;
             handles.push(scope.spawn(move || -> Result<()> {
                 loop {
+                    cancel.check()?;
                     let i = {
                         let mut q = queue
                             .lock()
@@ -1227,6 +1253,7 @@ fn inner_hash_join(
     workers: usize,
     policy: &BatchPolicy,
     pool: &MemoryPool,
+    cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
     let (build_keys, probe_keys, n_build, n_probe) = if build_left {
         (left_keys, right_keys, left.num_rows(), right.num_rows())
@@ -1237,10 +1264,11 @@ fn inner_hash_join(
     let n = workers.max(1).min(n_probe.max(1));
     if residual.is_none() && table.has_unique_i64(probe_keys) {
         return unique_i64_join(
-            &table, probe_keys, left, right, build_left, schema, n, policy, pool,
+            &table, probe_keys, left, right, build_left, schema, n, policy, pool, cancel,
         );
     }
     if n <= 1 {
+        cancel.check()?;
         let (left_idx, right_idx) = probe_inner_range(
             &table, probe_keys, left, right, residual, build_left, 0, n_probe, pool,
         )?;
@@ -1259,6 +1287,7 @@ fn inner_hash_join(
             let table = &table;
             let parts = &parts;
             handles.push(scope.spawn(move || -> Result<()> {
+                cancel.check()?;
                 let pair = probe_inner_range(
                     table, probe_keys, left, right, residual, build_left, start, end, pool,
                 )?;
@@ -1299,6 +1328,7 @@ fn unique_i64_join(
     workers: usize,
     policy: &BatchPolicy,
     pool: &MemoryPool,
+    cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
     let n_probe = if build_left {
         right.num_rows()
@@ -1307,6 +1337,7 @@ fn unique_i64_join(
     };
     let n = workers.max(1).min(n_probe.max(1));
     if n <= 1 {
+        cancel.check()?;
         let (left_idx, right_idx) = table
             .probe_unique_i64(probe_keys, build_left)?
             .ok_or_else(|| Error::Eval("expected unique i64 join map".into()))?;
@@ -1324,6 +1355,7 @@ fn unique_i64_join(
                 continue;
             }
             handles.push(scope.spawn(move || -> Result<()> {
+                cancel.check()?;
                 let pair = probe_unique_i64_range(table, probe_keys, build_left, start, end)?;
                 parts_ref
                     .lock()
