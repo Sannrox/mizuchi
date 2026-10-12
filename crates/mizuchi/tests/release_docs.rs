@@ -74,6 +74,28 @@ fn library_crate_is_publishable() {
 }
 
 #[test]
+fn python_lock_matches_path_crate() {
+    let out = std::process::Command::new("cargo")
+        .args([
+            "metadata",
+            "--manifest-path",
+            "python/Cargo.toml",
+            "--format-version",
+            "1",
+            "--locked",
+            "--offline",
+        ])
+        .current_dir(root())
+        .output()
+        .expect("cargo metadata python");
+    assert!(
+        out.status.success(),
+        "python/Cargo.lock is stale:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn package_list_includes_readme() {
     let out = std::process::Command::new("cargo")
         .args([
