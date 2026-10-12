@@ -254,3 +254,247 @@ fn dict_large_utf8_typed<K: ArrowDictionaryKeyType>(array: &dyn Array, row: usiz
         .ok_or_else(|| Error::Eval("expected LargeUtf8 dictionary values".into()))?;
     Ok(values.value(idx))
 }
+
+pub(super) fn hash_scalars(key: &[Scalar]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Hash one grouping or join key row without allocating `Scalar` / `String`.
+pub(super) fn hash_row(cols: &[ArrayRef], row: usize) -> Result<u64> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cols.len().hash(&mut hasher);
+    for col in cols {
+        hash_cell(col.as_ref(), row, &mut hasher)?;
+    }
+    Ok(hasher.finish())
+}
+
+pub(super) fn hash_cell(array: &dyn Array, row: usize, hasher: &mut impl Hasher) -> Result<()> {
+    if array.is_null(row) {
+        HASH_NULL.hash(hasher);
+        return Ok(());
+    }
+    match array.data_type() {
+        DataType::Null => {
+            HASH_NULL.hash(hasher);
+        }
+        DataType::Boolean => {
+            HASH_BOOL.hash(hasher);
+            array.as_boolean().value(row).hash(hasher);
+        }
+        DataType::Int8 => {
+            HASH_I8.hash(hasher);
+            array.as_primitive::<Int8Type>().value(row).hash(hasher);
+        }
+        DataType::Int16 => {
+            HASH_I16.hash(hasher);
+            array.as_primitive::<Int16Type>().value(row).hash(hasher);
+        }
+        DataType::Int32 => {
+            HASH_I32.hash(hasher);
+            array.as_primitive::<Int32Type>().value(row).hash(hasher);
+        }
+        DataType::Int64 => {
+            HASH_I64.hash(hasher);
+            array.as_primitive::<Int64Type>().value(row).hash(hasher);
+        }
+        DataType::UInt8 => {
+            HASH_U8.hash(hasher);
+            array.as_primitive::<UInt8Type>().value(row).hash(hasher);
+        }
+        DataType::UInt16 => {
+            HASH_U16.hash(hasher);
+            array.as_primitive::<UInt16Type>().value(row).hash(hasher);
+        }
+        DataType::UInt32 => {
+            HASH_U32.hash(hasher);
+            array.as_primitive::<UInt32Type>().value(row).hash(hasher);
+        }
+        DataType::UInt64 => {
+            HASH_U64.hash(hasher);
+            array.as_primitive::<UInt64Type>().value(row).hash(hasher);
+        }
+        DataType::Float32 => {
+            HASH_F32.hash(hasher);
+            canonical_f32(array.as_primitive::<Float32Type>().value(row).to_bits()).hash(hasher);
+        }
+        DataType::Float64 => {
+            HASH_F64.hash(hasher);
+            canonical_f64(array.as_primitive::<Float64Type>().value(row).to_bits()).hash(hasher);
+        }
+        DataType::Utf8 => {
+            HASH_UTF8.hash(hasher);
+            array.as_string::<i32>().value(row).hash(hasher);
+        }
+        DataType::LargeUtf8 => {
+            HASH_UTF8.hash(hasher);
+            array.as_string::<i64>().value(row).hash(hasher);
+        }
+        DataType::Dictionary(_, _) => {
+            HASH_UTF8.hash(hasher);
+            dict_utf8_at(array, row)?.hash(hasher);
+        }
+        dt => {
+            return Err(Error::Eval(format!(
+                "unsupported grouping or join key type: {dt}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn row_has_null(cols: &[ArrayRef], row: usize) -> bool {
+    cols.iter()
+        .any(|c| c.data_type() == &DataType::Null || c.is_null(row))
+}
+
+pub(super) fn row_matches(key: &[Scalar], cols: &[ArrayRef], row: usize) -> Result<bool> {
+    if key.len() != cols.len() {
+        return Ok(false);
+    }
+    for (part, col) in key.iter().zip(cols) {
+        if !cell_matches(part, col.as_ref(), row)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn cell_matches(part: &Scalar, array: &dyn Array, row: usize) -> Result<bool> {
+    if array.is_null(row) {
+        return Ok(*part == Scalar::Null);
+    }
+    Ok(match (part, array.data_type()) {
+        (Scalar::Bool(v), DataType::Boolean) => *v == array.as_boolean().value(row),
+        (Scalar::I8(v), DataType::Int8) => *v == array.as_primitive::<Int8Type>().value(row),
+        (Scalar::I16(v), DataType::Int16) => *v == array.as_primitive::<Int16Type>().value(row),
+        (Scalar::I32(v), DataType::Int32) => *v == array.as_primitive::<Int32Type>().value(row),
+        (Scalar::I64(v), DataType::Int64) => *v == array.as_primitive::<Int64Type>().value(row),
+        (Scalar::U8(v), DataType::UInt8) => *v == array.as_primitive::<UInt8Type>().value(row),
+        (Scalar::U16(v), DataType::UInt16) => *v == array.as_primitive::<UInt16Type>().value(row),
+        (Scalar::U32(v), DataType::UInt32) => *v == array.as_primitive::<UInt32Type>().value(row),
+        (Scalar::U64(v), DataType::UInt64) => *v == array.as_primitive::<UInt64Type>().value(row),
+        (Scalar::F32(v), DataType::Float32) => {
+            Scalar::F32(*v) == Scalar::F32(array.as_primitive::<Float32Type>().value(row).to_bits())
+        }
+        (Scalar::F64(v), DataType::Float64) => {
+            Scalar::F64(*v) == Scalar::F64(array.as_primitive::<Float64Type>().value(row).to_bits())
+        }
+        (Scalar::Utf8(v), DataType::Utf8) => v == array.as_string::<i32>().value(row),
+        (Scalar::Utf8(v), DataType::LargeUtf8) => v == array.as_string::<i64>().value(row),
+        (Scalar::Utf8(v), DataType::Dictionary(_, _)) => v == dict_utf8_at(array, row)?,
+        _ => false,
+    })
+}
+
+/// Compare one key row of `left` to one key row of `right` without allocating.
+pub(super) fn rows_equal(
+    left: &[ArrayRef],
+    lrow: usize,
+    right: &[ArrayRef],
+    rrow: usize,
+) -> Result<bool> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (l, r) in left.iter().zip(right) {
+        if !cells_equal(l.as_ref(), lrow, r.as_ref(), rrow)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn cells_equal(a: &dyn Array, ai: usize, b: &dyn Array, bi: usize) -> Result<bool> {
+    let an = a.is_null(ai);
+    let bn = b.is_null(bi);
+    if an || bn {
+        return Ok(an && bn);
+    }
+    if a.data_type() == b.data_type() {
+        return Ok(match a.data_type() {
+            DataType::Null => true,
+            DataType::Boolean => a.as_boolean().value(ai) == b.as_boolean().value(bi),
+            DataType::Int8 => {
+                a.as_primitive::<Int8Type>().value(ai) == b.as_primitive::<Int8Type>().value(bi)
+            }
+            DataType::Int16 => {
+                a.as_primitive::<Int16Type>().value(ai) == b.as_primitive::<Int16Type>().value(bi)
+            }
+            DataType::Int32 => {
+                a.as_primitive::<Int32Type>().value(ai) == b.as_primitive::<Int32Type>().value(bi)
+            }
+            DataType::Int64 => {
+                a.as_primitive::<Int64Type>().value(ai) == b.as_primitive::<Int64Type>().value(bi)
+            }
+            DataType::UInt8 => {
+                a.as_primitive::<UInt8Type>().value(ai) == b.as_primitive::<UInt8Type>().value(bi)
+            }
+            DataType::UInt16 => {
+                a.as_primitive::<UInt16Type>().value(ai) == b.as_primitive::<UInt16Type>().value(bi)
+            }
+            DataType::UInt32 => {
+                a.as_primitive::<UInt32Type>().value(ai) == b.as_primitive::<UInt32Type>().value(bi)
+            }
+            DataType::UInt64 => {
+                a.as_primitive::<UInt64Type>().value(ai) == b.as_primitive::<UInt64Type>().value(bi)
+            }
+            DataType::Float32 => {
+                canonical_f32(a.as_primitive::<Float32Type>().value(ai).to_bits())
+                    == canonical_f32(b.as_primitive::<Float32Type>().value(bi).to_bits())
+            }
+            DataType::Float64 => {
+                canonical_f64(a.as_primitive::<Float64Type>().value(ai).to_bits())
+                    == canonical_f64(b.as_primitive::<Float64Type>().value(bi).to_bits())
+            }
+            DataType::Utf8 => a.as_string::<i32>().value(ai) == b.as_string::<i32>().value(bi),
+            DataType::LargeUtf8 => a.as_string::<i64>().value(ai) == b.as_string::<i64>().value(bi),
+            DataType::Dictionary(_, _) => dict_utf8_at(a, ai)? == dict_utf8_at(b, bi)?,
+            _ => scalar_at(a, ai)? == scalar_at(b, bi)?,
+        });
+    }
+    Ok(scalar_at(a, ai)? == scalar_at(b, bi)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use std::sync::Arc;
+
+    #[test]
+    fn hash_row_matches_extracted_scalar_key() {
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])),
+            Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])),
+        ];
+        for row in 0..3 {
+            let key = extract_key(&cols, row).unwrap();
+            assert_eq!(hash_row(&cols, row).unwrap(), hash_scalars(&key));
+        }
+        assert_eq!(hash_row(&[], 0).unwrap(), hash_scalars(&[]));
+    }
+
+    #[test]
+    fn rows_equal_matches_scalar_eq_including_nulls() {
+        let left: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])),
+            Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])),
+        ];
+        let right = left.clone();
+        for row in 0..3 {
+            assert!(rows_equal(&left, row, &right, row).unwrap());
+            let key = extract_key(&left, row).unwrap();
+            assert!(row_matches(&key, &right, row).unwrap());
+        }
+        assert!(!rows_equal(&left, 0, &right, 1).unwrap());
+        assert!(row_has_null(&left, 1));
+        assert!(row_has_null(&left, 2));
+        assert!(!row_has_null(&left, 0));
+        let nulls: Vec<ArrayRef> = vec![Arc::new(arrow::array::NullArray::new(2))];
+        assert!(row_has_null(&nulls, 0));
+        assert!(row_has_null(&nulls, 1));
+    }
+}

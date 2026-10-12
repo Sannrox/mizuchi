@@ -6,6 +6,7 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- Hash join and hash aggregate: equality keys hash in place (a single integer column uses the value as the map key). Inner joins build the smaller collected side; the optimizer places the smaller estimated input on the build side from table stats. Micro-benchmarks: `cargo run --release -p mizuchi --example kernel_micro`. SF1 q1/q3/store_sales times in `docs/bench/results.md`.
 - Columnar aggregate updates: ungrouped COUNT/SUM/AVG/MIN/MAX fold whole Arrow arrays (float SUM/AVG through compute kernels; integer SUM stays checked so overflow fails closed). Grouped lookup hashes primitive, Utf8, and dictionary-string cells in place and allocates `Scalar` keys only for new groups. Micro-benchmarks: `cargo run --release -p mizuchi --example kernel_micro`. SF1 q1/q6 times in `docs/bench/results.md`.
 - Workspace skeleton with a placeholder library crate.
 - ADR 0001 (record architecture decisions) and ADR 0002 (own query engine as a side project).

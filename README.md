@@ -105,7 +105,7 @@ cargo test --locked --workspace
 bash scripts/validate-workflow-skills.sh
 ```
 
-Columnar kernel micro-benchmarks (filter, projection, aggregate update):
+Columnar kernel micro-benchmarks (filter, projection, aggregate, hash join):
 
 ```sh
 cargo run --release -p mizuchi --example kernel_micro

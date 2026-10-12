@@ -2372,6 +2372,111 @@ mod tests {
     }
 
     #[test]
+    fn inner_join_matches_when_either_side_is_smaller() {
+        let small: Vec<Option<i64>> = vec![Some(0), Some(1), Some(2)];
+        let large: Vec<Option<i64>> = (0..100).map(|i| Some(i * 2)).collect();
+        fn join(
+            left_vals: &[Option<i64>],
+            right_vals: &[Option<i64>],
+        ) -> Vec<(Option<i64>, Option<i64>)> {
+            let l_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+            let r_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+            let left = Batch::try_new(
+                l_schema.clone(),
+                vec![Arc::new(Int64Array::from(left_vals.to_vec()))],
+            )
+            .unwrap();
+            let right = Batch::try_new(
+                r_schema.clone(),
+                vec![Arc::new(Int64Array::from(right_vals.to_vec()))],
+            )
+            .unwrap();
+            let mut s = Session::new();
+            s.register("t", l_schema, vec![left]).unwrap();
+            s.register("u", r_schema, vec![right]).unwrap();
+            let out = s
+                .execute_sql("SELECT t.a, u.id FROM t JOIN u ON t.a = u.id")
+                .unwrap();
+            sorted_pairs(&out, "a", "id")
+        }
+        let a = join(&small, &large);
+        let b = join(&large, &small);
+        assert_eq!(a, b);
+        assert_eq!(a, vec![(Some(0), Some(0)), (Some(2), Some(2))]);
+    }
+
+    #[test]
+    fn inner_join_one_hundred_thousand_int64_keys() {
+        const N: i64 = 100_000;
+        let l_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let r_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let left = Batch::try_new(
+            l_schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..N))],
+        )
+        .unwrap();
+        let right = Batch::try_new(
+            r_schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(
+                (N / 2)..(N / 2 + 1_000),
+            ))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("t", l_schema, vec![left]).unwrap();
+        s.register("u", r_schema, vec![right]).unwrap();
+        let out = s
+            .execute_sql("SELECT COUNT(*) AS c FROM t JOIN u ON t.a = u.id")
+            .unwrap();
+        assert_eq!(col_i64(&out, "c"), vec![Some(1_000)]);
+    }
+
+    #[test]
+    fn inner_join_utf8_keys_hash_without_extract() {
+        let l_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
+        let r_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+        let left = Batch::try_new(
+            l_schema.clone(),
+            vec![Arc::new(StringArray::from(vec![
+                Some("red"),
+                Some("blue"),
+                None,
+                Some("red"),
+            ]))],
+        )
+        .unwrap();
+        let right = Batch::try_new(
+            r_schema.clone(),
+            vec![Arc::new(StringArray::from(vec![
+                Some("blue"),
+                Some("green"),
+                Some("red"),
+            ]))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("t", l_schema, vec![left]).unwrap();
+        s.register("u", r_schema, vec![right]).unwrap();
+        let out = s
+            .execute_sql("SELECT t.a, u.id FROM t JOIN u ON t.a = u.id")
+            .unwrap();
+        let mut got: Vec<(String, String)> = col_utf8(&out, "a")
+            .into_iter()
+            .zip(col_utf8(&out, "id"))
+            .map(|(a, b)| (a.unwrap(), b.unwrap()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("blue".into(), "blue".into()),
+                ("red".into(), "red".into()),
+                ("red".into(), "red".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn join_type_matrix_matches_reference() {
         let s = join_session();
         let cases = [
