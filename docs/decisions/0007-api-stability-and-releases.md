@@ -47,14 +47,21 @@ in the next 0.y.
 
 1. Move `CHANGELOG.md` Unreleased notes into a versioned section.
 2. Tag `v<version>` on `main`.
-3. CI on that tag (and `workflow_dispatch`) dry-runs `cargo publish` for
-   `mizuchi` and builds Python wheels on Linux, macOS, and Windows.
+3. CI on that tag (and `workflow_dispatch`) packages every published
+   workspace crate and dry-runs `cargo publish` for `mizuchi-core` (no
+   unpublished path deps), then builds Python wheels on Linux, macOS,
+   and Windows. A maintainer publishes `mizuchi-core`, `mizuchi-plan`,
+   `mizuchi-io`, `mizuchi-postgres`, `mizuchi-exec`, and `mizuchi` in
+   that order (ADR 0013). `mizuchi-flight` publishes with the Flight
+   feature set.
 4. A maintainer publishes to crates.io and PyPI only after that job is
    green, using tokens stored as GitHub secrets. The workflow does not
    upload by default.
 
-The `mizuchi` crate may be packaged (`publish = true`). The Python
-cdylib crate stays `publish = false`; it ships as a wheel.
+The `mizuchi` crate may be packaged (`publish = true`) with license,
+readme, repository, and keywords. The Python cdylib crate stays
+`publish = false`; it ships as a wheel. Tag `v0.1.0` only after the
+dry-run job on that tag is green; 0.1 is experimental.
 
 ## Consequences
 

@@ -3,9 +3,10 @@
 An Arrow-native query and transform engine written in Rust. Single-node first,
 distributed later.
 
-> Status: side project, pre-alpha. Nothing executes yet. Transform runners keep
-> using existing engines until mizuchi passes a defined bar
-> (see [ADR 0002](docs/decisions/0002-own-query-engine.md)).
+> Status: side project, experimental 0.1. Embedding runners should keep using
+> their current engines until mizuchi passes a defined bar
+> (see [ADR 0002](docs/decisions/0002-own-query-engine.md)). A 0.y release may
+> break the public surface.
 
 ## Goals
 
@@ -22,12 +23,18 @@ distributed later.
   ([coverage](docs/sql-coverage.md)) and benchmark comparisons against DuckDB
   and DataFusion.
 
-## Architecture (planned)
+## Architecture
 
 ```text
 SQL / DataFrame -> logical plan -> optimizer -> physical plan -> execution
                                                      (vectorized, morsel-driven)
 ```
+
+Workspace crates (ADR [0013](docs/decisions/0013-workspace-crate-graph.md)):
+`mizuchi-core` (batches, expressions, cancellation), `mizuchi-plan` (SQL and
+optimizer), `mizuchi-io` (files and lake tables), `mizuchi-postgres`,
+`mizuchi-exec` (operators and `Session`), `mizuchi-flight` (optional), and
+the `mizuchi` facade that embedders depend on.
 
 ## Roadmap
 
@@ -44,15 +51,20 @@ Tracked as GitHub Issues and milestones:
 
 ## Embedding
 
-Runners open a [`Session`](crates/mizuchi/src/exec/mod.rs) from
+Runners open a [`Session`](crates/mizuchi-exec/src/lib.rs) from
 `SessionConfig` (memory limit, worker count, spill directory, allowed
 read/write paths, network grant), register Arrow record batches,
 Parquet/CSV/JSON/Avro/ORC files, Delta or Iceberg snapshots, or an
-Arrow C stream, and pull result batches. Cooperative cancellation is a
+Arrow C stream, and pull result batches. Parquet reads project to
+requested columns, skip row groups and pages that cannot match
+(`ParquetReadOptions::filters`), and late-materialize remaining columns. Cooperative cancellation is a
 `CancelToken`. `execute_sql_reported` / `write_parquet_reported` return
 a `QueryReport` (inputs after partition prune, outputs, version, plan).
 `write_delta` / `write_iceberg` commit a new snapshot; `TimeTravel`
-reads a past version. `Session::merge_sql` runs `MERGE INTO`.
+reads a past version. The same commits run on a caller-supplied
+`ObjectStore` (`write_delta_store` / `write_iceberg_store`).
+`IcebergRestCatalog` is a `CatalogProvider` for the Iceberg REST
+protocol (TCP only with `allow_network`). `Session::merge_sql` runs `MERGE INTO`.
 `Session::stream_query` opens a continuous micro-batch query
 (`StreamQuery`) with event-time watermarks, windows, and a
 checkpointed Parquet sink (ADR 0009).
@@ -60,6 +72,14 @@ checkpointed Parquet sink (ADR 0009).
 optionally from a directory of JSON + Arrow schema files
 (`Catalog::open_file`). `Session::execute_ddl` runs `CREATE` / `DROP` /
 `ALTER TABLE`; `SHOW TABLES` lists a namespace (ADR 0010).
+`SessionConfig.query_api` (off by default) records query history and
+serves a versioned HTTP API (`/v1`, contract `mizuchi.query-api/v1` in
+`/healthz`) so external UIs can list completed queries, inspect plans and
+operator metrics, watch running queries, and cancel (ADR 0012). The JSON
+schema is `crates/mizuchi-exec/schemas/query-api-v1.json`. Bind address, optional bearer
+token, history path, and optional unpacked console directory (`ui_dir`, served
+at `/ui/`) are set by the embedder (ADR 0014); loopback listens do not
+require `allow_network`.
 `mizuchi::VERSION` and `Session::explain` are the strings a runner
 records. A complete walk-through is `cargo run -p mizuchi --example embed`.
 The engine opens TCP only when `SessionConfig.allow_network` is set
@@ -69,14 +89,30 @@ grant is denied. Optional Linux filesystem-limit tests use
 `--features sandbox` and `.github/workflows/sandbox.yml`
 (`workflow_dispatch` only). PostgreSQL source tests use
 `--features postgres` and `.github/workflows/postgres.yml`
+(`workflow_dispatch` only). Object-store S3 emulator tests (`--features s3
+-- --ignored`) run in default CI against MinIO; the job fails if they
+are skipped. Lake REST HTTP remains `.github/workflows/lake-store.yml`
 (`workflow_dispatch` only). `Cluster` sizes in-process workers, scales
-them, and may run speculative task copies. Layouts for a runner to
-deploy are under `deploy/`.
+them, and may run speculative task copies. Flight workers
+(`--features flight`, ADR 0011) are separate processes; the engine
+binds TCP only with `allow_network`. Layouts for a runner to
+deploy are under `deploy/`. Optional Flight tests use
+`.github/workflows/flight.yml` (`workflow_dispatch` only).
 
 ## Releases
 
 Pre-1.0. The public surface, SemVer rules, deprecation window, and tag
 dry-run job are [ADR 0007](docs/decisions/0007-api-stability-and-releases.md).
+The `mizuchi` crate is packagable (`publish = true`); the Python cdylib
+stays `publish = false` and ships as a wheel.
+
+1. Move `CHANGELOG.md` Unreleased notes into a versioned section.
+2. Tag `v<version>` on `main` (0.1 is experimental).
+3. Wait for `.github/workflows/release.yml` on that tag (or
+   `workflow_dispatch`): `cargo publish --locked --dry-run -p mizuchi`
+   plus `maturin build` wheels on Linux, macOS, and Windows.
+4. A maintainer publishes to crates.io and PyPI only after that job is
+   green. The workflow does not upload.
 
 ## Development
 
@@ -86,6 +122,12 @@ cargo build --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 bash scripts/validate-workflow-skills.sh
+```
+
+Columnar kernel micro-benchmarks (filter, projection, aggregate, hash join):
+
+```sh
+cargo run --release -p mizuchi --example kernel_micro
 ```
 
 Python (optional, not part of the default Cargo workspace):
@@ -120,7 +162,9 @@ bash scripts/bench-gb.sh 10   # SF10
 ```
 
 Method and committed results: [docs/bench/methodology.md](docs/bench/methodology.md),
-[docs/bench/results.md](docs/bench/results.md). Data lands in `bench-data/` (gitignored).
+[docs/bench/results.md](docs/bench/results.md). Operator exclusive-time
+profiles and ranked limiters: [docs/bench/limiters.md](docs/bench/limiters.md)
+(`bash scripts/profile-suite.sh tiny`). Data lands in `bench-data/` (gitignored).
 CI may smoke `scripts/bench-gb.sh tiny` from `.github/workflows/bench-gb.yml` on
 manual dispatch; pull-request CI does not run it.
 

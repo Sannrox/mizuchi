@@ -52,8 +52,8 @@ embedder to plug in an external catalog. `Catalog::new` and
 - **Import the object-store prune helper from `plan`.** `store` already
   depends on `plan`; that import is a cycle.
 
-[`Catalog`]: ../../crates/mizuchi/src/plan/catalog.rs
-[`Catalog::open_file`]: ../../crates/mizuchi/src/plan/catalog.rs
-[`CatalogProvider`]: ../../crates/mizuchi/src/plan/catalog.rs
-[`TableStats`]: ../../crates/mizuchi/src/plan/stats.rs
-[`Session::execute_ddl`]: ../../crates/mizuchi/src/exec/mod.rs
+[`Catalog`]: ../../crates/mizuchi-plan/src/plan/catalog.rs
+[`Catalog::open_file`]: ../../crates/mizuchi-plan/src/plan/catalog.rs
+[`CatalogProvider`]: ../../crates/mizuchi-plan/src/plan/catalog.rs
+[`TableStats`]: ../../crates/mizuchi-plan/src/plan/stats.rs
+[`Session::execute_ddl`]: ../../crates/mizuchi-exec/src/lib.rs

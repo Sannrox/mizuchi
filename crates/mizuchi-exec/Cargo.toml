@@ -1,0 +1,23 @@
+[package]
+name = "mizuchi-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = true
+description = "Vectorized execution, spill, scheduling, and Session for mizuchi."
+
+[dependencies]
+arrow = { workspace = true }
+mizuchi-core = { workspace = true }
+mizuchi-io = { workspace = true }
+mizuchi-plan = { workspace = true }
+mizuchi-postgres = { workspace = true }
+object_store = { workspace = true }
+serde_json = { workspace = true }
+sqlparser = { workspace = true }
+
+[features]
+default = []
+s3 = ["mizuchi-io/s3"]
+postgres = ["mizuchi-postgres/client"]

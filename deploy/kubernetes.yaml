@@ -1,6 +1,5 @@
-# Kubernetes layout for a coordinator and worker replicas.
-# The engine never opens network on its own; the runner grants CPU, memory,
-# and a spill volume per pod.
+# Kubernetes layout for a coordinator and Flight worker replicas.
+# TCP is opened only when MIZUCHI_ALLOW_NETWORK is set.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -18,12 +17,12 @@ spec:
       containers:
         - name: coordinator
           image: mizuchi:local
-          args: ["coordinator"]
+          args: ["coordinator", "--workers", "mizuchi-worker:8815"]
           env:
+            - name: MIZUCHI_ALLOW_NETWORK
+              value: "1"
             - name: MIZUCHI_WORKERS
-              value: "2"
-            - name: MIZUCHI_MEMORY_PER_WORKER
-              value: "33554432"
+              value: "mizuchi-worker:8815"
           resources:
             limits:
               cpu: "1"
@@ -40,7 +39,7 @@ kind: Deployment
 metadata:
   name: mizuchi-worker
 spec:
-  replicas: 2
+  replicas: 3
   selector:
     matchLabels:
       app: mizuchi-worker
@@ -52,7 +51,12 @@ spec:
       containers:
         - name: worker
           image: mizuchi:local
-          args: ["worker"]
+          args: ["worker", "--bind", "0.0.0.0:8815"]
+          env:
+            - name: MIZUCHI_ALLOW_NETWORK
+              value: "1"
+            - name: MIZUCHI_SPILL
+              value: /spill
           resources:
             limits:
               cpu: "1"

@@ -16,26 +16,34 @@ execute; skipped records are parsed and ignored.
 | Hash aggregate, `GROUP BY`, `COUNT(DISTINCT)` | `agg.slt` |
 | Inner join | `join.slt` |
 | Uncorrelated `FROM` subquery (derived table) | `subquery.slt` |
-| `CAST` of integer, float, and text | `decimal.slt` |
+| `IN` lists, `IN`/`NOT IN (SELECT ...)`, `EXISTS`, scalar subquery, `LATERAL` | `subquery.slt` (#80) |
+| `CAST` of integer, float, and text; `DECIMAL` / `NUMERIC` casts and arithmetic | `decimal.slt` (#82) |
+| `DATE`, `TIMESTAMP`, `INTERVAL` casts, `EXTRACT`, `DATE_TRUNC`, `CURRENT_DATE`, `NOW()` | `datetime.slt` (#83) |
 | Window functions (`OVER`, `ROW_NUMBER`, ranking, frames, named `WINDOW`) | `window.slt` (#78) |
 | CTEs (`WITH`, `WITH RECURSIVE`) | `cte.slt` (#79) |
+| `UNION` / `UNION ALL` / `UNION DISTINCT`, `INTERSECT`, `EXCEPT` (DISTINCT and ALL) | `setops.slt` (#81) |
 | `MERGE INTO` match / update / insert / delete | `merge.slt` |
 
-Arrow `Decimal*`, Date, Timestamp, Duration, and Interval are accepted at the
-schema boundary (`schema.rs` unit tests). They have no SQL path yet.
+Arrow Date, Timestamp, Duration, and Interval are accepted at the schema
+boundary (`schema.rs` unit tests). SQL `DATE` maps to Arrow `Date32`,
+`TIMESTAMP` (without time zone) to `Timestamp(Microsecond)`, and
+`INTERVAL … DAY` to `Interval(DayTime)`. `DECIMAL` / `NUMERIC` map onto
+Arrow `Decimal32` / `Decimal64` / `Decimal128`.
 
 ## Audited families
 
 | Feature | Status | Evidence | Follow-up |
 | --- | --- | --- | --- |
-| `IN` lists, `IN (SELECT ...)`, `EXISTS`, scalar subquery, correlated, `LATERAL` | skipped | `subquery.slt` | #80 |
-| `UNION` / `UNION ALL` / `UNION DISTINCT` | skipped | `setops.slt` | #81 |
-| `INTERSECT` / `EXCEPT` (DISTINCT and ALL) | skipped | `setops.slt` | #81 |
-| DECIMAL arithmetic and casts | skipped | `decimal.slt` | #82 |
-| DATE, TIMESTAMP, INTERVAL casts and functions | skipped | `datetime.slt` | #83 |
+| `IN` lists, `IN`/`NOT IN (SELECT ...)`, `EXISTS`, scalar subquery, `LATERAL` | supported | `subquery.slt` | #80 |
+| `UNION` / `UNION ALL` / `UNION DISTINCT` | supported | `setops.slt` | #81 |
+| `INTERSECT` / `EXCEPT` (DISTINCT and ALL) | supported | `setops.slt` | #81 |
+| DECIMAL arithmetic and casts | supported | `decimal.slt` | #82 |
+| DATE, TIMESTAMP, INTERVAL casts and functions | supported | `datetime.slt` | #83 |
 
-`UNION` and `UNION ALL` bind to a logical Union, then fail at physical union.
-`INTERSECT` and `EXCEPT` fail in the binder. `CURRENT_DATE` and `NOW()` in
-`datetime.slt` keep placeholder expected rows until a session clock exists.
+Set operators keep left column names. Column counts must match. Compatible
+integer, float, and null types widen; incompatible types fail at plan time.
+Nulls compare equal. `UNION BY NAME` is unimplemented.
+`CURRENT_DATE` and `NOW()` bind to the session clock (`SessionConfig.now_micros`
+or `Session::with_now_micros`); the slt runner pins 2020-01-01 00:00:00 UTC.
 
 `gaps.slt` is a pointer to the per-family files.

@@ -1,6 +1,21 @@
 [workspace]
-members = ["crates/mizuchi"]
-default-members = ["crates/mizuchi"]
+members = [
+    "crates/mizuchi-core",
+    "crates/mizuchi-plan",
+    "crates/mizuchi-io",
+    "crates/mizuchi-postgres",
+    "crates/mizuchi-exec",
+    "crates/mizuchi-flight",
+    "crates/mizuchi",
+]
+default-members = [
+    "crates/mizuchi-core",
+    "crates/mizuchi-plan",
+    "crates/mizuchi-io",
+    "crates/mizuchi-postgres",
+    "crates/mizuchi-exec",
+    "crates/mizuchi",
+]
 exclude = ["python", "fuzz"]
 resolver = "2"
 
@@ -12,13 +27,22 @@ repository = "https://github.com/Sannrox/mizuchi"
 publish = false
 
 [workspace.dependencies]
+mizuchi-core = { path = "crates/mizuchi-core", version = "0.1.0" }
+mizuchi-plan = { path = "crates/mizuchi-plan", version = "0.1.0" }
+mizuchi-io = { path = "crates/mizuchi-io", version = "0.1.0" }
+mizuchi-postgres = { path = "crates/mizuchi-postgres", version = "0.1.0" }
+mizuchi-exec = { path = "crates/mizuchi-exec", version = "0.1.0" }
 arrow = { version = "60.0.0", default-features = false, features = ["csv", "ipc", "ffi", "json"] }
 arrow-avro = { version = "60.0.0", default-features = false }
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }
 sqlparser = { version = "0.63.0" }
 object_store = { version = "0.14.1", default-features = false }
 futures = { version = "0.3.31", default-features = false, features = ["std", "executor"] }
+bytes = { version = "1.12.1", default-features = false }
 serde_json = { version = "1.0.152", default-features = false, features = ["std"] }
 postgres = { version = "0.19.10" }
 postgres-native-tls = { version = "0.5.2" }
 native-tls = { version = "0.2.14" }
+arrow-flight = { version = "60.0.0", default-features = false }
+tonic = { version = "0.14.1", default-features = false, features = ["transport", "codegen", "router"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "macros", "sync"] }

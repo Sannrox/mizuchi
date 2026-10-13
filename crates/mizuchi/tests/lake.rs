@@ -525,3 +525,88 @@ fn merge_fails_closed_when_memory_limit_is_hit() {
         .unwrap_err();
     assert!(matches!(err, mizuchi::Error::Memory(_)), "{err:?}");
 }
+
+#[test]
+fn store_merge_and_rest_catalog() {
+    use mizuchi::{CatalogProvider, IcebergRestCatalog, TableIdent, TableMeta, read_delta_store};
+    use object_store::memory::InMemory;
+
+    let store = InMemory::new();
+    let mut session = Session::new();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    let t = Batch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(1), Some(2)])),
+            Arc::new(Int64Array::from(vec![Some(10), Some(20)])),
+        ],
+    )
+    .unwrap();
+    let s = Batch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(1)])),
+            Arc::new(Int64Array::from(vec![Some(7)])),
+        ],
+    )
+    .unwrap();
+    session.register("t", schema.clone(), vec![t]).unwrap();
+    session.register("src", schema.clone(), vec![s]).unwrap();
+    session
+        .write_delta_store(&store, "delta/t", "t", WriteMode::Overwrite)
+        .unwrap();
+    session
+        .merge_delta_store(
+            &store,
+            "delta/t",
+            "MERGE INTO t USING src ON t.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v",
+        )
+        .unwrap();
+    let got = read_delta_store(&store, "delta/t", TimeTravel::Latest).unwrap();
+    let mut pairs = Vec::new();
+    for b in &got {
+        let id = b
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let v = b
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..id.len() {
+            pairs.push((id.value(i), v.value(i)));
+        }
+    }
+    pairs.sort();
+    assert_eq!(pairs, vec![(1, 7), (2, 20)]);
+
+    session
+        .write_iceberg_store(&store, "ice/t", "t", WriteMode::Overwrite)
+        .unwrap();
+    let mut cat = IcebergRestCatalog::memory();
+    cat.create_table(TableMeta {
+        ident: TableIdent::parse("t").unwrap(),
+        schema,
+        stats: mizuchi::TableStats::default(),
+    })
+    .unwrap();
+    let ident = TableIdent::parse("t").unwrap();
+    let md = cat.load_metadata(&ident).unwrap();
+    cat.commit_metadata(&ident, md, "ice/t").unwrap();
+    assert_eq!(cat.table_location(&ident).unwrap(), "ice/t");
+    assert_eq!(
+        CatalogProvider::get_table(&cat, &ident)
+            .unwrap()
+            .schema
+            .fields()
+            .len(),
+        2
+    );
+}

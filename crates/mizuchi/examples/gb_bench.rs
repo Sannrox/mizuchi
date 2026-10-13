@@ -160,6 +160,10 @@ fn main() {
             let cfg = parse_flags(args);
             run_mizuchi(&cfg);
         }
+        "profile" => {
+            let cfg = parse_flags(args);
+            profile_mizuchi(&cfg);
+        }
         _ => usage(),
     }
 }
@@ -177,7 +181,8 @@ fn usage() -> ! {
     eprintln!(
         "usage:
   gb_bench generate --sf tiny|1|10 --out DIR [--force]
-  gb_bench run --sf tiny|1|10 --dir DIR [--repeats N] [--workers N] [--json PATH|-]"
+  gb_bench run --sf tiny|1|10 --dir DIR [--repeats N] [--workers N] [--json PATH|-]
+  gb_bench profile --sf tiny|1|10 --dir DIR [--workers N] [--json PATH|-]"
     );
     std::process::exit(2);
 }
@@ -540,7 +545,7 @@ fn write_store_sales(path: &Path, n: usize, n_item: usize, n_dates: usize) {
     finish(w.expect("store_sales rows"), path);
 }
 
-fn run_mizuchi(flags: &Flags) {
+fn load_session(flags: &Flags, account: bool) -> (Session, u64) {
     let dir = data_dir(flags);
     if !dir.join("lineitem.parquet").exists() {
         eprintln!("missing {}; run generate first", dir.display());
@@ -553,6 +558,11 @@ fn run_mizuchi(flags: &Flags) {
         flags.workers
     );
     let mut session = Session::new().with_workers(flags.workers).expect("workers");
+    // Join/aggregate reserve only with a cap. Profile sets 24 GiB (above SF1
+    // peaks). Wall-clock `run` stays unbounded so SF10 matches results.md.
+    if account {
+        session = session.with_memory_limit(24u64 * 1024 * 1024 * 1024);
+    }
     let mut input_bytes = 0u64;
     for name in TABLES {
         let path = dir.join(format!("{name}.parquet"));
@@ -568,6 +578,26 @@ fn run_mizuchi(flags: &Flags) {
             .unwrap_or_else(|e| panic!("register {name}: {e}"));
         eprintln!("  loaded {name}");
     }
+    (session, input_bytes)
+}
+
+fn write_json_body(flags: &Flags, body: &str) {
+    match &flags.json {
+        Some(p) if p.as_os_str() == "-" => print!("{body}"),
+        Some(p) => {
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            let mut f = File::create(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+            f.write_all(body.as_bytes()).expect("write json");
+            eprintln!("wrote {}", p.display());
+        }
+        None => print!("{body}"),
+    }
+}
+
+fn run_mizuchi(flags: &Flags) {
+    let (session, input_bytes) = load_session(flags, false);
 
     let mut query_json = Vec::new();
     for spec in QUERIES {
@@ -606,18 +636,48 @@ fn run_mizuchi(flags: &Flags) {
         flags.workers,
         query_json.join(",\n")
     );
-    match &flags.json {
-        Some(p) if p.as_os_str() == "-" => print!("{body}"),
-        Some(p) => {
-            if let Some(parent) = p.parent() {
-                fs::create_dir_all(parent).ok();
-            }
-            let mut f = File::create(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-            f.write_all(body.as_bytes()).expect("write json");
-            eprintln!("wrote {}", p.display());
+    write_json_body(flags, &body);
+}
+
+fn profile_mizuchi(flags: &Flags) {
+    let (session, input_bytes) = load_session(flags, true);
+    let mut query_json = Vec::new();
+    for spec in QUERIES {
+        let metrics = session
+            .query_metrics(spec.sql)
+            .unwrap_or_else(|e| panic!("{}: {e}", spec.id));
+        let ranked = metrics.ranked_exclusive();
+        eprintln!(
+            "  {} peak_bytes={} exclusive rank:",
+            spec.id, metrics.peak_bytes
+        );
+        for (i, n) in ranked.iter().take(8).enumerate() {
+            eprintln!(
+                "    {}. {} exclusive_ns={} elapsed_ns={} peak_bytes={} copied_bytes={} rows={}",
+                i + 1,
+                n.name,
+                n.exclusive_ns(),
+                n.elapsed_ns,
+                n.peak_bytes,
+                n.copied_bytes,
+                n.rows
+            );
         }
-        None => print!("{body}"),
+        query_json.push(format!(
+            "    {{\n      \"id\": \"{}\",\n      \"peak_bytes\": {},\n      \"root\": {},\n      \"ranked_exclusive\": {}\n    }}",
+            spec.id,
+            metrics.peak_bytes,
+            metrics.to_json(),
+            metrics.ranked_exclusive_json()
+        ));
     }
+    let body = format!(
+        "{{\n  \"engine\": \"mizuchi\",\n  \"version\": \"{VERSION}\",\n  \"sf\": \"{}\",\n  \"kind\": \"operator_metrics\",\n  \"workers\": {},\n  \"input_bytes\": {input_bytes},\n  \"queries\": [\n{}\n  ]\n}}\n",
+        flags.scale.label,
+        flags.workers,
+        query_json.join(",\n")
+    );
+    write_json_body(flags, &body);
 }
 
 fn reported_ms(trials: &[f64]) -> f64 {

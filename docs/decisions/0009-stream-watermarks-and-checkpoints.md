@@ -58,4 +58,4 @@ a crash between writing output and closing the log.
 - **Advance the source offset before writing the sink.** A crash would
   skip input.
 
-[`StreamQuery`]: ../../crates/mizuchi/src/exec/stream.rs
+[`StreamQuery`]: ../../crates/mizuchi-exec/src/stream.rs

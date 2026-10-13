@@ -1,22 +1,62 @@
-# Standalone layout. The engine does not bind ports; the runner supplies
-# process grants (CPU, memory, spill) that Cluster honors.
+# Three Flight workers plus a coordinator. The engine binds TCP only when
+# MIZUCHI_ALLOW_NETWORK is set.
 services:
-  coordinator:
-    image: mizuchi:local
-    command: ["coordinator"]
+  worker1:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["worker", "--bind", "0.0.0.0:8815"]
     environment:
-      MIZUCHI_WORKERS: "2"
-      MIZUCHI_MEMORY_PER_WORKER: "33554432"
-    volumes:
-      - spill:/spill
-  worker:
-    image: mizuchi:local
-    command: ["worker"]
-    environment:
+      MIZUCHI_ALLOW_NETWORK: "1"
       MIZUCHI_SPILL: /spill
     volumes:
       - spill:/spill
-    deploy:
-      replicas: 2
+    expose:
+      - "8815"
+  worker2:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["worker", "--bind", "0.0.0.0:8815"]
+    environment:
+      MIZUCHI_ALLOW_NETWORK: "1"
+      MIZUCHI_SPILL: /spill
+    volumes:
+      - spill:/spill
+    expose:
+      - "8815"
+  worker3:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["worker", "--bind", "0.0.0.0:8815"]
+    environment:
+      MIZUCHI_ALLOW_NETWORK: "1"
+      MIZUCHI_SPILL: /spill
+    volumes:
+      - spill:/spill
+    expose:
+      - "8815"
+  coordinator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command:
+      [
+        "coordinator",
+        "--workers",
+        "worker1:8815,worker2:8815,worker3:8815",
+        "--sql",
+        "SELECT SUM(a) AS s FROM t",
+      ]
+    environment:
+      MIZUCHI_ALLOW_NETWORK: "1"
+      MIZUCHI_SPILL: /spill
+    volumes:
+      - spill:/spill
+    depends_on:
+      - worker1
+      - worker2
+      - worker3
 volumes:
   spill:

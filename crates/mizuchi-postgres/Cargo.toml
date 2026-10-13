@@ -1,0 +1,19 @@
+[package]
+name = "mizuchi-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = true
+description = "PostgreSQL source scans for mizuchi."
+
+[dependencies]
+arrow = { workspace = true }
+mizuchi-core = { workspace = true }
+native-tls = { workspace = true, optional = true }
+postgres = { workspace = true, optional = true }
+postgres-native-tls = { workspace = true, optional = true }
+
+[features]
+default = []
+client = ["dep:postgres", "dep:postgres-native-tls", "dep:native-tls"]

@@ -8,8 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, Float64Array, Int64Array, IntervalDayTimeArray, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::util::display::{ArrayFormatter, FormatOptions};
 use mizuchi::{Batch, Session};
 
 const ENGINE: &str = "mizuchi";
@@ -51,7 +52,8 @@ impl Db {
     }
 
     fn session(&self) -> Session {
-        let mut s = Session::new();
+        // 2020-01-01 00:00:00 UTC, matching datetime.slt CURRENT_DATE / NOW().
+        let mut s = Session::new().with_now_micros(1_577_836_800_000_000);
         for (name, (schema, rows)) in &self.tables {
             let batch = rows_to_batch(schema.clone(), rows);
             s.register(name, schema.clone(), vec![batch]).unwrap();
@@ -540,22 +542,56 @@ fn format_cell(batch: &Batch, col: usize, row: usize, ty: char) -> Result<String
                 .ok_or_else(|| "expected int64".to_string())?;
             Ok(a.value(row).to_string())
         }
-        'T' => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "expected utf8".to_string())?;
-            Ok(a.value(row).to_string())
-        }
+        'T' => format_text_cell(arr, row),
         'R' => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "expected float64".to_string())?;
-            Ok(format!("{}", a.value(row)))
+            if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+                return Ok(format!("{}", a.value(row)));
+            }
+            if arr.data_type().is_decimal() {
+                let fmt = ArrayFormatter::try_new(arr.as_ref(), &FormatOptions::default())
+                    .map_err(|e| e.to_string())?;
+                return Ok(fmt.value(row).to_string());
+            }
+            Err("expected float64 or decimal".into())
         }
         other => Err(format!("unknown result type {other}")),
     }
+}
+
+fn format_text_cell(arr: &arrow::array::ArrayRef, row: usize) -> Result<String, String> {
+    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+        return Ok(a.value(row).to_string());
+    }
+    match arr.data_type() {
+        DataType::Date32 | DataType::Date64 => {
+            let fmt = ArrayFormatter::try_new(arr.as_ref(), &FormatOptions::default())
+                .map_err(|e| e.to_string())?;
+            Ok(fmt.value(row).to_string())
+        }
+        DataType::Timestamp(_, _) => {
+            let opts = FormatOptions::default().with_timestamp_format(Some("%Y-%m-%d %H:%M:%S"));
+            let fmt = ArrayFormatter::try_new(arr.as_ref(), &opts).map_err(|e| e.to_string())?;
+            Ok(fmt.value(row).to_string())
+        }
+        DataType::Interval(_) => format_interval_cell(arr, row),
+        _ => Err("expected utf8, date, timestamp, or interval".into()),
+    }
+}
+
+fn format_interval_cell(arr: &arrow::array::ArrayRef, row: usize) -> Result<String, String> {
+    if let Some(a) = arr.as_any().downcast_ref::<IntervalDayTimeArray>() {
+        let v = a.value(row);
+        if v.milliseconds == 0 {
+            return Ok(if v.days.abs() == 1 {
+                format!("{} day", v.days)
+            } else {
+                format!("{} days", v.days)
+            });
+        }
+    }
+    let fmt = ArrayFormatter::try_new(arr.as_ref(), &FormatOptions::default())
+        .map_err(|e| e.to_string())?;
+    Ok(fmt.value(row).to_string())
 }
 
 fn apply_sort(values: &mut [String], width: usize, mode: SortMode) {

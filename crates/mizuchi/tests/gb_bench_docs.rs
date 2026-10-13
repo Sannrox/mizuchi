@@ -29,6 +29,9 @@ fn methodology_records_hardware_and_method() {
         "DuckDB",
         "DataFusion",
         "scripts/bench-gb.sh",
+        "scripts/profile-suite.sh",
+        "query_metrics",
+        "--workers",
     ] {
         assert!(text.contains(needle), "methodology missing {needle}");
     }
@@ -52,6 +55,37 @@ fn results_table_covers_sf1_and_sf10() {
         );
     }
     assert!(text.contains("ratio"), "results missing ratio column");
+    let sf1 = text
+        .split("## sf1")
+        .nth(1)
+        .and_then(|rest| rest.split("## ").next())
+        .expect("sf1 section");
+    for q in ["tpch_q1", "tpch_q3", "tpch_q6", "tpcds_store_sales"] {
+        let line = sf1
+            .lines()
+            .find(|l| l.contains(q))
+            .unwrap_or_else(|| panic!("sf1 missing {q}"));
+        let cols: Vec<&str> = line.split('|').map(str::trim).collect();
+        let ratio: f64 = cols
+            .get(4)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_else(|| panic!("{q} DuckDB ratio: {line}"));
+        assert!(
+            ratio + f64::EPSILON >= 0.33,
+            "{q} SF1 DuckDB ratio {ratio} is below 0.33"
+        );
+    }
+    for needle in [
+        "Parquet scan pushdown",
+        "row groups kept",
+        "clustered q6",
+        "late materialization",
+    ] {
+        assert!(text.contains(needle), "results missing pushdown {needle}");
+    }
+    for needle in ["worker scaling", "1 worker", "8 ms"] {
+        assert!(text.contains(needle), "results missing scaling {needle}");
+    }
     // Published times are milliseconds with at least one decimal.
     let has_ms = text.lines().any(|line| {
         line.contains("|")
@@ -66,18 +100,52 @@ fn results_table_covers_sf1_and_sf10() {
 }
 
 #[test]
+fn limiters_rank_suite_queries_and_follow_ups() {
+    let text = read("docs/bench/limiters.md");
+    for needle in [
+        "tpch_q1",
+        "tpch_q3",
+        "tpch_q6",
+        "tpcds_store_sales",
+        "exclusive",
+        "peak_bytes",
+        "copied_bytes",
+        "Scan",
+        "Expression",
+        "Hash aggregate",
+        "Hash join",
+        "Copies",
+        "Scheduling",
+        "#103",
+        "#104",
+        "#105",
+        "#106",
+        "#107",
+        "query_metrics",
+        "scripts/profile-suite.sh",
+    ] {
+        assert!(text.contains(needle), "limiters missing {needle}");
+    }
+}
+
+#[test]
 fn harness_and_optional_workflow_exist() {
     let root = root();
     for rel in [
         "scripts/bench-gb.sh",
         "scripts/bench_gb_ref.py",
+        "scripts/check-bench-regression.sh",
+        "scripts/profile-suite.sh",
         "crates/mizuchi/examples/gb_bench.rs",
         ".github/workflows/bench-gb.yml",
+        "docs/bench/limiters.md",
+        "docs/bench/baseline.json",
     ] {
         assert!(root.join(rel).is_file(), "missing {rel}");
     }
     let yml = read(".github/workflows/bench-gb.yml");
     assert!(yml.contains("workflow_dispatch"));
+    assert!(yml.contains("check-bench-regression.sh"));
     assert!(
         !yml.contains("pull_request"),
         "GB bench workflow must not run on pull_request"
@@ -85,4 +153,10 @@ fn harness_and_optional_workflow_exist() {
     let script = read("scripts/bench-gb.sh");
     assert!(script.contains("gb_bench"));
     assert!(script.contains("bench_gb_ref.py"));
+    let profile = read("scripts/profile-suite.sh");
+    assert!(profile.contains("gb_bench"));
+    assert!(profile.contains("profile"));
+    let example = read("crates/mizuchi/examples/gb_bench.rs");
+    assert!(example.contains("\"profile\""));
+    assert!(example.contains("query_metrics"));
 }

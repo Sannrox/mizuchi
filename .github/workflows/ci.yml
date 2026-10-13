@@ -23,9 +23,9 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --locked --workspace --all-targets
+        run: cargo build --locked --workspace --all-targets --exclude mizuchi-flight
       - name: Test
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --exclude mizuchi-flight
 
   fmt:
     name: Rustfmt
@@ -50,7 +50,7 @@ jobs:
           toolchain: 1.97.1
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets --exclude mizuchi-flight -- -D warnings
 
   workflow-skills:
     name: Workflow Skills
@@ -104,3 +104,32 @@ jobs:
           cargo +nightly fuzz run plan -- -max_total_time=15 -len_control=0
           cargo +nightly fuzz run execute -- -max_total_time=15 -len_control=0
           cargo +nightly fuzz run grammar -- -max_total_time=20 -len_control=0
+
+  s3-emulator:
+    name: S3 emulator
+    runs-on: ubuntu-latest
+    env:
+      MIZUCHI_S3_ENDPOINT: http://127.0.0.1:9000
+      MIZUCHI_S3_BUCKET: mizuchi
+      MIZUCHI_S3_ACCESS_KEY: minioadmin
+      MIZUCHI_S3_SECRET_KEY: minioadmin
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start MinIO
+        run: bash scripts/start-s3-emulator.sh
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: S3 emulator tests (fail if skipped)
+        run: |
+          set -euo pipefail
+          list=$(cargo test --locked --test s3_emulator --features s3 -- --ignored --list)
+          echo "$list"
+          n=$(printf '%s\n' "$list" | grep -c ': test$' || true)
+          if [ "$n" -lt 1 ]; then
+            echo "S3 emulator tests were skipped" >&2
+            exit 1
+          fi
+          cargo test --locked --test s3_emulator --features s3 -- --ignored --test-threads=1

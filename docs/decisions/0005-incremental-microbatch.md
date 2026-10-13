@@ -60,4 +60,4 @@ does not have.
 - **Continuous push of individual rows** with operator callbacks.
   Rejected for the same reason as push pipelines in ADR 0004.
 
-[`MicroBatchAgg`]: ../../crates/mizuchi/src/exec/incremental.rs
+[`MicroBatchAgg`]: ../../crates/mizuchi-exec/src/incremental.rs
