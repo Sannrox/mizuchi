@@ -1,7 +1,10 @@
 //! Build/probe hash join over Arrow batches.
 //!
 //! Equality conjuncts in `ON` become hash keys. Inner joins build the smaller
-//! collected side. A single integer column uses a compact range map when keys
+//! collected side, or the right side when the probe operator is streamed
+//! (optimizer places the smaller estimated input on the right). Workers scatter
+//! build morsels into hash partitions and finalise each partition's table with
+//! no insert lock. A single integer column uses a compact range map when keys
 //! sit in a tight span, otherwise a cheap hash map. Unique i64 keys probe
 //! with a direct index. Other join types probe left and build right. Inner
 //! probe ranges run on `Session::workers` threads. Null keys never match.
@@ -54,6 +57,9 @@ pub(super) fn run(
     cancel: &CancelToken,
     workers: usize,
 ) -> Result<Vec<Batch>> {
+    if !pool.has_limit() && spec.join_type == JoinType::Inner {
+        return hash_join_stream_probe(left, right, &spec, policy, workers, pool, cancel);
+    }
     let left_chunks = collect_chunks(&mut left, spec.left_schema.clone(), pool, cancel)?;
     let right_chunks = collect_chunks(&mut right, spec.right_schema.clone(), pool, cancel)?;
     let spilled = chunks_on_disk(&left_chunks) || chunks_on_disk(&right_chunks);
@@ -915,6 +921,379 @@ fn scatter_batch(
     Ok(out)
 }
 
+struct PartTable {
+    batch: Batch,
+    table: BuildTable,
+}
+
+fn build_partition_count(workers: usize) -> usize {
+    workers.max(1).next_power_of_two().clamp(1, 64)
+}
+
+/// Scatter build morsels into hash partitions on worker threads, then
+/// finalise each partition's table (one partition per task, no insert lock).
+fn parallel_build(
+    build_batches: &[Batch],
+    key_exprs: &[Expr],
+    schema: SchemaRef,
+    probe_key_sample: &[ArrayRef],
+    workers: usize,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Vec<Option<PartTable>>> {
+    let npart = build_partition_count(workers);
+    let n_rows: usize = build_batches.iter().map(Batch::num_rows).sum();
+    if npart == 1 || n_rows == 0 || build_batches.len() <= 1 && workers <= 1 {
+        let build = concat_chunk(build_batches, schema, pool)?;
+        let keys: Vec<ArrayRef> = key_exprs
+            .iter()
+            .map(|e| e.eval(&build))
+            .collect::<Result<_>>()?;
+        let table = BuildTable::new(&keys, probe_key_sample, build.num_rows())?;
+        return Ok(vec![Some(PartTable {
+            batch: build,
+            table,
+        })]);
+    }
+    let queue = Mutex::new((0..build_batches.len()).collect::<Vec<usize>>());
+    let locals = Mutex::new(Vec::<Vec<Vec<Batch>>>::new());
+    let n = workers.max(1).min(build_batches.len().max(1));
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let queue = &queue;
+            let locals = &locals;
+            let schema = schema.clone();
+            handles.push(scope.spawn(move || -> Result<()> {
+                let mut local: Vec<Vec<Batch>> = (0..npart).map(|_| Vec::new()).collect();
+                loop {
+                    cancel.check()?;
+                    let i = {
+                        let mut q = queue
+                            .lock()
+                            .map_err(|_| Error::Eval("join build lock poisoned".into()))?;
+                        q.pop()
+                    };
+                    let Some(i) = i else {
+                        break;
+                    };
+                    let scattered = scatter_batch(
+                        &build_batches[i],
+                        schema.clone(),
+                        key_exprs,
+                        npart,
+                        0,
+                        pool,
+                    )?;
+                    for (p, piece) in scattered.into_iter().enumerate() {
+                        if let Some(piece) = piece {
+                            local[p].push(piece);
+                        }
+                    }
+                }
+                locals
+                    .lock()
+                    .map_err(|_| Error::Eval("join build lock poisoned".into()))?
+                    .push(local);
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join()
+                .map_err(|_| Error::Eval("worker panicked".into()))??;
+        }
+        Ok(())
+    })?;
+    let locals = locals
+        .into_inner()
+        .map_err(|_| Error::Eval("join build lock poisoned".into()))?;
+    let mut merged: Vec<Vec<Batch>> = (0..npart).map(|_| Vec::new()).collect();
+    for local in locals {
+        for (p, pieces) in local.into_iter().enumerate() {
+            merged[p].extend(pieces);
+        }
+    }
+    let finished = Mutex::new(Vec::<(usize, PartTable)>::new());
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for (p, pieces) in merged.into_iter().enumerate() {
+            if pieces.is_empty() {
+                continue;
+            }
+            let finished = &finished;
+            let schema = schema.clone();
+            handles.push(scope.spawn(move || -> Result<()> {
+                cancel.check()?;
+                let batch = concat_chunk(&pieces, schema.clone(), pool)?;
+                let keys: Vec<ArrayRef> = key_exprs
+                    .iter()
+                    .map(|e| e.eval(&batch))
+                    .collect::<Result<_>>()?;
+                let table = BuildTable::new_partitioned(&keys, probe_key_sample, batch.num_rows())?;
+                finished
+                    .lock()
+                    .map_err(|_| Error::Eval("join build lock poisoned".into()))?
+                    .push((p, PartTable { batch, table }));
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join()
+                .map_err(|_| Error::Eval("worker panicked".into()))??;
+        }
+        Ok(())
+    })?;
+    let mut finished = finished
+        .into_inner()
+        .map_err(|_| Error::Eval("join build lock poisoned".into()))?;
+    finished.sort_by_key(|(p, _)| *p);
+    let mut parts: Vec<Option<PartTable>> = (0..npart).map(|_| None).collect();
+    for (p, part) in finished {
+        parts[p] = Some(part);
+    }
+    #[cfg(test)]
+    {
+        // BuildTable::new ran on worker threads; thread_local counters live here.
+        let tables = parts.iter().filter(|p| p.is_some()).count();
+        let rows: usize = parts
+            .iter()
+            .filter_map(|p| p.as_ref().map(|p| p.batch.num_rows()))
+            .sum();
+        BUILD_TABLES.with(|c| c.set(c.get() + tables));
+        BUILD_ROWS.with(|c| c.set(c.get() + rows));
+        JOIN_EVENTS.with(|e| {
+            for _ in 0..tables.max(1) {
+                e.borrow_mut().push("build");
+            }
+        });
+    }
+    Ok(parts)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_parts(
+    parts: &[Option<PartTable>],
+    npart: usize,
+    probe: &Batch,
+    probe_key_exprs: &[Expr],
+    residual: Option<&Expr>,
+    build_left: bool,
+    schema: SchemaRef,
+    policy: &BatchPolicy,
+    pool: &MemoryPool,
+) -> Result<Vec<Batch>> {
+    if probe.num_rows() == 0 {
+        return Ok(Vec::new());
+    }
+    let key_refs: Vec<&Expr> = probe_key_exprs.iter().collect();
+    if npart == 1 {
+        let Some(part) = parts[0].as_ref() else {
+            return Ok(Vec::new());
+        };
+        return probe_inner_batch(
+            &part.table,
+            &part.batch,
+            probe,
+            &key_refs,
+            residual,
+            build_left,
+            schema,
+            policy,
+            pool,
+        );
+    }
+    let probe_keys: Vec<ArrayRef> = probe_key_exprs
+        .iter()
+        .map(|e| e.eval(probe))
+        .collect::<Result<_>>()?;
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); npart];
+    for row in 0..probe.num_rows() {
+        if row_has_null(&probe_keys, row) {
+            continue;
+        }
+        let h = hash_row(&probe_keys, row)?;
+        buckets[partition_bucket(h, npart, 0)].push(row as u32);
+    }
+    let mut out = Vec::new();
+    for (i, idx) in buckets.into_iter().enumerate() {
+        if idx.is_empty() {
+            continue;
+        }
+        let Some(part) = parts[i].as_ref() else {
+            continue;
+        };
+        let probe_part = take_left(probe, &idx, probe.schema(), pool)?;
+        out.extend(probe_inner_batch(
+            &part.table,
+            &part.batch,
+            &probe_part,
+            &key_refs,
+            residual,
+            build_left,
+            schema.clone(),
+            policy,
+            pool,
+        )?);
+    }
+    Ok(out)
+}
+
+/// Probe one morsel, splitting its rows across `workers` when the morsel is large.
+#[allow(clippy::too_many_arguments)]
+fn probe_parts_parallel(
+    parts: &[Option<PartTable>],
+    npart: usize,
+    probe: &Batch,
+    probe_key_exprs: &[Expr],
+    residual: Option<&Expr>,
+    build_left: bool,
+    schema: SchemaRef,
+    policy: &BatchPolicy,
+    workers: usize,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Vec<Batch>> {
+    let n = workers.max(1).min(probe.num_rows().max(1));
+    if n <= 1 {
+        return probe_parts(
+            parts,
+            npart,
+            probe,
+            probe_key_exprs,
+            residual,
+            build_left,
+            schema,
+            policy,
+            pool,
+        );
+    }
+    let chunk = probe.num_rows().div_ceil(n);
+    let out_parts = Mutex::new(Vec::new());
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for t in 0..n {
+            let start = t * chunk;
+            let end = (start + chunk).min(probe.num_rows());
+            if start >= end {
+                continue;
+            }
+            let out_parts = &out_parts;
+            let schema = schema.clone();
+            handles.push(scope.spawn(move || -> Result<()> {
+                cancel.check()?;
+                let idx: Vec<u32> = (start..end).map(|i| i as u32).collect();
+                let slice = take_left(probe, &idx, probe.schema(), pool)?;
+                let batches = probe_parts(
+                    parts,
+                    npart,
+                    &slice,
+                    probe_key_exprs,
+                    residual,
+                    build_left,
+                    schema.clone(),
+                    policy,
+                    pool,
+                )?;
+                out_parts
+                    .lock()
+                    .map_err(|_| Error::Eval("join probe lock poisoned".into()))?
+                    .push((start, batches));
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join()
+                .map_err(|_| Error::Eval("worker panicked".into()))??;
+        }
+        Ok(())
+    })?;
+    let mut out_parts = out_parts
+        .into_inner()
+        .map_err(|_| Error::Eval("join probe lock poisoned".into()))?;
+    out_parts.sort_by_key(|(start, _)| *start);
+    Ok(out_parts.into_iter().flat_map(|(_, b)| b).collect())
+}
+
+fn key_sample(schema: SchemaRef, keys: &[Expr]) -> Result<Vec<ArrayRef>> {
+    let empty = Batch::empty(schema)?;
+    keys.iter().map(|e| e.eval(&empty)).collect()
+}
+
+/// Unbounded inner join: build the right side (optimizer smaller), probe
+/// left morsels as they arrive.
+#[allow(clippy::too_many_arguments)]
+fn hash_join_stream_probe(
+    mut left: Box<dyn Operator>,
+    mut right: Box<dyn Operator>,
+    spec: &JoinSpec<'_>,
+    policy: &BatchPolicy,
+    workers: usize,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Vec<Batch>> {
+    let left_ncols = spec.left_schema.fields().len();
+    let split = match spec.on {
+        Some(pred) => split_equi(pred, left_ncols)?,
+        None => EquiSplit {
+            keys: Vec::new(),
+            residual: None,
+        },
+    };
+    if split.keys.is_empty() {
+        let l = concat_chunk(
+            &take_batches(
+                collect_chunks(&mut left, spec.left_schema.clone(), pool, cancel)?,
+                spec.left_schema.clone(),
+            )?,
+            spec.left_schema.clone(),
+            pool,
+        )?;
+        let r = concat_chunk(
+            &take_batches(
+                collect_chunks(&mut right, spec.right_schema.clone(), pool, cancel)?,
+                spec.right_schema.clone(),
+            )?,
+            spec.right_schema.clone(),
+            pool,
+        )?;
+        return join_pair(&l, &r, spec, policy, workers, pool, cancel);
+    }
+    let right_chunks = collect_chunks(&mut right, spec.right_schema.clone(), pool, cancel)?;
+    let build_batches = take_batches(right_chunks, spec.right_schema.clone())?;
+    let right_keys: Vec<Expr> = split.keys.iter().map(|(_, r)| r.clone()).collect();
+    let left_keys: Vec<Expr> = split.keys.iter().map(|(l, _)| l.clone()).collect();
+    let probe_sample = key_sample(spec.left_schema.clone(), &left_keys)?;
+    let parts = parallel_build(
+        &build_batches,
+        &right_keys,
+        spec.right_schema.clone(),
+        &probe_sample,
+        workers,
+        pool,
+        cancel,
+    )?;
+    let npart = parts.len();
+    let residual = split.residual.as_ref();
+    let mut out = Vec::new();
+    while let Some(probe) = left.next_batch(cancel)? {
+        cancel.check()?;
+        out.extend(probe_parts_parallel(
+            &parts,
+            npart,
+            &probe,
+            &left_keys,
+            residual,
+            false,
+            spec.schema.clone(),
+            policy,
+            workers,
+            pool,
+            cancel,
+        )?);
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn nested_chunk_join(
     left_chunks: &[Chunk],
@@ -1229,54 +1608,71 @@ fn hash_join_streamed(
     let ln: usize = left.iter().map(Batch::num_rows).sum();
     let rn: usize = right.iter().map(Batch::num_rows).sum();
     let build_left = ln < rn;
-    let (build_batches, probe_batches, build_schema) = if build_left {
-        (left, right, spec.left_schema.clone())
+    let (build_batches, probe_batches, build_schema, build_key_exprs, probe_key_exprs) =
+        if build_left {
+            (
+                left,
+                right,
+                spec.left_schema.clone(),
+                split
+                    .keys
+                    .iter()
+                    .map(|(l, _)| l.clone())
+                    .collect::<Vec<_>>(),
+                split
+                    .keys
+                    .iter()
+                    .map(|(_, r)| r.clone())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            (
+                right,
+                left,
+                spec.right_schema.clone(),
+                split
+                    .keys
+                    .iter()
+                    .map(|(_, r)| r.clone())
+                    .collect::<Vec<_>>(),
+                split
+                    .keys
+                    .iter()
+                    .map(|(l, _)| l.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+    let probe_schema = if build_left {
+        spec.right_schema.clone()
     } else {
-        (right, left, spec.right_schema.clone())
+        spec.left_schema.clone()
     };
-    let build = concat_chunk(build_batches, build_schema, pool)?;
-    let build_keys: Vec<ArrayRef> = if build_left {
-        split
-            .keys
+    let probe_sample = match probe_batches.iter().find(|b| b.num_rows() > 0) {
+        Some(b) => probe_key_exprs
             .iter()
-            .map(|(l, _)| l.eval(&build))
-            .collect::<Result<_>>()?
-    } else {
-        split
-            .keys
-            .iter()
-            .map(|(_, r)| r.eval(&build))
-            .collect::<Result<_>>()?
+            .map(|e| e.eval(b))
+            .collect::<Result<Vec<_>>>()?,
+        None => key_sample(probe_schema, &probe_key_exprs)?,
     };
-    let probe_key_exprs: Vec<&Expr> = if build_left {
-        split.keys.iter().map(|(_, r)| r).collect()
-    } else {
-        split.keys.iter().map(|(l, _)| l).collect()
-    };
-    let sample_probe = match probe_batches.iter().find(|b| b.num_rows() > 0) {
-        Some(b) => b.clone(),
-        None => {
-            if build_left {
-                Batch::empty(spec.right_schema.clone())?
-            } else {
-                Batch::empty(spec.left_schema.clone())?
-            }
-        }
-    };
-    let sample_probe_keys: Vec<ArrayRef> = probe_key_exprs
-        .iter()
-        .map(|e| e.eval(&sample_probe))
-        .collect::<Result<_>>()?;
-    let table = BuildTable::new(&build_keys, &sample_probe_keys, build.num_rows())?;
+    let parts = parallel_build(
+        build_batches,
+        &build_key_exprs,
+        build_schema,
+        &probe_sample,
+        workers,
+        pool,
+        cancel,
+    )?;
+    let npart = parts.len();
     let residual = split.residual.as_ref();
     let n = workers.max(1).min(probe_batches.len().max(1));
     if n <= 1 {
         let mut out = Vec::new();
         for probe in probe_batches {
             cancel.check()?;
-            out.extend(probe_inner_batch(
-                &table,
-                &build,
+            out.extend(probe_parts(
+                &parts,
+                npart,
                 probe,
                 &probe_key_exprs,
                 residual,
@@ -1289,14 +1685,13 @@ fn hash_join_streamed(
         return Ok(out);
     }
     let queue = Mutex::new((0..probe_batches.len()).collect::<Vec<usize>>());
-    let parts = Mutex::new(Vec::new());
-    let table = &table;
-    let build = &build;
+    let out_parts = Mutex::new(Vec::new());
     thread::scope(|scope| -> Result<()> {
         let mut handles = Vec::new();
         for _ in 0..n {
-            let parts = &parts;
+            let out_parts = &out_parts;
             let queue = &queue;
+            let parts = &parts;
             let probe_key_exprs = &probe_key_exprs;
             handles.push(scope.spawn(move || -> Result<()> {
                 loop {
@@ -1310,9 +1705,9 @@ fn hash_join_streamed(
                     let Some(i) = i else {
                         return Ok(());
                     };
-                    let batches = probe_inner_batch(
-                        table,
-                        build,
+                    let batches = probe_parts(
+                        parts,
+                        npart,
                         &probe_batches[i],
                         probe_key_exprs,
                         residual,
@@ -1321,7 +1716,7 @@ fn hash_join_streamed(
                         policy,
                         pool,
                     )?;
-                    parts
+                    out_parts
                         .lock()
                         .map_err(|_| Error::Eval("join probe lock poisoned".into()))?
                         .push((i, batches));
@@ -1334,11 +1729,11 @@ fn hash_join_streamed(
         }
         Ok(())
     })?;
-    let mut parts = parts
+    let mut out_parts = out_parts
         .into_inner()
         .map_err(|_| Error::Eval("join probe lock poisoned".into()))?;
-    parts.sort_by_key(|(i, _)| *i);
-    Ok(parts.into_iter().flat_map(|(_, b)| b).collect())
+    out_parts.sort_by_key(|(i, _)| *i);
+    Ok(out_parts.into_iter().flat_map(|(_, b)| b).collect())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1772,10 +2167,31 @@ enum IntRelation<T> {
 
 impl BuildTable {
     fn new(build_keys: &[ArrayRef], probe_keys: &[ArrayRef], n_build: usize) -> Result<Self> {
+        Self::from_keys(build_keys, probe_keys, n_build, true)
+    }
+
+    /// Hash partitions scatter consecutive keys, so skip the 1 MiB dense-index
+    /// exemption that would otherwise allocate the full domain in every part.
+    fn new_partitioned(
+        build_keys: &[ArrayRef],
+        probe_keys: &[ArrayRef],
+        n_build: usize,
+    ) -> Result<Self> {
+        Self::from_keys(build_keys, probe_keys, n_build, false)
+    }
+
+    fn from_keys(
+        build_keys: &[ArrayRef],
+        probe_keys: &[ArrayRef],
+        n_build: usize,
+        range_index: bool,
+    ) -> Result<Self> {
         #[cfg(test)]
         BUILD_TABLES.with(|c| c.set(c.get() + 1));
         #[cfg(test)]
         BUILD_ROWS.with(|c| c.set(c.get() + n_build));
+        #[cfg(test)]
+        JOIN_EVENTS.with(|e| e.borrow_mut().push("build"));
         if build_keys.len() == 1
             && probe_keys.len() == 1
             && build_keys[0].data_type() == probe_keys[0].data_type()
@@ -1785,24 +2201,28 @@ impl BuildTable {
                     return Ok(Self::I64(int_relation::<Int64Type>(
                         build_keys[0].as_primitive(),
                         n_build,
+                        range_index,
                     )));
                 }
                 DataType::Int32 => {
                     return Ok(Self::I32(int_relation::<Int32Type>(
                         build_keys[0].as_primitive(),
                         n_build,
+                        range_index,
                     )));
                 }
                 DataType::UInt64 => {
                     return Ok(Self::U64(int_relation::<UInt64Type>(
                         build_keys[0].as_primitive(),
                         n_build,
+                        range_index,
                     )));
                 }
                 DataType::UInt32 => {
                     return Ok(Self::U32(int_relation::<UInt32Type>(
                         build_keys[0].as_primitive(),
                         n_build,
+                        range_index,
                     )));
                 }
                 _ => {}
@@ -1945,22 +2365,29 @@ impl IntKey for u32 {
     }
 }
 
-fn dense_len(min: i128, max: i128, n: usize) -> Option<usize> {
+fn dense_len(min: i128, max: i128, n: usize, range_index: bool) -> Option<usize> {
     let range = max.checked_sub(min)?.checked_add(1)?;
     if range <= 0 || range > 64 * 1024 * 1024 {
         return None;
     }
     let range = range as usize;
     // Allow ~32 empty slots per live key so a filtered unique key
-    // (200k hits in a 2M domain) still uses a direct index.
-    if range > n.saturating_mul(32) && range > 1_048_576 {
+    // (200k hits in a 2M domain) still uses a direct index. Unpartitioned
+    // tables also keep a 1 MiB-slot exemption. Hash partitions scatter
+    // consecutive keys, so that exemption would allocate the full domain
+    // in every partition.
+    if range > n.saturating_mul(32) && (!range_index || range > 1_048_576) {
         return None;
     }
     Some(range)
 }
 
 #[allow(clippy::needless_range_loop)]
-fn int_relation<T: ArrowPrimitiveType>(arr: &PrimitiveArray<T>, n: usize) -> IntRelation<T::Native>
+fn int_relation<T: ArrowPrimitiveType>(
+    arr: &PrimitiveArray<T>,
+    n: usize,
+    range_index: bool,
+) -> IntRelation<T::Native>
 where
     T::Native: IntKey,
 {
@@ -1979,7 +2406,7 @@ where
     if count == 0 {
         return IntRelation::Hash(fast_map_with_capacity(0));
     }
-    if let Some(range) = dense_len(min, max, count) {
+    if let Some(range) = dense_len(min, max, count, range_index) {
         let mut slots = vec![u32::MAX; range];
         let mut unique = true;
         for row in 0..n {
@@ -2535,6 +2962,7 @@ fn shift_right(expr: &Expr, left_ncols: usize) -> Expr {
 thread_local! {
     static BUILD_TABLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BUILD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static JOIN_EVENTS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -2550,7 +2978,7 @@ mod tests {
     fn moderately_sparse_unique_keys_still_use_range_slots() {
         let values: Vec<i64> = (0..200_000).map(|i| i * 10).collect();
         let arr = Int64Array::from(values);
-        match int_relation::<Int64Type>(&arr, 200_000) {
+        match int_relation::<Int64Type>(&arr, 200_000, true) {
             IntRelation::Unique { min, slots } => {
                 assert_eq!(min, 0);
                 assert_eq!(slots.len(), 1_999_991);
@@ -2564,7 +2992,7 @@ mod tests {
     #[test]
     fn compact_unique_integer_keys_use_range_slots() {
         let arr = i64_array(&[10, 11, 12]);
-        match int_relation::<Int64Type>(&arr, 3) {
+        match int_relation::<Int64Type>(&arr, 3, true) {
             IntRelation::Unique { min, slots } => {
                 assert_eq!(min, 10);
                 assert_eq!(slots.len(), 3);
@@ -2578,7 +3006,7 @@ mod tests {
     #[test]
     fn duplicate_integer_keys_use_range_chains() {
         let arr = i64_array(&[5, 6, 5]);
-        match int_relation::<Int64Type>(&arr, 3) {
+        match int_relation::<Int64Type>(&arr, 3, true) {
             IntRelation::Multi { min, heads, next } => {
                 assert_eq!(min, 5);
                 let mut seen = Vec::new();
@@ -2597,7 +3025,7 @@ mod tests {
     #[test]
     fn sparse_integer_keys_use_hash_map() {
         let arr = i64_array(&[0, 1_000_000_000]);
-        match int_relation::<Int64Type>(&arr, 2) {
+        match int_relation::<Int64Type>(&arr, 2, true) {
             IntRelation::Hash(map) => {
                 assert_eq!(map.get(&0).map(Vec::as_slice), Some(&[0][..]));
                 assert_eq!(map.get(&1_000_000_000).map(Vec::as_slice), Some(&[1][..]));
@@ -2610,7 +3038,7 @@ mod tests {
     fn empty_build_is_hash_map() {
         let arr = Int64Array::from(Vec::<i64>::new());
         assert!(matches!(
-            int_relation::<Int64Type>(&arr, 0),
+            int_relation::<Int64Type>(&arr, 0, true),
             IntRelation::Hash(_)
         ));
     }
@@ -2732,9 +3160,10 @@ mod tests {
         .unwrap();
         let builds = BUILD_TABLES.with(|c| c.get());
         // fold_unique_i64_join may build once then return None; streamed
-        // fallback builds once. L×R batch pairs would be 20.
+        // fallback builds one table per hash partition (workers=2 => 2).
+        // L×R batch pairs would be 20.
         assert!(
-            (1..=2).contains(&builds),
+            (1..=4).contains(&builds),
             "batch-pair fallback would build L×R tables, got {builds}"
         );
         let c = out[0].column(0).as_primitive::<Int64Type>();
@@ -2847,5 +3276,228 @@ mod tests {
         // Nested left×right pairs would rebuild the 1-row right side 20 times.
         assert!((1..=5).contains(&built), "each build row once, got {built}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unbounded_inner_join_builds_before_streaming_probe() {
+        struct ProbeOp {
+            batches: Vec<Batch>,
+            i: usize,
+        }
+        impl Operator for ProbeOp {
+            fn next_batch(&mut self, cancel: &CancelToken) -> Result<Option<Batch>> {
+                cancel.check()?;
+                JOIN_EVENTS.with(|e| e.borrow_mut().push("probe"));
+                if self.i >= self.batches.len() {
+                    return Ok(None);
+                }
+                let b = self.batches[self.i].clone();
+                self.i += 1;
+                Ok(Some(b))
+            }
+        }
+
+        let left_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", DataType::Int64, true),
+            arrow::datatypes::Field::new("v", DataType::Int64, true),
+        ]));
+        let right_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", DataType::Int64, true),
+            arrow::datatypes::Field::new("x", DataType::Int64, true),
+        ]));
+        let join_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(
+            left_schema
+                .fields()
+                .iter()
+                .cloned()
+                .chain(right_schema.fields().iter().cloned())
+                .collect::<Vec<_>>(),
+        ));
+        let left: Vec<Batch> = (0..4)
+            .map(|i| {
+                let a = i * 2;
+                Batch::try_new(
+                    left_schema.clone(),
+                    vec![
+                        std::sync::Arc::new(Int64Array::from(vec![a, a + 1])),
+                        std::sync::Arc::new(Int64Array::from(vec![i, i + 10])),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let right: Vec<Batch> = (0..5)
+            .map(|i| {
+                Batch::try_new(
+                    right_schema.clone(),
+                    vec![
+                        std::sync::Arc::new(Int64Array::from(vec![i])),
+                        std::sync::Arc::new(Int64Array::from(vec![i])),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        JOIN_EVENTS.with(|e| e.borrow_mut().clear());
+        let on = Expr::Binary(BinaryOp::Eq, Box::new(Expr::nth(0)), Box::new(Expr::nth(2)));
+        let session = Session::new().with_workers(2).unwrap();
+        let pool = MemoryPool::new(None, None).unwrap();
+        let joined = run(
+            Box::new(ProbeOp {
+                batches: left,
+                i: 0,
+            }),
+            Box::new(Exec::Scan {
+                batches: right,
+                index: 0,
+            }),
+            JoinSpec {
+                join_type: JoinType::Inner,
+                on: Some(&on),
+                left_schema,
+                right_schema,
+                schema: join_schema,
+            },
+            &session.policy,
+            &pool,
+            &session.exec_token(),
+            session.workers,
+        )
+        .unwrap();
+        let rows: usize = joined.iter().map(Batch::num_rows).sum();
+        assert_eq!(rows, 5);
+        let events = JOIN_EVENTS.with(|e| e.borrow().clone());
+        let first_build = events
+            .iter()
+            .position(|e| *e == "build")
+            .expect("build table");
+        let first_probe = events
+            .iter()
+            .position(|e| *e == "probe")
+            .expect("probe pull");
+        assert!(
+            first_build < first_probe,
+            "build must finish before the probe operator is pulled: {events:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_integer_key_widths_do_not_panic() {
+        use arrow::array::Int32Array;
+
+        let left_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", DataType::Int32, true),
+        ]));
+        let right_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", DataType::Int64, true),
+        ]));
+        let join_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(
+            left_schema
+                .fields()
+                .iter()
+                .cloned()
+                .chain(right_schema.fields().iter().cloned())
+                .collect::<Vec<_>>(),
+        ));
+        let left = Batch::try_new(
+            left_schema.clone(),
+            vec![std::sync::Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let right = Batch::try_new(
+            right_schema.clone(),
+            vec![std::sync::Arc::new(Int64Array::from(vec![2_i64, 4]))],
+        )
+        .unwrap();
+        let on = Expr::Binary(BinaryOp::Eq, Box::new(Expr::nth(0)), Box::new(Expr::nth(1)));
+        let session = Session::new().with_workers(1).unwrap();
+        let pool = MemoryPool::new(None, None).unwrap();
+        let joined = run(
+            Box::new(Exec::Scan {
+                batches: vec![left],
+                index: 0,
+            }),
+            Box::new(Exec::Scan {
+                batches: vec![right],
+                index: 0,
+            }),
+            JoinSpec {
+                join_type: JoinType::Inner,
+                on: Some(&on),
+                left_schema,
+                right_schema,
+                schema: join_schema,
+            },
+            &session.policy,
+            &pool,
+            &session.exec_token(),
+            session.workers,
+        )
+        .unwrap();
+        let _ = joined;
+    }
+
+    #[test]
+    fn partitioned_sparse_range_skips_million_slot_exemption() {
+        let values: Vec<i64> = (0..64).map(|i| i * 15_625).collect();
+        let arr = Int64Array::from(values);
+        match int_relation::<Int64Type>(&arr, 64, true) {
+            IntRelation::Unique { slots, .. } => {
+                assert!(
+                    slots.len() > 900_000,
+                    "unpartitioned 1 MiB exemption still applies"
+                );
+            }
+            other => panic!("expected unique range map, got {other:?}"),
+        }
+        match int_relation::<Int64Type>(&arr, 64, false) {
+            IntRelation::Hash(map) => assert_eq!(map.len(), 64),
+            other => panic!("partitioned sparse range must hash, got {other:?}"),
+        }
+        let compact = i64_array(&(0..64).collect::<Vec<_>>());
+        match int_relation::<Int64Type>(&compact, 64, false) {
+            IntRelation::Unique { slots, .. } => assert_eq!(slots.len(), 64),
+            other => panic!("compact partition keys still use a range map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parallel_partition_build_does_not_keep_sparse_unique_slots() {
+        use std::sync::Arc;
+
+        use arrow::datatypes::{Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let keys = [Expr::nth(0)];
+        let batches: Vec<Batch> = (0..2)
+            .map(|part| {
+                let values: Vec<i64> = (0..32).map(|i| (part * 32 + i) * 15_625).collect();
+                Batch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))]).unwrap()
+            })
+            .collect();
+        let pool = MemoryPool::new(None, None).unwrap();
+        let sample = key_sample(schema.clone(), &keys).unwrap();
+        let parts = parallel_build(
+            &batches,
+            &keys,
+            schema,
+            &sample,
+            2,
+            &pool,
+            &CancelToken::new(),
+        )
+        .unwrap();
+        let populated = parts.iter().filter(|p| p.is_some()).count();
+        assert!(populated >= 1, "expected at least one populated partition");
+        for part in parts.into_iter().flatten() {
+            if let Some((_, slots)) = part.table.unique_i64_slots() {
+                assert!(
+                    slots.len() <= part.batch.num_rows().saturating_mul(32),
+                    "partition allocated {} unique slots for {} rows",
+                    slots.len(),
+                    part.batch.num_rows()
+                );
+            }
+        }
     }
 }
