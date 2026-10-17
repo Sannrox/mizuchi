@@ -6,6 +6,7 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- Unbounded inner join plus aggregate (`run_then_agg`) reuses `hash_join_streamed` when unique-key fold does not apply: one build table, then parallel probe morsels. After morsels stayed unconcatenated, the batch-pair fallback rebuilt a hash table per left×right pair and made `tpcds_store_sales` hundreds of times slower with workers > 1. `scripts/bench-gb.sh` and `docs/bench/baseline.json` time the suite with workers > 1; `scripts/check-bench-regression.sh` rejects a 1-worker run.
 - Query API bearer comparison hashes both tokens and compares the digests in constant time, so response timing does not leak a prefix of the configured token.
 
 ### Changed

@@ -13,6 +13,7 @@ cd "${ROOT}"
 SF="${1:-tiny}"
 OUT="${BENCH_DATA:-${ROOT}/bench-data}"
 REPEATS="${BENCH_REPEATS:-3}"
+WORKERS="${BENCH_WORKERS:-2}"
 
 case "${SF}" in
   tiny) LABEL=tiny ;;
@@ -32,11 +33,11 @@ else
   PYTHON=python3
 fi
 
-echo "bench-gb sf=${SF} label=${LABEL} out=${OUT} python=${PYTHON}"
+echo "bench-gb sf=${SF} label=${LABEL} out=${OUT} python=${PYTHON} workers=${WORKERS}"
 
 cargo run --release --example gb_bench -- generate --sf "${SF}" --out "${OUT}"
 cargo run --release --example gb_bench -- run --sf "${SF}" --dir "${OUT}" \
-  --repeats "${REPEATS}" --json "${OUT}/${LABEL}/mizuchi.json"
+  --repeats "${REPEATS}" --workers "${WORKERS}" --json "${OUT}/${LABEL}/mizuchi.json"
 
 "${PYTHON}" "${ROOT}/scripts/bench_gb_ref.py" \
   --sf "${SF}" --dir "${OUT}" --repeats "${REPEATS}" --engine duckdb \

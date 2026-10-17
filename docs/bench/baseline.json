@@ -3,6 +3,7 @@
   "regression_factor": 1.2,
   "min_sf1_duckdb_ratio": 0.33,
   "min_abs_ms": 5.0,
+  "workers": 2,
   "tiny": {
     "tpch_q1": { "mizuchi_ms": 1.472 },
     "tpch_q3": { "mizuchi_ms": 1.801 },

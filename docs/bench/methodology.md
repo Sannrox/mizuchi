@@ -53,9 +53,12 @@ this method and the committed results table are in git.
    `tests/ds_common`).
 4. Three trials per query. The first trial is warmup and is dropped. The
    published number is the median of the remaining two.
-5. mizuchi uses `Session::with_workers` set to host-reported parallelism.
-   DuckDB and DataFusion use their package defaults. A scaling table at SF1
-   reruns the same queries with `--workers 1`, `2`, `4`, and `8`.
+5. mizuchi uses `Session::with_workers` set to host-reported parallelism for
+   published SF1/SF10 walls. `scripts/bench-gb.sh` times the suite with
+   `--workers` default 2 (`BENCH_WORKERS` overrides) so `tpcds_store_sales` is
+   not only the pull path. DuckDB and DataFusion use their package defaults.
+   A scaling table at SF1 reruns the same queries with `--workers 1`, `2`,
+   `4`, and `8`.
 6. mizuchi clones the session per trial so the result cache cannot reuse a
    previous answer.
 

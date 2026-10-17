@@ -184,20 +184,17 @@ pub(super) fn run_then_agg(
     {
         return Ok(out);
     }
-    let mut joined = Vec::new();
-    for l in &left {
-        for r in &right {
-            joined.extend(join_pair(
-                l,
-                r,
-                &spec,
-                &session.policy,
-                session.workers,
-                pool,
-                &session.exec_token(),
-            )?);
-        }
-    }
+    // One build table, then probe morsels. A batch-pair loop here is O(L×R)
+    // hash builds and is the #126 store_sales worker cliff.
+    let joined = hash_join_streamed(
+        &left,
+        &right,
+        &spec,
+        &session.policy,
+        session.workers,
+        pool,
+        &session.exec_token(),
+    )?;
     if joined.is_empty() {
         return agg::merge_finish(Vec::new(), group, aggs, out_schema, &session.policy);
     }
@@ -1505,6 +1502,8 @@ enum IntRelation<T> {
 
 impl BuildTable {
     fn new(build_keys: &[ArrayRef], probe_keys: &[ArrayRef], n_build: usize) -> Result<Self> {
+        #[cfg(test)]
+        BUILD_TABLES.with(|c| c.set(c.get() + 1));
         if build_keys.len() == 1
             && probe_keys.len() == 1
             && build_keys[0].data_type() == probe_keys[0].data_type()
@@ -2261,6 +2260,11 @@ fn shift_right(expr: &Expr, left_ncols: usize) -> Expr {
 }
 
 #[cfg(test)]
+thread_local! {
+    static BUILD_TABLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::Int64Array;
@@ -2377,5 +2381,90 @@ mod tests {
         let out = concat_chunk(&[a, b], schema, &pool).unwrap();
         assert_eq!(out.num_rows(), 2);
         assert!(pool.copied() > 0);
+    }
+
+    #[test]
+    fn run_then_agg_builds_one_table_regardless_of_probe_batch_count() {
+        use std::sync::Arc;
+
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        BUILD_TABLES.with(|c| c.set(0));
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+        ]));
+        let join_schema = Arc::new(Schema::new(
+            left_schema
+                .fields()
+                .iter()
+                .cloned()
+                .chain(right_schema.fields().iter().cloned())
+                .collect::<Vec<_>>(),
+        ));
+        let out_schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Int64, true)]));
+        let left: Vec<Batch> = (0..4)
+            .map(|i| {
+                Batch::try_new(
+                    left_schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(vec![1_i64, 1])),
+                        Arc::new(Int64Array::from(vec![i, i + 10])),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let right: Vec<Batch> = (0..5)
+            .map(|i| {
+                Batch::try_new(
+                    right_schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(vec![1_i64])),
+                        Arc::new(Int64Array::from(vec![i])),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let on = Expr::Binary(BinaryOp::Eq, Box::new(Expr::nth(0)), Box::new(Expr::nth(2)));
+        let session = Session::new().with_workers(2).unwrap();
+        let pool = MemoryPool::new(None, None).unwrap();
+        let out = run_then_agg(
+            Box::new(Exec::Scan {
+                batches: left,
+                index: 0,
+            }),
+            Box::new(Exec::Scan {
+                batches: right,
+                index: 0,
+            }),
+            JoinSpec {
+                join_type: JoinType::Inner,
+                on: Some(&on),
+                left_schema,
+                right_schema,
+                schema: join_schema,
+            },
+            &[],
+            &[("c".into(), AggCall::CountStar)],
+            out_schema,
+            &session,
+            &pool,
+        )
+        .unwrap();
+        let builds = BUILD_TABLES.with(|c| c.get());
+        // fold_unique_i64_join may build once then return None; streamed
+        // fallback builds once. L×R batch pairs would be 20.
+        assert!(
+            (1..=2).contains(&builds),
+            "batch-pair fallback would build L×R tables, got {builds}"
+        );
+        let c = out[0].column(0).as_primitive::<Int64Type>();
+        assert_eq!(c.value(0), 40);
     }
 }

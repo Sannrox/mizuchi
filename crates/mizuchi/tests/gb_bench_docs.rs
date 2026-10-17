@@ -153,10 +153,74 @@ fn harness_and_optional_workflow_exist() {
     let script = read("scripts/bench-gb.sh");
     assert!(script.contains("gb_bench"));
     assert!(script.contains("bench_gb_ref.py"));
+    assert!(
+        script.contains("--workers"),
+        "bench-gb.sh must time the parallel path"
+    );
+    let check = read("scripts/check-bench-regression.sh");
+    assert!(
+        check.contains("workers > 1"),
+        "regression check must reject a 1-worker mizuchi run"
+    );
+    let baseline = read("docs/bench/baseline.json");
+    assert!(
+        baseline.contains("\"workers\": 2") || baseline.contains("\"workers\":2"),
+        "baseline.json must record workers > 1"
+    );
     let profile = read("scripts/profile-suite.sh");
     assert!(profile.contains("gb_bench"));
     assert!(profile.contains("profile"));
     let example = read("crates/mizuchi/examples/gb_bench.rs");
     assert!(example.contains("\"profile\""));
     assert!(example.contains("query_metrics"));
+}
+
+#[test]
+fn regression_check_rejects_single_worker_mizuchi_run() {
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let root = root();
+    let dir = std::env::temp_dir().join(format!(
+        "mizuchi-gb-bench-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let json = dir.join("mizuchi.json");
+    fs::write(
+        &json,
+        r#"{
+  "engine": "mizuchi",
+  "workers": 1,
+  "queries": [{"id": "tpch_q1", "reported_ms": 1.0}]
+}
+"#,
+    )
+    .unwrap();
+    let output = Command::new("bash")
+        .arg(root.join("scripts/check-bench-regression.sh"))
+        .args([
+            "--scale",
+            "tiny",
+            "--mizuchi",
+            json.to_str().unwrap(),
+            "--baseline",
+            root.join("docs/bench/baseline.json").to_str().unwrap(),
+        ])
+        .output()
+        .expect("run check-bench-regression.sh");
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        !output.status.success(),
+        "1-worker run must fail the regression check"
+    );
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("parallel path") || err.contains("workers > 1"),
+        "stderr: {err}"
+    );
 }
