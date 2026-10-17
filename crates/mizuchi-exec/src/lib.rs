@@ -4620,6 +4620,11 @@ mod tests {
         let got_join = sorted_pairs(&limited.execute_sql(join_sql).unwrap(), "a", "id");
         assert_eq!(got_join, want_join);
 
+        let fused = "SELECT COUNT(*) AS c FROM t JOIN u ON t.a = u.a";
+        let want_fused = col_i64(&s.execute_sql(fused).unwrap(), "c");
+        let got_fused = col_i64(&limited.execute_sql(fused).unwrap(), "c");
+        assert_eq!(got_fused, want_fused);
+
         let semi_sql = "SELECT t.a FROM t LEFT SEMI JOIN u ON t.a = u.a";
         let mut want_semi = col_i64(&s.execute_sql(semi_sql).unwrap(), "a");
         let mut got_semi = col_i64(&limited.execute_sql(semi_sql).unwrap(), "a");

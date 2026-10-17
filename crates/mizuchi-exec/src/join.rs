@@ -7,7 +7,8 @@
 //! probe ranges run on `Session::workers` threads. Null keys never match.
 //! Non-equality conjuncts are a residual filter on candidate pairs. Joins
 //! without an equality key (including CROSS) use a nested loop. LEFT SEMI /
-//! ANTI emit the left schema only.
+//! ANTI emit the left schema only. Under a memory limit, inner equi-joins
+//! hash-partition both sides and join each partition once.
 
 use std::hash::Hash;
 use std::sync::Mutex;
@@ -72,19 +73,15 @@ pub(super) fn run(
     }
     if spec.join_type == JoinType::Inner {
         if spilled {
-            let mut parts = Vec::new();
-            for l in &left_chunks {
-                let l = load_chunk(l, spec.left_schema.clone(), pool)?;
-                for r in &right_chunks {
-                    let r = load_chunk(r, spec.right_schema.clone(), pool)?;
-                    parts.push(join_pair(&l, &r, &spec, policy, workers, pool, cancel)?);
-                }
-            }
-            return Ok(parts
-                .into_iter()
-                .flatten()
-                .filter(|b| b.num_rows() > 0)
-                .collect());
+            return partitioned_inner_join(
+                left_chunks,
+                right_chunks,
+                &spec,
+                policy,
+                workers,
+                pool,
+                cancel,
+            );
         }
         let left = take_batches(left_chunks, spec.left_schema.clone())?;
         let right = take_batches(right_chunks, spec.right_schema.clone())?;
@@ -136,22 +133,15 @@ pub(super) fn run_then_agg(
         &session.exec_token(),
     )?;
     if pool.has_limit() {
-        let mut joined = Vec::new();
-        for l in &left_chunks {
-            let l = load_chunk(l, spec.left_schema.clone(), pool)?;
-            for r in &right_chunks {
-                let r = load_chunk(r, spec.right_schema.clone(), pool)?;
-                joined.extend(join_pair(
-                    &l,
-                    &r,
-                    &spec,
-                    &session.policy,
-                    session.workers,
-                    pool,
-                    &session.exec_token(),
-                )?);
-            }
-        }
+        let joined = partitioned_inner_join(
+            left_chunks,
+            right_chunks,
+            &spec,
+            &session.policy,
+            session.workers,
+            pool,
+            &session.exec_token(),
+        )?;
         if joined.is_empty() {
             return agg::merge_finish(Vec::new(), group, aggs, out_schema, &session.policy);
         }
@@ -668,6 +658,286 @@ fn concat_chunk(batches: &[Batch], schema: SchemaRef, pool: &MemoryPool) -> Resu
             Ok(out)
         }
     }
+}
+
+fn partition_count(n_left: usize, n_right: usize) -> usize {
+    n_left.max(n_right).next_power_of_two().clamp(4, 64)
+}
+
+const GRACE_MAX_DEPTH: u32 = 4;
+
+fn chunk_bytes(chunk: &Chunk) -> u64 {
+    match chunk {
+        Chunk::Mem(b) => batch_bytes(b),
+        Chunk::File(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX),
+    }
+}
+
+fn chunks_fit(chunks: &[Chunk], pool: &MemoryPool) -> bool {
+    let Some(limit) = pool.limit() else {
+        return true;
+    };
+    let bytes: u64 = chunks.iter().map(chunk_bytes).sum();
+    bytes <= limit / 2
+}
+
+/// Inner equi-join: hash-partition both sides, then join each partition pair
+/// once. A batch-pair loop rebuilds a hash table per left×right chunk.
+/// Oversized or skewed partitions recurse, then fall back to one chunk pair
+/// at a time so the working set stays bounded by a pair of chunks.
+fn partitioned_inner_join(
+    left_chunks: Vec<Chunk>,
+    right_chunks: Vec<Chunk>,
+    spec: &JoinSpec<'_>,
+    policy: &BatchPolicy,
+    workers: usize,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Vec<Batch>> {
+    let left_ncols = spec.left_schema.fields().len();
+    let split = match spec.on {
+        Some(pred) => split_equi(pred, left_ncols)?,
+        None => EquiSplit {
+            keys: Vec::new(),
+            residual: None,
+        },
+    };
+    if split.keys.is_empty() {
+        return nested_chunk_join(
+            &left_chunks,
+            &right_chunks,
+            spec,
+            policy,
+            workers,
+            pool,
+            cancel,
+        );
+    }
+    let left_keys: Vec<Expr> = split.keys.iter().map(|(l, _)| l.clone()).collect();
+    let right_keys: Vec<Expr> = split.keys.iter().map(|(_, r)| r.clone()).collect();
+    grace_join(
+        left_chunks,
+        right_chunks,
+        &left_keys,
+        &right_keys,
+        spec,
+        policy,
+        workers,
+        pool,
+        cancel,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grace_join(
+    left_chunks: Vec<Chunk>,
+    right_chunks: Vec<Chunk>,
+    left_keys: &[Expr],
+    right_keys: &[Expr],
+    spec: &JoinSpec<'_>,
+    policy: &BatchPolicy,
+    workers: usize,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+    depth: u32,
+) -> Result<Vec<Batch>> {
+    cancel.check()?;
+    if left_chunks.is_empty() || right_chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+    if left_chunks.len() <= 1 && right_chunks.len() <= 1 {
+        return join_loaded_chunks(
+            &left_chunks,
+            &right_chunks,
+            spec,
+            policy,
+            workers,
+            pool,
+            cancel,
+        );
+    }
+    if chunks_fit(&left_chunks, pool) && chunks_fit(&right_chunks, pool) {
+        let left = take_batches(left_chunks, spec.left_schema.clone())?;
+        let right = take_batches(right_chunks, spec.right_schema.clone())?;
+        if left.iter().all(|b| b.num_rows() == 0) || right.iter().all(|b| b.num_rows() == 0) {
+            return Ok(Vec::new());
+        }
+        return hash_join_streamed(&left, &right, spec, policy, workers, pool, cancel);
+    }
+    if depth >= GRACE_MAX_DEPTH {
+        return nested_chunk_join(
+            &left_chunks,
+            &right_chunks,
+            spec,
+            policy,
+            workers,
+            pool,
+            cancel,
+        );
+    }
+    let npart = partition_count(left_chunks.len(), right_chunks.len());
+    let mut left_parts = partition_side(
+        &left_chunks,
+        spec.left_schema.clone(),
+        left_keys,
+        npart,
+        depth,
+        pool,
+        cancel,
+    )?;
+    let mut right_parts = partition_side(
+        &right_chunks,
+        spec.right_schema.clone(),
+        right_keys,
+        npart,
+        depth,
+        pool,
+        cancel,
+    )?;
+    let mut out = Vec::new();
+    for i in 0..npart {
+        out.extend(grace_join(
+            std::mem::take(&mut left_parts[i]),
+            std::mem::take(&mut right_parts[i]),
+            left_keys,
+            right_keys,
+            spec,
+            policy,
+            workers,
+            pool,
+            cancel,
+            depth + 1,
+        )?);
+    }
+    Ok(out)
+}
+
+fn join_loaded_chunks(
+    left_chunks: &[Chunk],
+    right_chunks: &[Chunk],
+    spec: &JoinSpec<'_>,
+    policy: &BatchPolicy,
+    workers: usize,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Vec<Batch>> {
+    let left = match left_chunks.first() {
+        Some(c) => load_chunk(c, spec.left_schema.clone(), pool)?,
+        None => Batch::empty(spec.left_schema.clone())?,
+    };
+    let right = match right_chunks.first() {
+        Some(c) => load_chunk(c, spec.right_schema.clone(), pool)?,
+        None => Batch::empty(spec.right_schema.clone())?,
+    };
+    hash_join_streamed(
+        std::slice::from_ref(&left),
+        std::slice::from_ref(&right),
+        spec,
+        policy,
+        workers,
+        pool,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn partition_side(
+    chunks: &[Chunk],
+    schema: SchemaRef,
+    key_exprs: &[Expr],
+    npart: usize,
+    depth: u32,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Vec<Vec<Chunk>>> {
+    let mut parts: Vec<Vec<Chunk>> = (0..npart).map(|_| Vec::new()).collect();
+    for chunk in chunks {
+        cancel.check()?;
+        let batch = load_chunk(chunk, schema.clone(), pool)?;
+        let scattered = scatter_batch(&batch, schema.clone(), key_exprs, npart, depth, pool)?;
+        for (i, piece) in scattered.into_iter().enumerate() {
+            if let Some(piece) = piece {
+                if pool.can_spill() {
+                    parts[i].push(spill_chunk(
+                        std::slice::from_ref(&piece),
+                        schema.clone(),
+                        pool,
+                    )?);
+                } else {
+                    parts[i].push(Chunk::Mem(piece));
+                }
+            }
+        }
+    }
+    Ok(parts)
+}
+
+/// Power-of-two bucket. Depth takes the next 6 hash bits (max partition
+/// count is 64) so a later pass can split rows that shared a first-pass
+/// bucket. Adding a salt then masking cannot.
+fn partition_bucket(h: u64, npart: usize, depth: u32) -> usize {
+    let shift = (depth * 6) % 64;
+    ((h >> shift) as usize) & (npart - 1)
+}
+
+fn scatter_batch(
+    batch: &Batch,
+    schema: SchemaRef,
+    key_exprs: &[Expr],
+    npart: usize,
+    depth: u32,
+    pool: &MemoryPool,
+) -> Result<Vec<Option<Batch>>> {
+    if batch.num_rows() == 0 {
+        return Ok(vec![None; npart]);
+    }
+    let keys: Vec<ArrayRef> = key_exprs
+        .iter()
+        .map(|e| e.eval(batch))
+        .collect::<Result<_>>()?;
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); npart];
+    for row in 0..batch.num_rows() {
+        if row_has_null(&keys, row) {
+            continue;
+        }
+        let h = hash_row(&keys, row)?;
+        buckets[partition_bucket(h, npart, depth)].push(row as u32);
+    }
+    let mut out = Vec::with_capacity(npart);
+    for idx in buckets {
+        if idx.is_empty() {
+            out.push(None);
+        } else {
+            out.push(Some(take_left(batch, &idx, schema.clone(), pool)?));
+        }
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nested_chunk_join(
+    left_chunks: &[Chunk],
+    right_chunks: &[Chunk],
+    spec: &JoinSpec<'_>,
+    policy: &BatchPolicy,
+    workers: usize,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Vec<Batch>> {
+    let mut parts = Vec::new();
+    for l in left_chunks {
+        let l = load_chunk(l, spec.left_schema.clone(), pool)?;
+        for r in right_chunks {
+            let r = load_chunk(r, spec.right_schema.clone(), pool)?;
+            parts.push(join_pair(&l, &r, spec, policy, workers, pool, cancel)?);
+        }
+    }
+    Ok(parts
+        .into_iter()
+        .flatten()
+        .filter(|b| b.num_rows() > 0)
+        .collect())
 }
 
 fn semi_anti_chunks(
@@ -1504,6 +1774,8 @@ impl BuildTable {
     fn new(build_keys: &[ArrayRef], probe_keys: &[ArrayRef], n_build: usize) -> Result<Self> {
         #[cfg(test)]
         BUILD_TABLES.with(|c| c.set(c.get() + 1));
+        #[cfg(test)]
+        BUILD_ROWS.with(|c| c.set(c.get() + n_build));
         if build_keys.len() == 1
             && probe_keys.len() == 1
             && build_keys[0].data_type() == probe_keys[0].data_type()
@@ -2262,6 +2534,7 @@ fn shift_right(expr: &Expr, left_ncols: usize) -> Expr {
 #[cfg(test)]
 thread_local! {
     static BUILD_TABLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BUILD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -2466,5 +2739,113 @@ mod tests {
         );
         let c = out[0].column(0).as_primitive::<Int64Type>();
         assert_eq!(c.value(0), 40);
+    }
+
+    #[test]
+    fn recursive_partition_uses_fresh_hash_bits() {
+        let npart = 64;
+        let h1 = 0u64;
+        let h2 = 1u64 << 6;
+        assert_eq!(
+            partition_bucket(h1, npart, 0),
+            partition_bucket(h2, npart, 0)
+        );
+        assert_ne!(
+            partition_bucket(h1, npart, 1),
+            partition_bucket(h2, npart, 1)
+        );
+    }
+
+    #[test]
+    fn memory_limited_inner_join_builds_each_row_once() {
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+        ]));
+        let join_schema = Arc::new(Schema::new(
+            left_schema
+                .fields()
+                .iter()
+                .cloned()
+                .chain(right_schema.fields().iter().cloned())
+                .collect::<Vec<_>>(),
+        ));
+        let left: Vec<Batch> = (0..4)
+            .map(|i| {
+                let a = i * 2;
+                Batch::try_new(
+                    left_schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(vec![a, a + 1])),
+                        Arc::new(Int64Array::from(vec![i, i + 10])),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let right: Vec<Batch> = (0..5)
+            .map(|i| {
+                Batch::try_new(
+                    right_schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(vec![i])),
+                        Arc::new(Int64Array::from(vec![i])),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let cap = batch_bytes(&left[0]) + batch_bytes(&left[0]) / 2;
+        let root = std::env::temp_dir().join(format!(
+            "mizuchi-join-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let on = Expr::Binary(BinaryOp::Eq, Box::new(Expr::nth(0)), Box::new(Expr::nth(2)));
+        let session = Session::new().with_workers(2).unwrap();
+        let pool = MemoryPool::new(Some(cap), Some(root.clone())).unwrap();
+
+        BUILD_ROWS.with(|c| c.set(0));
+        let joined = run(
+            Box::new(Exec::Scan {
+                batches: left,
+                index: 0,
+            }),
+            Box::new(Exec::Scan {
+                batches: right,
+                index: 0,
+            }),
+            JoinSpec {
+                join_type: JoinType::Inner,
+                on: Some(&on),
+                left_schema: left_schema.clone(),
+                right_schema: right_schema.clone(),
+                schema: join_schema.clone(),
+            },
+            &session.policy,
+            &pool,
+            &session.exec_token(),
+            session.workers,
+        )
+        .unwrap();
+        let rows: usize = joined.iter().map(Batch::num_rows).sum();
+        assert_eq!(rows, 5);
+        let built = BUILD_ROWS.with(|c| c.get());
+        // Nested left×right pairs would rebuild the 1-row right side 20 times.
+        assert!((1..=5).contains(&built), "each build row once, got {built}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
