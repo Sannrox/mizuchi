@@ -66,22 +66,41 @@ if scale in ("1", "sf1"):
 elif scale not in ("tiny", "sf10"):
     sys.exit(f"unknown scale {scale}")
 
+def load_run(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
 def load_queries(path):
     if not path:
         return {}
-    with open(path, encoding="utf-8") as f:
-        body = json.load(f)
+    body = load_run(path)
     out = {}
     for q in body.get("queries", []):
         out[q["id"]] = float(q["reported_ms"])
     return out
 
-mizuchi = load_queries(os.environ["MIZUCHI"]) if os.environ.get("MIZUCHI") else {}
+mizuchi_path = os.environ.get("MIZUCHI") or ""
+if mizuchi_path:
+    mz_run = load_run(mizuchi_path)
+    workers = int(mz_run.get("workers") or 0)
+    if workers <= 1:
+        sys.exit(
+            f"{mizuchi_path} used workers={workers}; "
+            "tpcds_store_sales must time the parallel path (workers > 1)"
+        )
+mizuchi = load_queries(mizuchi_path) if mizuchi_path else {}
 duckdb = load_queries(os.environ.get("DUCKDB") or "")
 datafusion = load_queries(os.environ.get("DATAFUSION") or "")
 
 with open(os.environ["BASELINE"], encoding="utf-8") as f:
     baseline = json.load(f)
+
+base_workers = int(baseline.get("workers") or 0)
+if base_workers <= 1:
+    sys.exit(
+        f"{os.environ['BASELINE']} workers={base_workers}; "
+        "tpcds_store_sales must time the parallel path (workers > 1)"
+    )
 
 factor = float(baseline.get("regression_factor", 1.20))
 min_ratio = float(baseline.get("min_sf1_duckdb_ratio", 0.33))
