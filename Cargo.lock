@@ -1555,7 +1555,9 @@ dependencies = [
  "mizuchi-postgres",
  "object_store",
  "serde_json",
+ "sha2",
  "sqlparser",
+ "subtle",
 ]
 
 [[package]]

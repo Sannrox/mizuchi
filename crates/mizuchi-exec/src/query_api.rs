@@ -13,6 +13,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use super::CancelToken;
 use super::metrics::OperatorMetrics;
@@ -620,9 +622,25 @@ fn bearer_ok(head: &str, token: &str) -> bool {
     };
     let value = value.trim();
     let prefix = "Bearer ";
-    value.len() >= prefix.len()
-        && value.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
-        && &value[prefix.len()..] == token
+    if value.len() < prefix.len()
+        || !value.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    {
+        return false;
+    }
+    bearer_token_matches(&value[prefix.len()..], token)
+}
+
+/// Hash both secrets, then compare the fixed-length digests in constant time.
+/// Direct `==` on the token would return early on the first mismatch and leak
+/// a prefix to a network attacker.
+fn bearer_token_matches(presented: &str, expected: &str) -> bool {
+    let presented_digest = Sha256::digest(presented.as_bytes());
+    let expected_digest = Sha256::digest(expected.as_bytes());
+    bool::from(
+        presented_digest
+            .as_slice()
+            .ct_eq(expected_digest.as_slice()),
+    )
 }
 
 fn dispatch(log: &QueryLog, method: &str, raw_path: &str) -> (u16, Value) {
@@ -1151,6 +1169,15 @@ mod tests {
             "GET /\r\nAuthorization: Bearer secret\r\n",
             "SECRET"
         ));
+    }
+
+    #[test]
+    fn bearer_ok_covers_equal_unequal_and_different_length_tokens() {
+        let head = |token: &str| format!("GET /\r\nAuthorization: Bearer {token}\r\n");
+        assert!(bearer_ok(&head("secret"), "secret"));
+        assert!(!bearer_ok(&head("secret"), "secreT"));
+        assert!(!bearer_ok(&head("secre"), "secret"));
+        assert!(!bearer_ok(&head("secret!"), "secret"));
     }
 
     #[test]
