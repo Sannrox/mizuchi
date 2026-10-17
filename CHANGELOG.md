@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- Query API bearer comparison hashes both tokens and compares the digests in constant time, so response timing does not leak a prefix of the configured token.
+
 ### Changed
 
 - The library is a layered workspace (ADR 0013): `mizuchi-core`, `mizuchi-plan`, `mizuchi-io`, `mizuchi-postgres`, `mizuchi-exec`, and the `mizuchi` facade. Embedder crate-root re-exports are unchanged. `parse_sql` no longer re-exports `sqlparser::ast::Statement`. Query API JSON Schema lives in `crates/mizuchi-exec/schemas/query-api-v1.json`. Flight stays behind `--features flight` in `mizuchi-flight`.

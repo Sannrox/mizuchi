@@ -15,7 +15,9 @@ mizuchi-plan = { workspace = true }
 mizuchi-postgres = { workspace = true }
 object_store = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.11"
 sqlparser = { workspace = true }
+subtle = "2.6"
 
 [features]
 default = []
