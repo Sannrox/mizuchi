@@ -83,6 +83,10 @@ impl MemoryPool {
         self.limit.is_some()
     }
 
+    pub(super) fn limit(&self) -> Option<u64> {
+        self.limit
+    }
+
     pub(super) fn try_reserve(&self, bytes: u64) -> Result<Reservation<'_>> {
         if bytes == 0 {
             return Ok(Reservation {
