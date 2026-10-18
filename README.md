@@ -80,8 +80,10 @@ schema is `crates/mizuchi-exec/schemas/query-api-v1.json`. Bind address, optiona
 token or HS256 JWT/JWKS verifier, history path, and optional unpacked console
 directory (`ui_dir`, served at `/ui/`) are set by the embedder (ADR 0014);
 loopback listens do not require `allow_network`. `SessionConfig.governed`
-plus a `PolicyContext` (allowed tables, row filters, column masks) apply in
-planning; off by default.
+plus a `PolicyContext` (allowed tables, row filters, column masks, opaque
+table and column markings) apply in planning; off by default. Markings
+propagate through the plan into query and write reports. Governed writes
+refuse a destination whose declared labels do not cover the output.
 `mizuchi::VERSION` and `Session::explain` are the strings a runner
 records. A complete walk-through is `cargo run -p mizuchi --example embed`.
 The engine opens TCP only when `SessionConfig.allow_network` is set

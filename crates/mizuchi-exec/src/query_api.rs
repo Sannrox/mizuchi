@@ -824,6 +824,10 @@ fn report_to_json(r: &QueryReport) -> Value {
         "outputs": r.outputs.iter().map(output_json).collect::<Vec<_>>(),
         "principal": r.principal,
         "actor": r.actor,
+        "column_markings": r.column_markings.iter().map(|c| json!({
+            "name": c.name,
+            "labels": c.labels,
+        })).collect::<Vec<_>>(),
     })
 }
 
