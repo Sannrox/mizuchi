@@ -70,9 +70,10 @@ Ratio in the results table is `reference_ms / mizuchi_ms` (same convention as
 `Session::query_metrics` records inclusive `elapsed_ns`, pool `peak_bytes`,
 and `copied_bytes` per physical operator. Exclusive time is inclusive minus the children's
 inclusive times. Rank exclusive time for the CPU profile of the plan.
-`peak_bytes` is the allocation profile: join and aggregate reserve only when
-a `memory_limit` is set, so `gb_bench profile` uses a 24 GiB cap. `gb_bench
-run` stays unbounded so SF10 wall times match [results.md](results.md).
+`peak_bytes` is the allocation profile. `gb_bench profile` uses
+`Session::with_system_memory_budget` (one quarter of machine memory, with
+spill). `gb_bench run` stays unbounded so SF10 wall times match
+[results.md](results.md).
 Reproduce a
 Parquet run with `bash scripts/profile-suite.sh tiny` (or `1` / `10` when
 those scales are generated). Default `cargo test` uses the tiny in-memory

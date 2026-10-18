@@ -622,7 +622,7 @@ fn agg_from_batches(
         let partials = partials
             .into_inner()
             .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?;
-        return super::agg::combine_partials(partials, group, aggs, schema, &session.policy);
+        return super::agg::combine_partials(partials, group, aggs, schema, &session.policy, pool);
     }
     if group.is_empty() {
         let tables = Mutex::new(Vec::new());

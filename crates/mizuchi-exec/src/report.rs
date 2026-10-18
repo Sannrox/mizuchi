@@ -12,6 +12,10 @@ pub struct QueryResult {
     pub batches: Vec<mizuchi_core::batch::Batch>,
     /// What the query read and wrote.
     pub report: QueryReport,
+    /// Memory-pool high water for this execute.
+    pub peak_bytes: u64,
+    /// Spill file bytes written during this execute.
+    pub spilled_bytes: u64,
 }
 
 /// Engine-neutral record of one query's inputs, outputs, version, and plan.

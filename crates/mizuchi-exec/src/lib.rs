@@ -338,6 +338,17 @@ impl Session {
         self
     }
 
+    /// Cap this session at [`memory::system_budget`] and spill under the
+    /// process temp directory. Join, aggregate, and sort then degrade by
+    /// spilling hash partitions or runs instead of failing.
+    pub fn with_system_memory_budget(self) -> Self {
+        let dir = memory::private_spill_root().unwrap_or_else(|_| {
+            std::env::temp_dir().join(format!("mizuchi-spill-{}", std::process::id()))
+        });
+        self.with_memory_limit(memory::system_budget())
+            .with_spill_dir(dir)
+    }
+
     /// Directory for operator spill files (Arrow IPC). Removed per query.
     pub fn with_spill_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.spill_dir = Some(dir.into());
@@ -1062,6 +1073,8 @@ impl Session {
                 QueryResult {
                     report: self.report_for(&plan),
                     batches,
+                    peak_bytes: stats.peak_bytes,
+                    spilled_bytes: stats.spilled_bytes,
                 },
                 stats,
             ))
@@ -1128,6 +1141,8 @@ impl Session {
                 QueryResult {
                     batches,
                     report: QueryReport::new("SHOW TABLES".into(), Vec::new()),
+                    peak_bytes: 0,
+                    spilled_bytes: 0,
                 },
                 query_api::RunStats::default(),
             ));
@@ -1143,6 +1158,8 @@ impl Session {
                 QueryResult {
                     batches,
                     report: QueryReport::new(text, Vec::new()),
+                    peak_bytes: 0,
+                    spilled_bytes: 0,
                 },
                 query_api::RunStats::default(),
             ));
@@ -1153,6 +1170,8 @@ impl Session {
             QueryResult {
                 report: self.report_for(&plan),
                 batches,
+                peak_bytes: stats.peak_bytes,
+                spilled_bytes: stats.spilled_bytes,
             },
             stats,
         ))
@@ -1182,22 +1201,30 @@ impl Session {
                 },
             ));
         }
-        Ok((
-            self.execute_optimized(plan)?,
-            query_api::RunStats::default(),
-        ))
+        self.execute_optimized_stats(plan)
     }
 
-    fn execute_optimized(&self, plan: &LogicalPlan) -> Result<Vec<Batch>> {
-        self.execute_cached(plan, || {
-            let pool = self.memory_pool()?;
+    fn execute_optimized_stats(
+        &self,
+        plan: &LogicalPlan,
+    ) -> Result<(Vec<Batch>, query_api::RunStats)> {
+        let pool = self.memory_pool()?;
+        let batches = self.execute_cached(plan, || {
             if self.workers > 1
                 && let Some(out) = schedule::try_parallel(plan, self, &pool)?
             {
                 return Ok(out);
             }
             collect(physical(plan, self, &pool)?, &self.exec_token())
-        })
+        })?;
+        Ok((
+            batches,
+            query_api::RunStats {
+                peak_bytes: pool.peak(),
+                spilled_bytes: pool.spilled(),
+                metrics: None,
+            },
+        ))
     }
 
     /// Logical and physical plan text. Does not run the query.
@@ -1233,6 +1260,8 @@ impl Session {
                 QueryResult {
                     report: self.report_for(&plan),
                     batches,
+                    peak_bytes: stats.peak_bytes,
+                    spilled_bytes: stats.spilled_bytes,
                 },
                 stats,
             ))
@@ -1254,6 +1283,11 @@ impl Session {
             tree.format(true)
         );
         text.push_str(&stage::explain_analyze(&plan, self)?);
+        text.push_str(&format!(
+            "query peak_bytes={} spilled_bytes={}\n",
+            pool.peak(),
+            pool.spilled()
+        ));
         Ok(text)
     }
 
@@ -5050,7 +5084,11 @@ mod tests {
     fn join_and_agg_spill_under_tiny_limit_and_match() {
         let (t_schema, t_batches) = numbered_batches(12, 32, 0);
         let (u_schema, u_batches) = numbered_batches(8, 16, 0);
-        let cap = tight_limit(&t_batches).max(tight_limit(&u_batches));
+        // Finish() of a few aggregate columns is larger than one scan morsel
+        // after Arrow buffer rounding; keep the cap below the registered set.
+        let cap = tight_limit(&t_batches)
+            .max(tight_limit(&u_batches))
+            .saturating_mul(8);
         let mut s = Session::new();
         s.register("t", t_schema, t_batches).unwrap();
         s.register("u", u_schema, u_batches).unwrap();
@@ -5102,6 +5140,66 @@ mod tests {
         let left = leftover(&root);
         let _ = std::fs::remove_dir_all(&root);
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn query_completes_under_budget_below_working_set() {
+        let (t_schema, t_batches) = numbered_batches(24, 64, 0);
+        let (u_schema, u_batches) = numbered_batches(4, 16, 0);
+        let working: u64 = t_batches
+            .iter()
+            .chain(u_batches.iter())
+            .map(|b| b.as_arrow().get_array_memory_size() as u64)
+            .sum();
+        let largest = t_batches
+            .iter()
+            .chain(u_batches.iter())
+            .map(|b| b.as_arrow().get_array_memory_size() as u64)
+            .max()
+            .unwrap();
+        // Join output is wider than a scan morsel; keep the cap below the
+        // registered working set and above one pipeline batch.
+        let cap = (working / 3).max(largest * 8);
+        assert!(
+            cap < working,
+            "cap {cap} must sit below working set {working}"
+        );
+        let mut s = Session::new();
+        s.register("t", t_schema, t_batches).unwrap();
+        s.register("u", u_schema, u_batches).unwrap();
+        let sql = "SELECT t.g, COUNT(*) AS n FROM t JOIN u ON t.a = u.a GROUP BY t.g ORDER BY g";
+        let want = col_i64(&s.execute_sql(sql).unwrap(), "n");
+        let root = spill_root("budget");
+        let limited = s
+            .clone()
+            .with_memory_limit(cap)
+            .with_spill_dir(root.clone());
+        let got = limited
+            .execute_sql_reported(sql)
+            .unwrap_or_else(|e| panic!("budget below working set must spill: {e}"));
+        assert_eq!(col_i64(&got.batches, "n"), want);
+        assert!(
+            got.spilled_bytes > 0,
+            "peak={} spilled={}",
+            got.peak_bytes,
+            got.spilled_bytes
+        );
+        assert!(
+            got.peak_bytes <= cap,
+            "peak={} cap={} spilled={}",
+            got.peak_bytes,
+            cap,
+            got.spilled_bytes
+        );
+        let text = limited.explain_analyze(sql).unwrap();
+        assert!(text.contains("query peak_bytes="), "{text}");
+        assert!(text.contains("spilled_bytes="), "{text}");
+        let left = leftover(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(left.is_empty(), "{left:?}");
+        let budgeted = s.with_system_memory_budget();
+        assert!(budgeted.execute_sql(sql).is_ok());
+        assert!(memory::system_budget() >= 64 * 1024 * 1024);
     }
 
     #[test]
