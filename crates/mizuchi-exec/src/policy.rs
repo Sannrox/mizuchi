@@ -1,7 +1,8 @@
 //! Query policy context applied in planning.
 //!
 //! Off until the embedder sets [`PolicyContext`]. Governed mode refuses a
-//! query that has no context. The caller owns the policy document.
+//! query that has no context. The caller owns the policy document, including
+//! opaque marking labels that this crate only propagates and reports.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -30,6 +31,11 @@ pub struct PolicyContext {
     /// Per-table columns stripped from the planning catalog so `SELECT *`,
     /// joins, and aggregates cannot name them.
     pub column_masks: BTreeMap<String, BTreeSet<String>>,
+    /// Opaque labels on every row of a table. Mizuchi unions them into
+    /// every output column that reads the table and does not interpret them.
+    pub table_markings: BTreeMap<String, BTreeSet<String>>,
+    /// Opaque labels on a table column, keyed by table then column.
+    pub column_markings: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
 }
 
 impl PolicyContext {
@@ -46,6 +52,8 @@ impl PolicyContext {
             allowed_tables: BTreeSet::new(),
             row_filters: BTreeMap::new(),
             column_masks: BTreeMap::new(),
+            table_markings: BTreeMap::new(),
+            column_markings: BTreeMap::new(),
         }
     }
 
@@ -290,14 +298,20 @@ fn inject_scan_filter(
     let LogicalPlan::Scan { table, filters, .. } = &mut scan else {
         return Ok(scan);
     };
-    let Some(pred_sql) = policy.row_filters.get(&normalize_name(table)) else {
+    let key = normalize_name(table);
+    let Some(schema) = session.tables.get(&key).map(|t| t.schema.clone()) else {
+        if policy.row_filters.contains_key(&key) {
+            return Err(Error::Plan(format!("table not found: {table}")));
+        }
         return Ok(scan);
     };
-    let schema = session
-        .tables
-        .get(&normalize_name(table))
-        .map(|t| t.schema.clone())
-        .ok_or_else(|| Error::Plan(format!("table not found: {table}")))?;
+    for pred in filters.iter_mut() {
+        let old = std::mem::replace(pred, Expr::nth(0));
+        *pred = named_columns(old, schema.as_ref());
+    }
+    let Some(pred_sql) = policy.row_filters.get(&key) else {
+        return Ok(scan);
+    };
     let extra = bind_row_filter(table, schema.clone(), pred_sql, session.query_now_micros())?;
     if extra.is_empty() {
         return Err(Error::Plan(format!(
@@ -305,6 +319,7 @@ fn inject_scan_filter(
         )));
     }
     for pred in extra {
+        let pred = named_columns(pred, schema.as_ref());
         if !filters
             .iter()
             .any(|existing| expr_equiv(existing, &pred, schema.as_ref()))
@@ -313,6 +328,68 @@ fn inject_scan_filter(
         }
     }
     Ok(scan)
+}
+
+/// Bind policy filters against the full table, then name columns so later
+/// projection pruning cannot drop `Nth` ordinals from marking collection.
+fn named_columns(expr: Expr, schema: &Schema) -> Expr {
+    match expr {
+        Expr::Nth(i) => schema
+            .fields()
+            .get(i)
+            .map(|f| Expr::Column(f.name().clone()))
+            .unwrap_or(Expr::Nth(i)),
+        Expr::Binary(op, left, right) => Expr::Binary(
+            op,
+            Box::new(named_columns(*left, schema)),
+            Box::new(named_columns(*right, schema)),
+        ),
+        Expr::Unary(op, child) => Expr::Unary(op, Box::new(named_columns(*child, schema))),
+        Expr::Cast { expr, data_type } => Expr::Cast {
+            expr: Box::new(named_columns(*expr, schema)),
+            data_type,
+        },
+        Expr::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => Expr::Case {
+            operand: operand.map(|e| Box::new(named_columns(*e, schema))),
+            when_then: when_then
+                .into_iter()
+                .map(|(w, t)| (named_columns(w, schema), named_columns(t, schema)))
+                .collect(),
+            else_expr: else_expr.map(|e| Box::new(named_columns(*e, schema))),
+        },
+        Expr::Coalesce(items) => Expr::Coalesce(
+            items
+                .into_iter()
+                .map(|e| named_columns(e, schema))
+                .collect(),
+        ),
+        Expr::Concat(items) => Expr::Concat(
+            items
+                .into_iter()
+                .map(|e| named_columns(e, schema))
+                .collect(),
+        ),
+        Expr::Array(items) => Expr::Array(
+            items
+                .into_iter()
+                .map(|e| named_columns(e, schema))
+                .collect(),
+        ),
+        Expr::Substring {
+            expr,
+            start,
+            length,
+        } => Expr::Substring {
+            expr: Box::new(named_columns(*expr, schema)),
+            start,
+            length,
+        },
+        other => other,
+    }
 }
 
 fn trusted_row_filters(session: &Session, policy: &PolicyContext, table: &str) -> Vec<Expr> {
@@ -1493,5 +1570,238 @@ mod tests {
             col_i64(&out, "salary"),
             vec![Some(100), Some(200), Some(999)]
         );
+    }
+
+    fn marked_policy() -> PolicyContext {
+        PolicyContext::new("a", "alice", "job")
+            .allow_table("employees")
+            .allow_table("depts")
+            .allow_table("out")
+            .mark_column("employees", "salary", "pii")
+            .mark_column("employees", "id", "internal")
+            .mark_column("depts", "name", "org")
+    }
+
+    fn labels_of(report: &QueryReport, col: &str) -> Vec<String> {
+        report
+            .column_markings
+            .iter()
+            .find(|c| c.name == col)
+            .map(|c| c.labels.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn markings_propagate_through_star_exprs_joins_aggs_windows_ctes_and_subqueries() {
+        let s = session_ab().with_policy(marked_policy());
+
+        let star = s.execute_sql_reported("SELECT * FROM employees").unwrap();
+        assert_eq!(labels_of(&star.report, "id"), vec!["internal"]);
+        assert_eq!(labels_of(&star.report, "tenant"), Vec::<String>::new());
+        assert_eq!(labels_of(&star.report, "dept"), Vec::<String>::new());
+        assert_eq!(labels_of(&star.report, "salary"), vec!["pii"]);
+
+        let expr = s
+            .execute_sql_reported(
+                "SELECT salary * 2 AS s2, COALESCE(salary, id) AS c FROM employees",
+            )
+            .unwrap();
+        assert_eq!(labels_of(&expr.report, "s2"), vec!["pii"]);
+        assert_eq!(labels_of(&expr.report, "c"), vec!["internal", "pii"]);
+
+        let join = s
+            .execute_sql_reported(
+                "SELECT employees.id, depts.name FROM employees JOIN depts ON employees.dept = depts.id",
+            )
+            .unwrap();
+        assert_eq!(labels_of(&join.report, "id"), vec!["internal"]);
+        assert_eq!(labels_of(&join.report, "name"), vec!["org"]);
+
+        let agg = s
+            .execute_sql_reported("SELECT dept, SUM(salary) AS total FROM employees GROUP BY dept")
+            .unwrap();
+        assert_eq!(labels_of(&agg.report, "dept"), Vec::<String>::new());
+        assert_eq!(labels_of(&agg.report, "total"), vec!["pii"]);
+
+        let window = s
+            .execute_sql_reported(
+                "SELECT id, SUM(salary) OVER (PARTITION BY dept) AS s FROM employees",
+            )
+            .unwrap();
+        assert_eq!(labels_of(&window.report, "id"), vec!["internal"]);
+        assert_eq!(labels_of(&window.report, "s"), vec!["pii"]);
+
+        let ranked = s
+            .execute_sql_reported(
+                "SELECT id FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY salary) AS rn FROM employees) t",
+            )
+            .unwrap();
+        assert_eq!(labels_of(&ranked.report, "id"), vec!["internal", "pii"]);
+
+        let cte = s
+            .execute_sql_reported("WITH t AS (SELECT id, salary FROM employees) SELECT id FROM t")
+            .unwrap();
+        assert_eq!(labels_of(&cte.report, "id"), vec!["internal"]);
+
+        let sub = s
+            .execute_sql_reported("SELECT id FROM (SELECT id, salary FROM employees) q")
+            .unwrap();
+        assert_eq!(labels_of(&sub.report, "id"), vec!["internal"]);
+
+        let union = s
+            .execute_sql_reported("SELECT salary FROM employees UNION SELECT id FROM employees")
+            .unwrap();
+        let union_col = union.report.column_markings.first().unwrap();
+        assert_eq!(union_col.labels, vec!["internal", "pii"]);
+
+        let intersected = s
+            .execute_sql_reported(
+                "SELECT COUNT(*) AS n FROM (SELECT salary FROM employees INTERSECT SELECT salary FROM employees) t",
+            )
+            .unwrap();
+        assert_eq!(labels_of(&intersected.report, "n"), vec!["pii"]);
+
+        let grouped = s
+            .execute_sql_reported("SELECT COUNT(*) AS n FROM employees GROUP BY salary")
+            .unwrap();
+        assert_eq!(labels_of(&grouped.report, "n"), vec!["pii"]);
+
+        let rec = s
+            .execute_sql_reported(
+                "WITH RECURSIVE t AS (\
+                 SELECT id AS a, dept AS b, salary AS c FROM employees \
+                 UNION ALL \
+                 SELECT a, a, b FROM t WHERE a < 0\
+                 ) SELECT c FROM t",
+            )
+            .unwrap();
+        assert_eq!(labels_of(&rec.report, "c"), vec!["internal", "pii"]);
+    }
+
+    #[test]
+    fn filter_and_table_markings_apply_to_output_columns() {
+        let s = session_ab().with_policy(
+            PolicyContext::new("a", "alice", "job")
+                .allow_table("employees")
+                .mark_column("employees", "salary", "pii")
+                .mark_table("employees", "tenant-a"),
+        );
+        let filtered = s
+            .execute_sql_reported("SELECT id FROM employees WHERE salary > 100")
+            .unwrap();
+        assert_eq!(labels_of(&filtered.report, "id"), vec!["pii", "tenant-a"]);
+
+        let all = s.execute_sql_reported("SELECT id FROM employees").unwrap();
+        assert_eq!(labels_of(&all.report, "id"), vec!["tenant-a"]);
+
+        let policy_filter = session_ab().with_policy(
+            PolicyContext::new("a", "alice", "job")
+                .allow_table("employees")
+                .mark_column("employees", "salary", "pii")
+                .row_filter("employees", "salary > 100"),
+        );
+        let filtered = policy_filter
+            .execute_sql_reported("SELECT id FROM employees")
+            .unwrap();
+        assert_eq!(labels_of(&filtered.report, "id"), vec!["pii"]);
+
+        let schema = session_ab().table_data("employees").unwrap().0;
+        let salary_ord = schema.index_of("salary").unwrap();
+        let plan = LogicalPlan::Scan {
+            table: "employees".into(),
+            schema: schema.clone(),
+            alias: None,
+            projection: Some(vec!["id".into()]),
+            filters: vec![Expr::Binary(
+                BinaryOp::Gt,
+                Box::new(Expr::nth(salary_ord)),
+                Box::new(Expr::lit_i64(100)),
+            )],
+            stats: None,
+        };
+        let supplied = session_ab()
+            .with_policy(
+                PolicyContext::new("a", "alice", "job")
+                    .allow_table("employees")
+                    .mark_column("employees", "salary", "pii"),
+            )
+            .execute_reported(&plan)
+            .unwrap();
+        assert_eq!(labels_of(&supplied.report, "id"), vec!["pii"]);
+    }
+
+    #[test]
+    fn governed_write_is_refused_when_dest_labels_do_not_cover_output() {
+        let s = session_ab().with_governed(true).with_policy(
+            marked_policy()
+                .mark_table("out", "internal")
+                .mark_column("out", "salary", "internal"),
+        );
+        let result = s
+            .execute_sql_reported("SELECT salary FROM employees")
+            .unwrap();
+        assert_eq!(labels_of(&result.report, "salary"), vec!["pii"]);
+        let err = s
+            .check_write_markings("out", &result.report.column_markings)
+            .unwrap_err();
+        assert!(matches!(err, Error::Plan(_)), "{err:?}");
+        assert!(err.to_string().contains("drop marking"), "{err}");
+
+        let covered = session_ab()
+            .with_governed(true)
+            .with_policy(marked_policy().mark_table("out", "pii"));
+        let result = covered
+            .execute_sql_reported("SELECT salary FROM employees")
+            .unwrap();
+        covered
+            .check_write_markings("out", &result.report.column_markings)
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "mizuchi-144-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.parquet");
+        covered
+            .write_parquet_reported_to(
+                &path,
+                "out",
+                &result.batches,
+                &result.report.column_markings,
+                mizuchi_io::ParquetWriteOptions::default(),
+            )
+            .unwrap();
+        let err = covered
+            .write_parquet_reported_to(
+                &path,
+                "out",
+                &result.batches,
+                &[],
+                mizuchi_io::ParquetWriteOptions::default(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("column markings"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let ungoverned = session_ab().with_policy(marked_policy());
+        ungoverned
+            .check_write_markings("out", &result.report.column_markings)
+            .unwrap();
+
+        let bare = session_ab()
+            .with_governed(true)
+            .with_policy(marked_policy());
+        let err = bare
+            .write_parquet_reported(
+                &path,
+                &result.batches,
+                mizuchi_io::ParquetWriteOptions::default(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("destination table"), "{err}");
     }
 }

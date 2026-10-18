@@ -11,6 +11,7 @@ mod incremental;
 mod join;
 mod jwt;
 mod key;
+mod markings;
 pub mod memory;
 mod merge;
 mod metrics;
@@ -66,7 +67,7 @@ pub use query_api::{
     QUERY_API_CONTRACT, QUERY_API_SCHEMA, QueryApiConfig, QueryApiServer, QueryLog, QueryRecord,
     QueryRetention, QueryStatus, RunningQuery,
 };
-pub use report::{InputScan, OutputWrite, QueryReport, QueryResult};
+pub use report::{ColumnLabels, InputScan, OutputWrite, QueryReport, QueryResult};
 pub use stream::{EventWindow, StreamOutput, StreamQuery, StreamQueryConfig, StreamTrigger};
 
 thread_local! {
@@ -730,6 +731,7 @@ impl Session {
     /// from a previous run is present. Checkpoint and sink paths must pass
     /// the write allow-list (and the read allow-list, for recovery).
     pub fn stream_query(&self, schema: SchemaRef, cfg: StreamQueryConfig) -> Result<StreamQuery> {
+        self.refuse_bare_governed_write()?;
         config::assert_allowed(&cfg.checkpoint, &self.allowed_write_paths)?;
         config::assert_allowed(&cfg.checkpoint, &self.allowed_read_paths)?;
         config::assert_allowed(&cfg.sink, &self.allowed_write_paths)?;
@@ -749,6 +751,7 @@ impl Session {
 
     /// Write newline-delimited JSON after the write allow-list check.
     pub fn write_json(&self, dest: impl AsRef<Path>, batches: &[Batch]) -> Result<()> {
+        self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
         mizuchi_io::write_json(dest, batches)
@@ -756,6 +759,7 @@ impl Session {
 
     /// Write an Avro Object Container File after the write allow-list check.
     pub fn write_avro(&self, dest: impl AsRef<Path>, batches: &[Batch]) -> Result<()> {
+        self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
         mizuchi_io::write_avro(dest, batches)
@@ -763,6 +767,7 @@ impl Session {
 
     /// Write an uncompressed ORC file after the write allow-list check.
     pub fn write_orc(&self, dest: impl AsRef<Path>, batches: &[Batch]) -> Result<()> {
+        self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
         mizuchi_io::write_orc(dest, batches)
@@ -770,6 +775,16 @@ impl Session {
 
     /// [`Self::write_parquet`] plus the output side of a [`QueryReport`].
     pub fn write_parquet_reported(
+        &self,
+        dest: impl AsRef<Path>,
+        batches: &[Batch],
+        opts: mizuchi_io::ParquetWriteOptions<'_>,
+    ) -> Result<QueryReport> {
+        self.refuse_bare_governed_write()?;
+        self.write_parquet_reported_inner(dest, batches, opts)
+    }
+
+    pub(crate) fn write_parquet_reported_inner(
         &self,
         dest: impl AsRef<Path>,
         batches: &[Batch],
@@ -820,6 +835,7 @@ impl Session {
         name: &str,
         mode: mizuchi_io::WriteMode,
     ) -> Result<mizuchi_io::LakeSnapshot> {
+        self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
         let (_, batches) = self.table_data(name)?;
@@ -849,6 +865,7 @@ impl Session {
         dest: impl AsRef<Path>,
         sql: &str,
     ) -> Result<mizuchi_io::LakeSnapshot> {
+        self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
         config::assert_allowed(dest, &self.allowed_read_paths)?;
@@ -879,6 +896,7 @@ impl Session {
         name: &str,
         mode: mizuchi_io::WriteMode,
     ) -> Result<mizuchi_io::LakeSnapshot> {
+        self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
         let (_, batches) = self.table_data(name)?;
@@ -908,6 +926,7 @@ impl Session {
         dest: impl AsRef<Path>,
         sql: &str,
     ) -> Result<mizuchi_io::LakeSnapshot> {
+        self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
         config::assert_allowed(dest, &self.allowed_read_paths)?;
@@ -939,6 +958,7 @@ impl Session {
         name: &str,
         mode: mizuchi_io::WriteMode,
     ) -> Result<mizuchi_io::LakeSnapshot> {
+        self.refuse_bare_governed_write()?;
         let (_, batches) = self.table_data(name)?;
         mizuchi_io::write_delta_store(store, prefix, &batches, mode)
     }
@@ -966,6 +986,7 @@ impl Session {
         prefix: &str,
         sql: &str,
     ) -> Result<mizuchi_io::LakeSnapshot> {
+        self.refuse_bare_governed_write()?;
         let target = mizuchi_plan::merge_target_table(sql)?;
         let head = mizuchi_io::delta_head_store(store, prefix)?;
         let batches = mizuchi_io::read_delta_store(store, prefix, mizuchi_io::TimeTravel::Latest)?;
@@ -993,6 +1014,7 @@ impl Session {
         name: &str,
         mode: mizuchi_io::WriteMode,
     ) -> Result<mizuchi_io::LakeSnapshot> {
+        self.refuse_bare_governed_write()?;
         let (_, batches) = self.table_data(name)?;
         mizuchi_io::write_iceberg_store(store, prefix, &batches, mode)
     }
@@ -1020,6 +1042,7 @@ impl Session {
         prefix: &str,
         sql: &str,
     ) -> Result<mizuchi_io::LakeSnapshot> {
+        self.refuse_bare_governed_write()?;
         let target = mizuchi_plan::merge_target_table(sql)?;
         let head = mizuchi_io::iceberg_head_store(store, prefix)?;
         let batches =
@@ -1204,7 +1227,11 @@ impl Session {
     fn report_for(&self, plan: &LogicalPlan) -> QueryReport {
         let mut inputs = Vec::new();
         collect_scan_reports(plan, self, &mut inputs);
-        self.attach_actor(QueryReport::new(report::plan_text(plan), inputs))
+        let mut report = self.attach_actor(QueryReport::new(report::plan_text(plan), inputs));
+        if let Some(policy) = &self.query_policy {
+            report.column_markings = markings::propagate(plan, policy);
+        }
+        report
     }
 
     fn attach_actor(&self, mut report: QueryReport) -> QueryReport {

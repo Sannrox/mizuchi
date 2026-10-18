@@ -5,6 +5,15 @@ use mizuchi_plan::LogicalPlan;
 
 pub use mizuchi_core::{InputScan, OutputWrite};
 
+/// Output column with the opaque labels that reached it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnLabels {
+    /// Result or written column name.
+    pub name: String,
+    /// Sorted unique labels. Empty means unmarked.
+    pub labels: Vec<String>,
+}
+
 /// Batches plus the lineage report for one execute.
 #[derive(Clone, Debug)]
 pub struct QueryResult {
@@ -36,6 +45,8 @@ pub struct QueryReport {
     pub principal: Option<String>,
     /// Actor from the query policy, when set.
     pub actor: Option<String>,
+    /// Output columns with the labels that reached them.
+    pub column_markings: Vec<ColumnLabels>,
 }
 
 impl QueryReport {
@@ -49,6 +60,7 @@ impl QueryReport {
             outputs: Vec::new(),
             principal: None,
             actor: None,
+            column_markings: Vec::new(),
         }
     }
 
@@ -60,6 +72,7 @@ impl QueryReport {
             outputs: vec![output],
             principal: None,
             actor: None,
+            column_markings: Vec::new(),
         }
     }
 }

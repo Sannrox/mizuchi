@@ -43,6 +43,14 @@
         "commit_id": { "type": "string" }
       }
     },
+    "ColumnLabels": {
+      "type": "object",
+      "required": ["name", "labels"],
+      "properties": {
+        "name": { "type": "string" },
+        "labels": { "type": "array", "items": { "type": "string" } }
+      }
+    },
     "QueryReport": {
       "type": "object",
       "required": ["engine_version", "plan", "inputs", "outputs"],
@@ -52,7 +60,11 @@
         "inputs": { "type": "array", "items": { "$ref": "#/$defs/InputScan" } },
         "outputs": { "type": "array", "items": { "$ref": "#/$defs/OutputWrite" } },
         "principal": { "type": ["string", "null"] },
-        "actor": { "type": ["string", "null"] }
+        "actor": { "type": ["string", "null"] },
+        "column_markings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ColumnLabels" }
+        }
       }
     },
     "OperatorMetrics": {
