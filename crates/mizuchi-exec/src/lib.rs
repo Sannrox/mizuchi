@@ -18,6 +18,7 @@ mod query_api;
 mod query_ui;
 mod recursive;
 mod report;
+mod runtime_filter;
 mod schedule;
 mod setop;
 mod sort;
@@ -100,6 +101,9 @@ pub struct Session {
     allow_network: bool,
     /// When true, stage tasks may run a speculative copy; first commit wins.
     speculate: bool,
+    /// After an inner hash-join build, push integer join keys into the
+    /// probe-side scan. Off is still correct; scans may ignore the filter.
+    runtime_join_filters: bool,
     /// Combinable user-defined aggregates, keyed by lower-case SQL name.
     udafs: BTreeMap<String, Arc<dyn CombineAgg>>,
     /// Query-start clock in microseconds since the Unix epoch. `None` uses
@@ -129,6 +133,7 @@ impl Default for Session {
             allowed_write_paths: Vec::new(),
             allow_network: false,
             speculate: false,
+            runtime_join_filters: true,
             udafs: BTreeMap::new(),
             now_micros: None,
             query_log: None,
@@ -159,6 +164,7 @@ impl Clone for Session {
             allowed_write_paths: self.allowed_write_paths.clone(),
             allow_network: self.allow_network,
             speculate: self.speculate,
+            runtime_join_filters: self.runtime_join_filters,
             udafs: self.udafs.clone(),
             now_micros: self.now_micros,
             query_log: self.query_log.clone(),
@@ -260,6 +266,12 @@ impl Session {
     /// Run a second copy of each stage task; the first commit wins.
     pub fn with_speculate(mut self, on: bool) -> Self {
         self.speculate = on;
+        self
+    }
+
+    /// Push inner-join build keys into the probe-side scan. Default is on.
+    pub fn with_runtime_join_filters(mut self, on: bool) -> Self {
+        self.runtime_join_filters = on;
         self
     }
 
@@ -1687,6 +1699,17 @@ pub(crate) fn build_physical(
     analyze: bool,
     work: Option<(&str, &[Batch])>,
 ) -> Result<(Box<dyn Operator>, metrics::PhysNode)> {
+    build_physical_filtered(plan, session, pool, analyze, work, &[])
+}
+
+fn build_physical_filtered(
+    plan: &LogicalPlan,
+    session: &Session,
+    pool: &memory::MemoryPool,
+    analyze: bool,
+    work: Option<(&str, &[Batch])>,
+    runtime: &[Expr],
+) -> Result<(Box<dyn Operator>, metrics::PhysNode)> {
     let lowering = session.lowering.0.as_ref();
     match plan {
         LogicalPlan::Empty { schema } => Ok(metrics::finish(
@@ -1719,6 +1742,7 @@ pub(crate) fn build_physical(
             table,
             projection,
             filters,
+            schema,
             ..
         } => {
             let table = session
@@ -1747,21 +1771,33 @@ pub(crate) fn build_physical(
                 if !project_first && let Some(names) = projection {
                     batch = project_named(batch, names)?;
                 }
+                if !runtime.is_empty() {
+                    match runtime_filter::apply_preds(batch, runtime)? {
+                        Some(kept) => batch = kept,
+                        None => continue,
+                    }
+                }
                 morsels.extend(batch.split_by_policy(&session.policy));
             }
-            Ok(metrics::finish(
-                "Scan",
-                lowering.scan(morsels)?,
-                Vec::new(),
-                analyze,
-                pool,
-            ))
+            let (op, mut node) =
+                metrics::finish("Scan", lowering.scan(morsels)?, Vec::new(), analyze, pool);
+            if let Some(rf) = runtime_detail(runtime, schema.as_ref()) {
+                node.detail = rf;
+            }
+            Ok((op, node))
         }
         LogicalPlan::Filter { input, predicate } => {
-            let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
+            // Do not push runtime preds through a Filter: a join key like
+            // `100 / x` may only be safe after this predicate.
+            let (child, child_node) =
+                build_physical_filtered(input, session, pool, analyze, work, &[])?;
+            let mut op = lowering.filter(child, predicate.clone())?;
+            for pred in runtime {
+                op = lowering.filter(op, pred.clone())?;
+            }
             Ok(metrics::finish(
                 "Filter",
-                lowering.filter(child, predicate.clone())?,
+                op,
                 vec![child_node],
                 analyze,
                 pool,
@@ -1772,14 +1808,38 @@ pub(crate) fn build_physical(
             exprs,
             schema,
         } => {
-            let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
-            Ok(metrics::finish(
-                "Project",
-                lowering.project(child, exprs.clone(), schema.clone())?,
-                vec![child_node],
-                analyze,
-                pool,
-            ))
+            let rewritten: Option<Vec<Expr>> = runtime
+                .iter()
+                .map(|e| runtime_filter::rewrite_through_project(e, exprs))
+                .collect();
+            let (child_runtime, leftover) = match rewritten {
+                Some(preds) => (preds, Vec::new()),
+                None => (Vec::new(), runtime.to_vec()),
+            };
+            let (child, child_node) =
+                build_physical_filtered(input, session, pool, analyze, work, &child_runtime)?;
+            let projected = lowering.project(child, exprs.clone(), schema.clone())?;
+            if leftover.is_empty() {
+                Ok(metrics::finish(
+                    "Project",
+                    projected,
+                    vec![child_node],
+                    analyze,
+                    pool,
+                ))
+            } else {
+                let mut op = projected;
+                for pred in leftover {
+                    op = lowering.filter(op, pred)?;
+                }
+                Ok(metrics::finish(
+                    "Project",
+                    op,
+                    vec![child_node],
+                    analyze,
+                    pool,
+                ))
+            }
         }
         LogicalPlan::Aggregate {
             input,
@@ -1824,8 +1884,42 @@ pub(crate) fn build_physical(
             on,
             schema,
         } => {
-            let (left_op, left_node) = build_physical(left, session, pool, analyze, work)?;
-            let (right_op, right_node) = build_physical(right, session, pool, analyze, work)?;
+            // Keep parent runtime preds above this join. A fallible parent
+            // key like `100 / fact.k` may only be safe after this join
+            // removes rows that would fail.
+            let left_ncols = left.schema().fields().len();
+            let (right_op, right_node) =
+                build_physical_filtered(right, session, pool, analyze, work, &[])?;
+            let mut build_ns = 0u64;
+            let mut build_copied = 0u64;
+            let (left_op, left_node, right_op) = if *join_type == mizuchi_plan::JoinType::Inner
+                && session.runtime_join_filters
+                && !pool.has_limit()
+            {
+                let t_build = Instant::now();
+                let copied_build = pool.copied();
+                let right_batches = collect(right_op, &session.exec_token())?;
+                let mut left_runtime = Vec::new();
+                if let Some(rf) = runtime_filter::from_build(
+                    on.as_ref(),
+                    left_ncols,
+                    left.schema().as_ref(),
+                    &right_batches,
+                ) {
+                    left_runtime.extend(rf.preds);
+                }
+                build_ns = u64::try_from(t_build.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                build_copied = pool.copied().saturating_sub(copied_build);
+                // Probe-side construction stays outside this join's timer so
+                // nested blocking children keep disjoint exclusive time.
+                let (left_op, left_node) =
+                    build_physical_filtered(left, session, pool, analyze, work, &left_runtime)?;
+                (left_op, left_node, lowering.scan(right_batches)?)
+            } else {
+                let (left_op, left_node) =
+                    build_physical_filtered(left, session, pool, analyze, work, &[])?;
+                (left_op, left_node, right_op)
+            };
             let t0 = Instant::now();
             let copied0 = pool.copied();
             let batches = join::run(
@@ -1843,10 +1937,16 @@ pub(crate) fn build_physical(
                 &session.exec_token(),
                 session.workers,
             )?;
-            let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let mut joined = lowering.scan(batches)?;
+            for pred in runtime {
+                joined = lowering.filter(joined, pred.clone())?;
+            }
+            let ns = u64::try_from(t0.elapsed().as_nanos())
+                .unwrap_or(u64::MAX)
+                .saturating_add(build_ns);
             let (op, node) = metrics::finish(
                 "HashJoin",
-                lowering.scan(batches)?,
+                joined,
                 vec![left_node, right_node],
                 analyze,
                 pool,
@@ -1856,7 +1956,9 @@ pub(crate) fn build_physical(
                     &node,
                     ns,
                     pool.peak(),
-                    pool.copied().saturating_sub(copied0),
+                    pool.copied()
+                        .saturating_sub(copied0)
+                        .saturating_add(build_copied),
                 );
             }
             Ok((op, node))
@@ -2212,6 +2314,17 @@ pub(crate) fn collect(mut exec: Box<dyn Operator>, cancel: &CancelToken) -> Resu
         }
     }
     Ok(out)
+}
+
+fn runtime_detail(runtime: &[Expr], schema: &Schema) -> Option<String> {
+    if runtime.is_empty() {
+        return None;
+    }
+    let summary = runtime_filter::RuntimeFilter {
+        preds: runtime.to_vec(),
+        summary: String::new(),
+    };
+    Some(runtime_filter::format_detail(&summary, schema))
 }
 
 pub(crate) fn filter_batch(batch: &Batch, predicate: &Expr) -> Result<Option<Batch>> {
@@ -2741,6 +2854,338 @@ mod tests {
         let b = join(&large, &small);
         assert_eq!(a, b);
         assert_eq!(a, vec![(Some(0), Some(0)), (Some(2), Some(2))]);
+    }
+
+    fn fact_dim_session() -> Session {
+        let dim_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let dim = Batch::try_new(
+            dim_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![
+                Some(10),
+                Some(20),
+                Some(30),
+            ]))],
+        )
+        .unwrap();
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let fact = Batch::try_new(
+            fact_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((1..=100).map(Some).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from((1..=100).map(Some).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("dim", dim_schema, vec![dim]).unwrap();
+        s.register("fact", fact_schema, vec![fact]).unwrap();
+        s
+    }
+
+    fn scan_rows(text: &str, needle: &str) -> Option<u64> {
+        for line in text.lines() {
+            if line.contains("Scan") && line.contains(needle) && line.contains("rows=") {
+                let after = line.split("rows=").nth(1)?;
+                let n = after.split_whitespace().next()?;
+                return n.parse().ok();
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn runtime_filter_int32_join_stays_correct() {
+        let dim_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let dim = Batch::try_new(
+            dim_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![Some(10), Some(20)]))],
+        )
+        .unwrap();
+        let fact_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, true)]));
+        let fact = Batch::try_new(
+            fact_schema.clone(),
+            vec![Arc::new(Int32Array::from(
+                (1..=40).map(Some).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("dim", dim_schema, vec![dim]).unwrap();
+        s.register("fact", fact_schema, vec![fact]).unwrap();
+        let sql = "SELECT fact.k, dim.id FROM fact JOIN dim ON fact.k = dim.id";
+        let off = s.clone().with_runtime_join_filters(false);
+        let on_n: usize = s
+            .execute_sql(sql)
+            .unwrap()
+            .iter()
+            .map(Batch::num_rows)
+            .sum();
+        let off_n: usize = off
+            .execute_sql(sql)
+            .unwrap()
+            .iter()
+            .map(Batch::num_rows)
+            .sum();
+        assert_eq!(on_n, 2);
+        assert_eq!(on_n, off_n);
+        let text = s.explain_analyze(sql).unwrap();
+        assert!(text.contains("runtime_filter="), "{text}");
+    }
+
+    #[test]
+    fn runtime_filter_join_matches_with_filters_on_and_off() {
+        let sql = "SELECT fact.k, dim.id FROM fact JOIN dim ON fact.k = dim.id";
+        let on = fact_dim_session();
+        let off = fact_dim_session().with_runtime_join_filters(false);
+        let a = sorted_pairs(&on.execute_sql(sql).unwrap(), "k", "id");
+        let b = sorted_pairs(&off.execute_sql(sql).unwrap(), "k", "id");
+        assert_eq!(
+            a,
+            vec![
+                (Some(10), Some(10)),
+                (Some(20), Some(20)),
+                (Some(30), Some(30))
+            ]
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn runtime_filter_explain_analyze_reduces_probe_scan_rows() {
+        let sql = "SELECT fact.k, dim.id FROM fact JOIN dim ON fact.k = dim.id";
+        let on = fact_dim_session();
+        let off = fact_dim_session().with_runtime_join_filters(false);
+        let on_text = on.explain_analyze(sql).unwrap();
+        let off_text = off.explain_analyze(sql).unwrap();
+        assert!(
+            on_text.contains("runtime_filter="),
+            "expected runtime filter on scan:\n{on_text}"
+        );
+        assert!(
+            !off_text.contains("runtime_filter="),
+            "filters off must not label a runtime filter:\n{off_text}"
+        );
+        let on_rows = scan_rows(&on_text, "runtime_filter=").expect(&on_text);
+        let off_rows = off_text
+            .lines()
+            .filter(|l| l.contains("Scan") && l.contains("rows="))
+            .filter_map(|l| {
+                l.split("rows=")
+                    .nth(1)?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .max()
+            .expect(&off_text);
+        assert!(
+            on_rows < off_rows,
+            "probe scan rows on={on_rows} off={off_rows}\non:\n{on_text}\noff:\n{off_text}"
+        );
+        assert_eq!(on_rows, 3, "{on_text}");
+    }
+
+    #[test]
+    fn runtime_filter_parallel_path_matches_pull_path() {
+        let sql = "SELECT fact.k, dim.id FROM fact JOIN dim ON fact.k = dim.id";
+        let pull = fact_dim_session();
+        let parallel = fact_dim_session().with_workers(2).unwrap();
+        let a = sorted_pairs(&pull.execute_sql(sql).unwrap(), "k", "id");
+        let b = sorted_pairs(&parallel.execute_sql(sql).unwrap(), "k", "id");
+        assert_eq!(a, b);
+        let text = parallel.explain_analyze(sql).unwrap();
+        assert!(text.contains("runtime_filter="), "{text}");
+    }
+
+    #[test]
+    fn runtime_filter_does_not_eval_join_key_before_guarding_filter() {
+        let dim_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let dim = Batch::try_new(
+            dim_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(10), Some(5)]))],
+        )
+        .unwrap();
+        let fact_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let fact = Batch::try_new(
+            fact_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![
+                Some(0),
+                Some(10),
+                Some(20),
+            ]))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("dim", dim_schema, vec![dim]).unwrap();
+        s.register("fact", fact_schema, vec![fact]).unwrap();
+        let sql = "SELECT t.k, dim.id FROM (SELECT k, k + 1 AS y FROM fact) t \
+                   JOIN dim ON (100 / t.k) = dim.id WHERE t.y <> 1";
+        let out = s
+            .execute_sql(sql)
+            .unwrap_or_else(|e| panic!("guarded division must not fail: {e}"));
+        let n: usize = out.iter().map(Batch::num_rows).sum();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn runtime_filter_does_not_eval_join_key_before_guarding_join() {
+        let dim_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let dim = Batch::try_new(
+            dim_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(10)]))],
+        )
+        .unwrap();
+        let guard_schema = Arc::new(Schema::new(vec![Field::new("g", DataType::Int64, true)]));
+        let guard = Batch::try_new(
+            guard_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(10)]))],
+        )
+        .unwrap();
+        let fact_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let fact = Batch::try_new(
+            fact_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(0), Some(10)]))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("dim", dim_schema, vec![dim]).unwrap();
+        s.register("guard", guard_schema, vec![guard]).unwrap();
+        s.register("fact", fact_schema, vec![fact]).unwrap();
+        let sql = "SELECT fact.k, dim.id FROM fact \
+                   JOIN guard ON fact.k = guard.g \
+                   JOIN dim ON (100 / fact.k) = dim.id";
+        let out = s
+            .execute_sql(sql)
+            .unwrap_or_else(|e| panic!("guarded nested join must not fail: {e}"));
+        let n: usize = out.iter().map(Batch::num_rows).sum();
+        assert_eq!(n, 1);
+        let parallel = s.with_workers(2).unwrap();
+        let out = parallel
+            .execute_sql(sql)
+            .unwrap_or_else(|e| panic!("parallel guarded nested join must not fail: {e}"));
+        let n: usize = out.iter().map(Batch::num_rows).sum();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn runtime_filter_left_join_does_not_drop_probe_rows() {
+        let sql = "SELECT fact.k FROM fact LEFT JOIN dim ON fact.k = dim.id";
+        let s = fact_dim_session();
+        let out = s.execute_sql(sql).unwrap();
+        let n: usize = out.iter().map(Batch::num_rows).sum();
+        assert_eq!(n, 100);
+        let text = s.explain_analyze(sql).unwrap();
+        assert!(
+            !text.contains("runtime_filter="),
+            "left join must not filter the probe:\n{text}"
+        );
+    }
+
+    #[test]
+    fn runtime_filter_q3_and_store_sales_scans() {
+        // Tiny q3 / store_sales shape: filtered dim on the build side, large fact
+        // as probe. Same pattern as tpch_q3 (orders/lineitem) and tpcds_store_sales.
+        let dim_schema = Arc::new(Schema::new(vec![
+            Field::new("d_date_sk", DataType::Int64, true),
+            Field::new("d_year", DataType::Int64, true),
+        ]));
+        let dim = Batch::try_new(
+            dim_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)])),
+                Arc::new(Int64Array::from(vec![
+                    Some(1993),
+                    Some(1994),
+                    Some(1994),
+                    Some(1995),
+                ])),
+            ],
+        )
+        .unwrap();
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("ss_sold_date_sk", DataType::Int64, true),
+            Field::new("ss_item_sk", DataType::Int64, true),
+        ]));
+        let fact = Batch::try_new(
+            fact_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    (0..40).map(|i| Some(1 + i % 4)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    (0..40).map(|i| Some(1 + i % 8)).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("date_dim", dim_schema, vec![dim]).unwrap();
+        s.register("store_sales", fact_schema, vec![fact]).unwrap();
+        let sql = "SELECT COUNT(*) AS n FROM store_sales JOIN date_dim \
+                   ON ss_sold_date_sk = d_date_sk WHERE d_year = 1994";
+        let off = s.clone().with_runtime_join_filters(false);
+        let on_n = col_i64(&s.execute_sql(sql).unwrap(), "n");
+        let off_n = col_i64(&off.execute_sql(sql).unwrap(), "n");
+        assert_eq!(on_n, off_n);
+        let text = s.explain_analyze(sql).unwrap();
+        assert!(
+            text.contains("runtime_filter="),
+            "store_sales probe must show the filter:\n{text}"
+        );
+        let rows = scan_rows(&text, "runtime_filter=").expect(&text);
+        assert!(rows < 40, "store_sales scan rows={rows}\n{text}");
+    }
+
+    #[test]
+    fn runtime_filter_parquet_direct_skips_row_groups() {
+        use mizuchi_io::{ColumnRange, RowGroupStats, row_group_cannot_match};
+        let dim_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let dim = Batch::try_new(
+            dim_schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1), Some(2)]))],
+        )
+        .unwrap();
+        let rf = runtime_filter::from_build(
+            Some(&Expr::Binary(
+                mizuchi_core::expr::BinaryOp::Eq,
+                Box::new(Expr::nth(0)),
+                Box::new(Expr::nth(1)),
+            )),
+            1,
+            dim.schema().as_ref(),
+            std::slice::from_ref(&dim),
+        )
+        .expect("filter");
+        let schema = Schema::new(vec![Field::new("k", DataType::Int64, true)]);
+        let pred = runtime_filter::nth_to_column(&rf.preds[0], &schema).unwrap();
+        let hit = RowGroupStats {
+            index: 0,
+            num_rows: 2,
+            column_names: vec!["k".into()],
+            i64_ranges: vec![ColumnRange {
+                name: "k".into(),
+                min_i64: Some(1),
+                max_i64: Some(2),
+            }],
+            f64_ranges: vec![],
+        };
+        let miss = RowGroupStats {
+            index: 1,
+            num_rows: 2,
+            column_names: vec!["k".into()],
+            i64_ranges: vec![ColumnRange {
+                name: "k".into(),
+                min_i64: Some(100),
+                max_i64: Some(101),
+            }],
+            f64_ranges: vec![],
+        };
+        assert!(!row_group_cannot_match(&hit, &pred), "{pred:?}");
+        assert!(row_group_cannot_match(&miss, &pred), "{pred:?}");
     }
 
     #[test]
