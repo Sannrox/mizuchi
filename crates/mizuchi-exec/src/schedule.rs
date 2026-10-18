@@ -13,7 +13,8 @@ use arrow::datatypes::SchemaRef;
 
 use super::join::{self, JoinSpec};
 use super::memory::MemoryPool;
-use super::{Exec, Session, collect, filter_batch, physical, project_batch};
+use super::runtime_filter;
+use super::{Exec, Session, collect, physical, project_batch};
 use mizuchi_core::batch::Batch;
 use mizuchi_core::error::{Error, Result};
 use mizuchi_core::expr::Expr;
@@ -103,8 +104,14 @@ pub(super) fn try_parallel(
                 )?));
             }
             if let Some(fused) = inner_join_under_project(input, group, aggs) {
-                let l = plan_batches(fused.left, session, pool)?;
-                let r = plan_batches(fused.right, session, pool)?;
+                let (l, r) = join_sides(
+                    fused.left,
+                    fused.right,
+                    fused.on,
+                    JoinType::Inner,
+                    session,
+                    pool,
+                )?;
                 return Ok(Some(join::run_then_agg(
                     Box::new(Exec::Scan {
                         batches: l,
@@ -145,8 +152,7 @@ pub(super) fn try_parallel(
             on,
             schema,
         } => {
-            let l = plan_batches(left, session, pool)?;
-            let r = plan_batches(right, session, pool)?;
+            let (l, r) = join_sides(left, right, on.as_ref(), *join_type, session, pool)?;
             Ok(Some(join::run(
                 Box::new(Exec::Scan {
                     batches: l,
@@ -378,10 +384,106 @@ fn agg_parallel_ok(aggs: &[(String, AggCall)], pool: &MemoryPool) -> bool {
 }
 
 fn plan_batches(plan: &LogicalPlan, session: &Session, pool: &MemoryPool) -> Result<Vec<Batch>> {
-    if let Some(out) = try_parallel(plan, session, pool)? {
-        return Ok(out);
+    plan_batches_filtered(plan, &[], session, pool)
+}
+
+fn plan_batches_filtered(
+    plan: &LogicalPlan,
+    extra: &[Expr],
+    session: &Session,
+    pool: &MemoryPool,
+) -> Result<Vec<Batch>> {
+    if extra.is_empty() {
+        if let Some(out) = try_parallel(plan, session, pool)? {
+            return Ok(out);
+        }
+        return collect(physical(plan, session, pool)?, &session.exec_token());
     }
-    collect(physical(plan, session, pool)?, &session.exec_token())
+    match plan {
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+            schema,
+        } => {
+            let (l, r) = join_sides(left, right, on.as_ref(), *join_type, session, pool)?;
+            let batches = join::run(
+                Box::new(Exec::Scan {
+                    batches: l,
+                    index: 0,
+                }),
+                Box::new(Exec::Scan {
+                    batches: r,
+                    index: 0,
+                }),
+                JoinSpec {
+                    join_type: *join_type,
+                    on: on.as_ref(),
+                    left_schema: left.schema().clone(),
+                    right_schema: right.schema().clone(),
+                    schema: schema.clone(),
+                },
+                &session.policy,
+                pool,
+                &session.exec_token(),
+                session.workers,
+            )?;
+            runtime_filter::filter_batches(batches, extra)
+        }
+        _ => {
+            if let Some(mut pipe) = as_pipeline(plan) {
+                push_runtime(&mut pipe, extra);
+                return parallel_pipeline(&pipe, session);
+            }
+            let batches = plan_batches(plan, session, pool)?;
+            runtime_filter::filter_batches(batches, extra)
+        }
+    }
+}
+
+/// Build the right (build) side first so inner-join keys can filter the probe.
+/// Parent runtime preds stay above this join; a fallible parent key may only
+/// be safe after this join removes rows that would fail.
+fn join_sides(
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    on: Option<&Expr>,
+    join_type: JoinType,
+    session: &Session,
+    pool: &MemoryPool,
+) -> Result<(Vec<Batch>, Vec<Batch>)> {
+    let left_ncols = left.schema().fields().len();
+    let inner = join_type == JoinType::Inner;
+    let r = plan_batches_filtered(right, &[], session, pool)?;
+    let mut left_extra = Vec::new();
+    if session.runtime_join_filters
+        && inner
+        && let Some(rf) = runtime_filter::from_build(on, left_ncols, left.schema().as_ref(), &r)
+    {
+        left_extra.extend(rf.preds);
+    }
+    let l = plan_batches_filtered(left, &left_extra, session, pool)?;
+    Ok((l, r))
+}
+
+fn push_runtime(pipe: &mut Pipeline, runtime: &[Expr]) {
+    if runtime.is_empty() {
+        return;
+    }
+    if let Some((exprs, _)) = &pipe.project {
+        if let Some(rewritten) = runtime
+            .iter()
+            .map(|e| runtime_filter::rewrite_through_project(e, exprs))
+            .collect::<Option<Vec<_>>>()
+        {
+            pipe.extra_filters.extend(rewritten);
+            return;
+        }
+        pipe.runtime_filters.extend(runtime.iter().cloned());
+        return;
+    }
+    pipe.extra_filters.extend(runtime.iter().cloned());
 }
 
 struct Pipeline {
@@ -389,6 +491,7 @@ struct Pipeline {
     projection: Option<Vec<String>>,
     scan_filters: Vec<Expr>,
     extra_filters: Vec<Expr>,
+    runtime_filters: Vec<Expr>,
     project: Option<(Vec<NamedExpr>, SchemaRef)>,
 }
 
@@ -404,6 +507,7 @@ fn as_pipeline(plan: &LogicalPlan) -> Option<Pipeline> {
             projection: projection.clone(),
             scan_filters: filters.clone(),
             extra_filters: Vec::new(),
+            runtime_filters: Vec::new(),
             project: None,
         }),
         LogicalPlan::Filter { input, predicate } => {
@@ -643,14 +747,8 @@ fn map_morsels(
         .collect())
 }
 
-fn apply_filters(mut batch: Batch, filters: &[Expr]) -> Result<Option<Batch>> {
-    for pred in filters {
-        match filter_batch(&batch, pred)? {
-            Some(kept) => batch = kept,
-            None => return Ok(None),
-        }
-    }
-    Ok(Some(batch))
+fn apply_filters(batch: Batch, filters: &[Expr]) -> Result<Option<Batch>> {
+    runtime_filter::apply_preds(batch, filters)
 }
 
 fn apply_pipe(pipe: &Pipeline, batch: Batch) -> Result<Option<Batch>> {
@@ -674,6 +772,9 @@ fn apply_pipe(pipe: &Pipeline, batch: Batch) -> Result<Option<Batch>> {
     if let Some((exprs, schema)) = &pipe.project {
         batch = project_batch(&batch, exprs, schema.clone())?;
     }
+    let Some(batch) = apply_filters(batch, &pipe.runtime_filters)? else {
+        return Ok(None);
+    };
     if batch.num_rows() == 0 {
         return Ok(None);
     }

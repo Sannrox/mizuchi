@@ -144,6 +144,8 @@ pub(crate) struct Counters {
 
 pub(crate) struct PhysNode {
     pub name: &'static str,
+    /// Extra label after the name (`runtime_filter=[...]` on a Scan).
+    pub detail: String,
     pub metrics: Arc<Counters>,
     pub children: Vec<PhysNode>,
 }
@@ -170,11 +172,15 @@ impl PhysNode {
 
     fn format_into(&self, analyze: bool, indent: usize, out: &mut String) {
         let pad = "  ".repeat(indent);
+        let label = if self.detail.is_empty() {
+            self.name.to_string()
+        } else {
+            format!("{} {}", self.name, self.detail)
+        };
         if analyze {
             let snap = self.snapshot();
             out.push_str(&format!(
-                "{pad}{} rows={} batches={} elapsed_ns={} exclusive_ns={} peak_bytes={} copied_bytes={}\n",
-                snap.name,
+                "{pad}{label} rows={} batches={} elapsed_ns={} exclusive_ns={} peak_bytes={} copied_bytes={}\n",
                 snap.rows,
                 snap.batches,
                 snap.elapsed_ns,
@@ -183,7 +189,7 @@ impl PhysNode {
                 snap.copied_bytes
             ));
         } else {
-            out.push_str(&format!("{pad}{}\n", self.name));
+            out.push_str(&format!("{pad}{label}\n"));
         }
         for child in &self.children {
             child.format_into(analyze, indent + 1, out);
@@ -232,6 +238,7 @@ pub(super) fn physical_shape(plan: &LogicalPlan) -> PhysNode {
 pub(super) fn leaf(name: &'static str) -> PhysNode {
     PhysNode {
         name,
+        detail: String::new(),
         metrics: Arc::new(Counters::default()),
         children: Vec::new(),
     }
@@ -240,6 +247,7 @@ pub(super) fn leaf(name: &'static str) -> PhysNode {
 fn node(name: &'static str, children: Vec<PhysNode>) -> PhysNode {
     PhysNode {
         name,
+        detail: String::new(),
         metrics: Arc::new(Counters::default()),
         children,
     }
@@ -255,6 +263,7 @@ pub(super) fn finish(
     let metrics = Arc::new(Counters::default());
     let node = PhysNode {
         name,
+        detail: String::new(),
         metrics: metrics.clone(),
         children,
     };

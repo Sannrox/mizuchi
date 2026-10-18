@@ -78,9 +78,12 @@ and merge in parallel.
 q3 (407 ms) and store_sales (196 ms) each build two HashJoins. Equality keys
 hash in place. A single integer column in a tight min/max span uses a
 compact range map; unique i64 keys probe with a direct index. Inner joins
-build the smaller collected side. Null keys never match. Both sides are
-fully materialized before probe. Inner probe ranges run on worker threads;
-the hash table is still built on one thread.
+build the smaller estimated side (right). After that build, integer join
+keys become a min/max or small IN-list runtime filter on the probe-side
+scan. `EXPLAIN ANALYZE` prints `runtime_filter=[...]` on the scan and the
+scan's `rows=` count is the rows that survive the filter. In-memory scans
+skip morsels that cannot match; Parquet footer prune treats IN-list as OR.
+Null keys never match. Inner probe ranges run on worker threads.
 
 ### Copies
 

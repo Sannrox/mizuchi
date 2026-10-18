@@ -439,6 +439,9 @@ pub fn row_group_cannot_match(stats: &RowGroupStats, pred: &Expr) -> bool {
         Expr::Binary(BinaryOp::And, l, r) => {
             row_group_cannot_match(stats, l) || row_group_cannot_match(stats, r)
         }
+        Expr::Binary(BinaryOp::Or, l, r) => {
+            row_group_cannot_match(stats, l) && row_group_cannot_match(stats, r)
+        }
         Expr::Binary(op, l, r) => {
             let Some((name, lit, swapped)) = col_cmp_lit(l, r) else {
                 return false;
@@ -1249,6 +1252,39 @@ mod tests {
         assert!(stats.compressed_bytes_kept < stats.compressed_bytes_total);
         assert!(stats.compressed_bytes_kept > 0);
         assert_eq!(col_i64(&out, "id"), vec![Some(3), Some(4)]);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn parquet_or_eq_in_list_skips_row_groups() {
+        let path = write_parquet(&[sample_batch()], 2);
+        let pred = Expr::Binary(
+            mizuchi_core::expr::BinaryOp::Or,
+            Box::new(Expr::Binary(
+                mizuchi_core::expr::BinaryOp::Eq,
+                Box::new(Expr::column("id")),
+                Box::new(Expr::lit_i64(1)),
+            )),
+            Box::new(Expr::Binary(
+                mizuchi_core::expr::BinaryOp::Eq,
+                Box::new(Expr::column("id")),
+                Box::new(Expr::lit_i64(2)),
+            )),
+        );
+        let filters = [pred];
+        let names = ["id".to_string()];
+        let (out, stats) = read_parquet_reported(
+            &path,
+            ParquetReadOptions {
+                filters: Some(&filters),
+                projection: Some(&names),
+                ..ParquetReadOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(stats.row_groups_total, 2);
+        assert_eq!(stats.row_groups_kept, 1);
+        assert_eq!(col_i64(&out, "id"), vec![Some(1), Some(2)]);
         std::fs::remove_file(path).ok();
     }
 
