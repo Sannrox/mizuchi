@@ -287,7 +287,7 @@ fn eval_expr(expr: &Expr, batch: &Batch) -> Result<ArrayRef> {
             start,
             length,
         } => {
-            let child = eval_expr(expr, batch)?;
+            let child = plain_utf8(eval_expr(expr, batch)?)?;
             let arrow_start = if *start >= 1 { *start - 1 } else { *start };
             substring(child.as_ref(), arrow_start, *length).map_err(eval_err)
         }
@@ -408,6 +408,9 @@ fn align_cmp(left: &ArrayRef, right: &ArrayRef) -> Result<(ArrayRef, ArrayRef)> 
     } else if let Some(dt) = widen_decimal(l, r) {
         dt?
     } else {
+        // Dictionary Utf8 versus Utf8 (and other equal-width pairs) go to
+        // Arrow comparison kernels as-is. Arrow 60 compares those without
+        // expanding the dictionary.
         return Ok((left.clone(), right.clone()));
     };
     Ok((
@@ -504,7 +507,7 @@ fn eval_concat(batch: &Batch, args: &[Expr]) -> Result<ArrayRef> {
     }
     let mut arrays = Vec::with_capacity(args.len());
     for arg in args {
-        arrays.push(eval_expr(arg, batch)?);
+        arrays.push(plain_utf8(eval_expr(arg, batch)?)?);
     }
     let mut refs: Vec<&StringArray> = Vec::with_capacity(arrays.len());
     for array in &arrays {
@@ -549,14 +552,28 @@ fn as_utf8(array: &ArrayRef) -> Result<&StringArray> {
         .ok_or_else(|| Error::Eval(format!("expected Utf8, got {}", array.data_type())))
 }
 
+/// Dictionary Utf8 becomes plain Utf8 so string kernels keep working.
+fn plain_utf8(array: ArrayRef) -> Result<ArrayRef> {
+    match array.data_type() {
+        DataType::Dictionary(_, value)
+            if matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            cast_strict(array.as_ref(), value.as_ref())
+        }
+        _ => Ok(array),
+    }
+}
+
 fn map_utf8(array: &ArrayRef, f: impl Fn(&str) -> String) -> Result<ArrayRef> {
-    let strings = as_utf8(array)?;
+    let array = plain_utf8(array.clone())?;
+    let strings = as_utf8(&array)?;
     let out: StringArray = strings.iter().map(|v| v.map(&f)).collect();
     Ok(Arc::new(out))
 }
 
 fn map_utf8_i64(array: &ArrayRef, f: impl Fn(&str) -> i64) -> Result<ArrayRef> {
-    let strings = as_utf8(array)?;
+    let array = plain_utf8(array.clone())?;
+    let strings = as_utf8(&array)?;
     let out: Int64Array = strings.iter().map(|v| v.map(&f)).collect();
     Ok(Arc::new(out))
 }

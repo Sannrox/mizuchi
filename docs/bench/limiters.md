@@ -63,7 +63,9 @@ q1 evaluates several arithmetic aggregates per `lineitem` row (`SUM` of
 selective Filter plus one product. Filter and projection already run Arrow
 compute over whole arrays. Ungrouped aggregate updates (q6) fold COUNT/SUM/AVG
 kernels over those arrays. Grouped lookup (q1) indexes single-byte Utf8 keys with a
-perfect hash (no per-group `Scalar`). Wider domains hash in place and
+perfect hash (no per-group `Scalar`). Short Utf8 keys (at most 16 bytes)
+pack into a fixed-width cell in the hash table. Dictionary Utf8 stays
+dictionary through filter. Wider domains hash in place and
 radix-partition so workers merge disjoint partitions.
 
 ### Hash aggregate

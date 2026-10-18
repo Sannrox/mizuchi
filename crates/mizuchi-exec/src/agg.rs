@@ -3,7 +3,8 @@
 //! Grouping expressions and aggregate arguments are evaluated column-at-a-time.
 //! Small integer, boolean, and single-byte string key ranges use a perfect
 //! hash: accumulators are indexed by the packed key with no per-group
-//! `Scalar`. Other grouped input radix-partitions by hash bits, flushes
+//! `Scalar`. Other Utf8 keys of at most 16 bytes pack inline. Other grouped
+//! input radix-partitions by hash bits, flushes
 //! thread-local tables when they fill, and merges partitions in parallel.
 //! COUNT(expr), SUM, AVG, MIN, and MAX skip nulls; COUNT(*) counts every
 //! input row. COUNT(DISTINCT expr) counts unique non-null values per group.
@@ -309,6 +310,7 @@ fn spill_finished(
 fn scalar_mem(s: &Scalar) -> u64 {
     24 + match s {
         Scalar::Utf8(t) => t.len() as u64,
+        Scalar::Utf8Packed { .. } => 0,
         _ => 0,
     }
 }
@@ -331,6 +333,15 @@ fn piece_payload(batch: &Batch) -> u64 {
             DataType::Utf8 => c.as_string::<i32>().values().len() as u64 + rows.saturating_mul(4),
             DataType::LargeUtf8 => {
                 c.as_string::<i64>().values().len() as u64 + rows.saturating_mul(8)
+            }
+            DataType::Dictionary(k, _) => {
+                let key_w = match k.as_ref() {
+                    DataType::Int8 | DataType::UInt8 => 1,
+                    DataType::Int16 | DataType::UInt16 => 2,
+                    DataType::Int32 | DataType::UInt32 => 4,
+                    _ => 8,
+                };
+                rows.saturating_mul(key_w)
             }
             DataType::Boolean => rows.div_ceil(8),
             _ => rows.saturating_mul(8),
@@ -1775,7 +1786,9 @@ fn decode_dim(dim: &Dim, code: u32, dt: &DataType) -> Result<Scalar> {
         }
         DimKind::Byte => {
             let b = (code - 1) as u8;
-            Ok(Scalar::Utf8(String::from_utf8_lossy(&[b]).into_owned()))
+            Ok(Scalar::from_utf8(
+                std::str::from_utf8(&[b]).unwrap_or("\u{FFFD}"),
+            ))
         }
     }
 }
@@ -2889,7 +2902,7 @@ fn kernel_extremum(array: &dyn Array, is_min: bool) -> Result<Option<Scalar>> {
                     });
                 }
             }
-            cur.map(|s| Scalar::Utf8(s.to_owned()))
+            cur.map(Scalar::from_utf8)
         }
         _ => return Ok(None),
     };
@@ -2966,12 +2979,14 @@ fn cmp_scalar(a: &Scalar, b: &Scalar) -> Result<Ordering> {
         (Scalar::U64(x), Scalar::U64(y)) => x.cmp(y),
         (Scalar::F32(x), Scalar::F32(y)) => f32::from_bits(*x).total_cmp(&f32::from_bits(*y)),
         (Scalar::F64(x), Scalar::F64(y)) => f64::from_bits(*x).total_cmp(&f64::from_bits(*y)),
-        (Scalar::Utf8(x), Scalar::Utf8(y)) => x.cmp(y),
-        _ => {
-            return Err(Error::Eval(
-                "MIN/MAX compared values of different types".into(),
-            ));
-        }
+        (x, y) => match (x.as_utf8(), y.as_utf8()) {
+            (Some(a), Some(b)) => a.cmp(b),
+            _ => {
+                return Err(Error::Eval(
+                    "MIN/MAX compared values of different types".into(),
+                ));
+            }
+        },
     })
 }
 
@@ -3138,8 +3153,10 @@ fn map_utf8(values: &[Scalar]) -> Result<Vec<Option<&str>>> {
         .iter()
         .map(|v| match v {
             Scalar::Null => Ok(None),
-            Scalar::Utf8(s) => Ok(Some(s.as_str())),
-            _ => Err(Error::Eval("expected utf8 aggregate value".into())),
+            other => other
+                .as_utf8()
+                .map(Some)
+                .ok_or_else(|| Error::Eval("expected utf8 aggregate value".into())),
         })
         .collect()
 }

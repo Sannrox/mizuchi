@@ -3747,6 +3747,110 @@ mod tests {
     }
 
     #[test]
+    fn packed_utf8_group_keys_round_trip_including_nulls() {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, true)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![
+                None,
+                Some(""),
+                Some("aa"),
+                Some("aa"),
+                Some("abcdefghijklmnop"),
+                Some("abcdefghijklmnopq"),
+                None,
+            ])) as ArrayRef],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("t", schema, vec![batch]).unwrap();
+        let out = s
+            .execute_sql("SELECT k, COUNT(*) AS c FROM t GROUP BY k")
+            .unwrap();
+        let mut rows: Vec<(Option<String>, i64)> = Vec::new();
+        for batch in &out {
+            let keys = batch.column_by_name("k").unwrap();
+            let counts = batch
+                .column_by_name("c")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                let k = if keys.is_null(i) {
+                    None
+                } else {
+                    Some(
+                        keys.as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .value(i)
+                            .to_owned(),
+                    )
+                };
+                rows.push((k, counts.value(i)));
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            rows,
+            vec![
+                (None, 2),
+                (Some(String::new()), 1),
+                (Some("aa".into()), 2),
+                (Some("abcdefghijklmnop".into()), 1),
+                (Some("abcdefghijklmnopq".into()), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn dictionary_filter_keeps_dictionary_and_matches_utf8_literal() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let keys = Int32Array::from(vec![Some(0), Some(1), Some(0), None, Some(1)]);
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["A", "N"]));
+        let dict = DictionaryArray::try_new(keys, values).unwrap();
+        let batch = Batch::try_new(schema.clone(), vec![Arc::new(dict)]).unwrap();
+        let mut s = Session::new();
+        s.register("d", schema, vec![batch]).unwrap();
+        let out = s
+            .execute_sql("SELECT flag FROM d WHERE flag = 'A' OR flag IS NULL")
+            .unwrap();
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+        let mut got: Vec<Option<String>> = Vec::new();
+        for batch in &out {
+            let col = batch.column_by_name("flag").unwrap();
+            assert!(
+                matches!(col.data_type(), DataType::Dictionary(_, v) if v.as_ref() == &DataType::Utf8),
+                "filter kept dictionary, got {}",
+                col.data_type()
+            );
+            let dict = col
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()
+                .unwrap();
+            let values = dict
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..dict.len() {
+                if dict.is_null(i) {
+                    got.push(None);
+                } else {
+                    got.push(Some(values.value(dict.keys().value(i) as usize).to_owned()));
+                }
+            }
+        }
+        got.sort();
+        assert_eq!(got, vec![None, Some("A".into()), Some("A".into())]);
+    }
+
+    #[test]
     fn kernel_filter_project_and_ungrouped_agg_one_million_rows() {
         const N: i64 = 1_000_000;
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
