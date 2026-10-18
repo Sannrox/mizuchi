@@ -1164,6 +1164,11 @@ fn execute_staged_inner(
     let stages = plan_stages(logical, workers);
     let job = match &session.shuffle_dir {
         Some(root) => {
+            if session.encryption.is_some() {
+                return Err(Error::Io(
+                    "encrypted sessions cannot use disk shuffle".into(),
+                ));
+            }
             let id = JOB_SEQ.fetch_add(1, Ordering::Relaxed);
             let dir = root.join(format!("job-{id}"));
             ShuffleJob {
@@ -2341,6 +2346,47 @@ mod tests {
         assert_eq!(
             sorted_pairs(&pull, "a", "id"),
             sorted_pairs(&staged, "a", "id")
+        );
+        let leftover: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert!(leftover.is_empty(), "{leftover:?}");
+    }
+
+    #[test]
+    fn encrypted_session_refuses_disk_shuffle() {
+        use mizuchi_io::{
+            EncryptionSession, KeyPurpose, MemoryKeyProvider, RuntimeProfile, TenantId, UnwrapGrant,
+        };
+        let _g = lock_stage_tests();
+        let root = std::env::temp_dir().join(format!(
+            "mizuchi-shuffle-enc-{}-{}",
+            std::process::id(),
+            JOB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let provider = Arc::new(MemoryKeyProvider::new(RuntimeProfile::Development).unwrap());
+        let tenant = TenantId::new("acme").unwrap();
+        let grant = UnwrapGrant {
+            tenant_id: tenant.clone(),
+            purpose: KeyPurpose::Spill,
+            expires_unix_secs: i64::MAX / 2,
+        };
+        let keys = EncryptionSession::new(provider, tenant, grant, Vec::new());
+        let s = join_session()
+            .with_encryption(keys)
+            .with_workers(2)
+            .unwrap()
+            .with_shuffle_dir(root.clone());
+        let err = s
+            .execute_staged("SELECT t.a, u.id FROM t JOIN u ON t.a = u.id")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("encrypted sessions cannot use disk shuffle"),
+            "{err}"
         );
         let leftover: Vec<_> = fs::read_dir(&root)
             .unwrap()

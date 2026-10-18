@@ -34,7 +34,7 @@ use super::key::{
     IdentityMap, Scalar, dict_utf8_at, eval_all, extract_key, hash_row, hash_scalars,
     identity_map_with_capacity, row_matches, scalar_at,
 };
-use super::memory::{self, MemoryPool, batch_bytes};
+use super::memory::{MemoryPool, batch_bytes};
 use mizuchi_core::batch::{Batch, BatchPolicy};
 use mizuchi_core::error::{Error, Result};
 use mizuchi_core::expr::Expr;
@@ -771,7 +771,8 @@ fn merge_partition(
     depth: u32,
 ) -> Result<Vec<Batch>> {
     if paths.len() == 1 && !pool.has_limit() {
-        return memory::read_spill(&paths[0], schema)?
+        return pool
+            .read_spill(&paths[0], schema)?
             .into_iter()
             .map(compact_batch)
             .collect();
@@ -806,7 +807,7 @@ fn merge_partition(
     let mut held: Vec<super::memory::Reservation<'_>> = Vec::new();
     let mut more = Vec::new();
     for path in paths {
-        for batch in memory::spill_batches(path)? {
+        for batch in pool.spill_iter(path)? {
             let batch = compact_batch(batch?)?;
             if batch.num_rows() == 0 {
                 continue;
@@ -892,7 +893,7 @@ fn repartition_merge(
     let nsub = 4;
     let mut parts: Vec<Vec<std::path::PathBuf>> = vec![Vec::new(); nsub];
     for path in paths {
-        for batch in memory::spill_batches(path)? {
+        for batch in pool.spill_iter(path)? {
             let batch = compact_batch(batch?)?;
             if batch.num_rows() == 0 {
                 continue;

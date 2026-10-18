@@ -33,7 +33,7 @@ use super::key::{
     FastMap, IdentityMap, fast_map_with_capacity, hash_row, identity_map_with_capacity,
     row_has_null, rows_equal,
 };
-use super::memory::{self, MemoryPool, batch_bytes};
+use super::memory::{MemoryPool, batch_bytes};
 use super::{CancelToken, Exec, Operator, Session, filter_batch};
 use mizuchi_core::batch::{Batch, BatchPolicy};
 use mizuchi_core::error::{Error, Result};
@@ -89,8 +89,8 @@ pub(super) fn run(
                 cancel,
             );
         }
-        let left = take_batches(left_chunks, spec.left_schema.clone())?;
-        let right = take_batches(right_chunks, spec.right_schema.clone())?;
+        let left = take_batches(left_chunks, spec.left_schema.clone(), pool)?;
+        let right = take_batches(right_chunks, spec.right_schema.clone(), pool)?;
         if left.len() == 1 && right.len() == 1 {
             return join_pair(&left[0], &right[0], &spec, policy, workers, pool, cancel);
         }
@@ -99,12 +99,12 @@ pub(super) fn run(
     // Unmatched rows for LEFT/RIGHT/FULL are relative to the whole opposite
     // side. Concatenate once, then emit unmatched rows a single time.
     let left = concat_chunk(
-        &take_batches(left_chunks, spec.left_schema.clone())?,
+        &take_batches(left_chunks, spec.left_schema.clone(), pool)?,
         spec.left_schema.clone(),
         pool,
     )?;
     let right = concat_chunk(
-        &take_batches(right_chunks, spec.right_schema.clone())?,
+        &take_batches(right_chunks, spec.right_schema.clone(), pool)?,
         spec.right_schema.clone(),
         pool,
     )?;
@@ -164,8 +164,8 @@ pub(super) fn run_then_agg(
             &session.exec_token(),
         );
     }
-    let left = take_batches(left_chunks, spec.left_schema.clone())?;
-    let right = take_batches(right_chunks, spec.right_schema.clone())?;
+    let left = take_batches(left_chunks, spec.left_schema.clone(), pool)?;
+    let right = take_batches(right_chunks, spec.right_schema.clone(), pool)?;
     if spec.join_type == JoinType::Inner
         && let Some(out) = fold_unique_i64_join(
             &left,
@@ -563,13 +563,13 @@ fn load_chunk(chunk: &Chunk, schema: SchemaRef, pool: &MemoryPool) -> Result<Bat
     match chunk {
         Chunk::Mem(b) => Ok(b.clone()),
         Chunk::File(p) => {
-            let batches = memory::read_spill(p, schema.clone())?;
+            let batches = pool.read_spill(p, schema.clone())?;
             concat_chunk(&batches, schema, pool)
         }
     }
 }
 
-fn take_batches(chunks: Vec<Chunk>, schema: SchemaRef) -> Result<Vec<Batch>> {
+fn take_batches(chunks: Vec<Chunk>, schema: SchemaRef, pool: &MemoryPool) -> Result<Vec<Batch>> {
     let mut out = Vec::new();
     for chunk in chunks {
         match chunk {
@@ -579,7 +579,7 @@ fn take_batches(chunks: Vec<Chunk>, schema: SchemaRef) -> Result<Vec<Batch>> {
                 }
             }
             Chunk::File(p) => {
-                for b in memory::read_spill(&p, schema.clone())? {
+                for b in pool.read_spill(&p, schema.clone())? {
                     if b.num_rows() > 0 {
                         out.push(b);
                     }
@@ -775,8 +775,8 @@ fn grace_join(
         );
     }
     if chunks_fit(&left_chunks, pool) && chunks_fit(&right_chunks, pool) {
-        let left = take_batches(left_chunks, spec.left_schema.clone())?;
-        let right = take_batches(right_chunks, spec.right_schema.clone())?;
+        let left = take_batches(left_chunks, spec.left_schema.clone(), pool)?;
+        let right = take_batches(right_chunks, spec.right_schema.clone(), pool)?;
         if left.iter().all(|b| b.num_rows() == 0) || right.iter().all(|b| b.num_rows() == 0) {
             return Ok(Vec::new());
         }
@@ -1255,6 +1255,7 @@ fn hash_join_stream_probe(
             &take_batches(
                 collect_chunks(&mut left, spec.left_schema.clone(), pool, cancel)?,
                 spec.left_schema.clone(),
+                pool,
             )?,
             spec.left_schema.clone(),
             pool,
@@ -1263,6 +1264,7 @@ fn hash_join_stream_probe(
             &take_batches(
                 collect_chunks(&mut right, spec.right_schema.clone(), pool, cancel)?,
                 spec.right_schema.clone(),
+                pool,
             )?,
             spec.right_schema.clone(),
             pool,
@@ -1270,7 +1272,7 @@ fn hash_join_stream_probe(
         return join_pair(&l, &r, spec, policy, workers, pool, cancel);
     }
     let right_chunks = collect_chunks(&mut right, spec.right_schema.clone(), pool, cancel)?;
-    let build_batches = take_batches(right_chunks, spec.right_schema.clone())?;
+    let build_batches = take_batches(right_chunks, spec.right_schema.clone(), pool)?;
     let right_keys: Vec<Expr> = split.keys.iter().map(|(_, r)| r.clone()).collect();
     let left_keys: Vec<Expr> = split.keys.iter().map(|(l, _)| l.clone()).collect();
     let probe_sample = key_sample(spec.left_schema.clone(), &left_keys)?;

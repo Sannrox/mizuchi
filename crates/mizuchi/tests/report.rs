@@ -45,6 +45,7 @@ fn partitioned_write_report_is_stable() {
     let opts = ParquetWriteOptions {
         partition_by: &[String::from("year")],
         mode: WriteMode::Overwrite,
+        encryption: None,
     };
     let s = Session::new();
     let first = s
@@ -78,6 +79,7 @@ fn pruned_scan_report_lists_kept_partitions() {
         ParquetWriteOptions {
             partition_by: &[String::from("year")],
             mode: WriteMode::Overwrite,
+            encryption: None,
         },
     )
     .unwrap();
@@ -114,6 +116,7 @@ fn store_pruned_scan_report_matches_fetched_partitions() {
         ParquetWriteOptions {
             partition_by: &[String::from("year")],
             mode: WriteMode::Overwrite,
+            encryption: None,
         },
     )
     .unwrap();

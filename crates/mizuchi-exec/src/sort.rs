@@ -174,14 +174,14 @@ fn merge_spilled(
     while runs.len() > 1 {
         let a = runs.remove(0);
         let b = runs.remove(0);
-        let left = memory::read_spill(&a, schema.clone())?;
-        let right = memory::read_spill(&b, schema.clone())?;
+        let left = pool.read_spill(&a, schema.clone())?;
+        let right = pool.read_spill(&b, schema.clone())?;
         let merged = merge_sorted_batches(left, right, schema.clone(), order, pool, cancel)?;
         let path = pool.write_spill_file(schema.clone(), &merged)?;
         runs.push(path);
     }
     match runs.pop() {
-        Some(path) => memory::read_spill(&path, schema),
+        Some(path) => pool.read_spill(&path, schema),
         None => Ok(vec![Batch::empty(schema)?]),
     }
 }

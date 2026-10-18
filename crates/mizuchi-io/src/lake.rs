@@ -30,8 +30,13 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::file::properties::WriterProperties;
 use serde_json::{Value, json};
 
+use crate::crypto::{EncryptionSession, parquet_writer_properties};
+use crate::read::{
+    parquet_reader_options_with, require_encrypted_footer, require_encrypted_footer_file,
+};
 use crate::write::WriteMode;
 use mizuchi_core::batch::Batch;
 use mizuchi_core::error::{Error, Result};
@@ -97,6 +102,9 @@ trait LakeIo {
     fn put(&self, rel: &str, bytes: &[u8]) -> Result<()>;
     fn get(&self, rel: &str) -> Result<Vec<u8>>;
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
+    fn encryption(&self) -> Option<&EncryptionSession> {
+        None
+    }
     fn write_parquet(
         &self,
         rel: &str,
@@ -107,7 +115,8 @@ trait LakeIo {
         let file_schema = physical_schema(schema, physical);
         let mut buf = Vec::new();
         {
-            let mut writer = ArrowWriter::try_new(&mut buf, file_schema.clone(), None)
+            let props = lake_writer_properties(self.encryption(), file_schema.as_ref(), physical)?;
+            let mut writer = ArrowWriter::try_new(&mut buf, file_schema.clone(), props)
                 .map_err(|e| Error::Io(e.to_string()))?;
             for batch in batches {
                 let projected = to_physical_batch(batch, schema, physical)?;
@@ -124,25 +133,36 @@ trait LakeIo {
         Ok(size)
     }
     fn read_parquet(&self, rel: &str) -> Result<Vec<Batch>> {
-        read_parquet_bytes(rel, &self.get(rel)?)
+        read_parquet_bytes(rel, &self.get(rel)?, self.encryption())
     }
 }
 
 struct PathIo {
     root: PathBuf,
+    encryption: Option<EncryptionSession>,
 }
 
 impl PathIo {
     fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
+            encryption: None,
         }
+    }
+
+    fn with_keys(mut self, keys: EncryptionSession) -> Self {
+        self.encryption = Some(keys);
+        self
     }
 }
 
 impl LakeIo for PathIo {
     fn label(&self) -> String {
         self.root.display().to_string()
+    }
+
+    fn encryption(&self) -> Option<&EncryptionSession> {
+        self.encryption.as_ref()
     }
 
     fn put_create(&self, rel: &str, bytes: &[u8]) -> Result<()> {
@@ -198,7 +218,8 @@ impl LakeIo for PathIo {
             }
             Err(e) => return Err(io_err(&path, e)),
         };
-        let mut writer = ArrowWriter::try_new(file, file_schema.clone(), None)
+        let props = lake_writer_properties(self.encryption(), file_schema.as_ref(), physical)?;
+        let mut writer = ArrowWriter::try_new(file, file_schema.clone(), props)
             .map_err(|e| Error::Io(e.to_string()))?;
         for batch in batches {
             let projected = to_physical_batch(batch, schema, physical)?;
@@ -215,8 +236,12 @@ impl LakeIo for PathIo {
     fn read_parquet(&self, rel: &str) -> Result<Vec<Batch>> {
         let path = confined(&self.root, rel)?;
         let file = File::open(&path).map_err(|e| io_err(&path, e))?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+        require_encrypted_footer_file(&file, self.encryption())?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            file,
+            parquet_reader_options_with(self.encryption())?,
+        )
+        .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
         let reader = builder
             .with_batch_size(mizuchi_core::batch::DEFAULT_MAX_ROWS)
             .build()
@@ -233,6 +258,7 @@ impl LakeIo for PathIo {
 struct StoreIo<'a> {
     store: &'a dyn ObjectStore,
     prefix: String,
+    encryption: Option<EncryptionSession>,
 }
 
 impl<'a> StoreIo<'a> {
@@ -240,7 +266,13 @@ impl<'a> StoreIo<'a> {
         Self {
             store,
             prefix: prefix.trim_matches('/').to_string(),
+            encryption: None,
         }
+    }
+
+    fn with_keys(mut self, keys: EncryptionSession) -> Self {
+        self.encryption = Some(keys);
+        self
     }
 
     fn loc(&self, rel: &str) -> Result<ObjectPath> {
@@ -253,6 +285,10 @@ impl<'a> StoreIo<'a> {
 impl LakeIo for StoreIo<'_> {
     fn label(&self) -> String {
         self.prefix.clone()
+    }
+
+    fn encryption(&self) -> Option<&EncryptionSession> {
+        self.encryption.as_ref()
     }
 
     fn put_create(&self, rel: &str, bytes: &[u8]) -> Result<()> {
@@ -348,6 +384,21 @@ pub fn write_delta(
     write_delta_at(dest.as_ref(), batches, mode, None)
 }
 
+/// [`write_delta`] with Parquet modular encryption.
+pub fn write_delta_keys(
+    dest: impl AsRef<Path>,
+    batches: &[Batch],
+    mode: WriteMode,
+    keys: &EncryptionSession,
+) -> Result<LakeSnapshot> {
+    write_delta_io(
+        &PathIo::new(dest.as_ref()).with_keys(keys.clone()),
+        batches,
+        mode,
+        None,
+    )
+}
+
 /// [`write_delta`] that fails if the current version is not `expected`.
 pub fn write_delta_at(
     dest: impl AsRef<Path>,
@@ -358,9 +409,36 @@ pub fn write_delta_at(
     write_delta_io(&PathIo::new(dest.as_ref()), batches, mode, expected)
 }
 
+/// [`write_delta_at`] with Parquet modular encryption.
+pub fn write_delta_at_keys(
+    dest: impl AsRef<Path>,
+    batches: &[Batch],
+    mode: WriteMode,
+    expected: Option<i64>,
+    keys: &EncryptionSession,
+) -> Result<LakeSnapshot> {
+    write_delta_io(
+        &PathIo::new(dest.as_ref()).with_keys(keys.clone()),
+        batches,
+        mode,
+        expected,
+    )
+}
+
 /// Read a Delta table, optionally at a past version or timestamp.
 pub fn read_delta(dest: impl AsRef<Path>, travel: TimeTravel) -> Result<Vec<Batch>> {
     let io = PathIo::new(dest.as_ref());
+    let snap = delta_replay(&io, travel)?;
+    read_files(&io, &snap.files, &snap.schema, &snap.physical)
+}
+
+/// [`read_delta`] that unwraps encrypted data files.
+pub fn read_delta_keys(
+    dest: impl AsRef<Path>,
+    travel: TimeTravel,
+    keys: &EncryptionSession,
+) -> Result<Vec<Batch>> {
+    let io = PathIo::new(dest.as_ref()).with_keys(keys.clone());
     let snap = delta_replay(&io, travel)?;
     read_files(&io, &snap.files, &snap.schema, &snap.physical)
 }
@@ -384,6 +462,21 @@ pub fn write_iceberg(
     write_iceberg_at(dest.as_ref(), batches, mode, None)
 }
 
+/// [`write_iceberg`] with Parquet modular encryption.
+pub fn write_iceberg_keys(
+    dest: impl AsRef<Path>,
+    batches: &[Batch],
+    mode: WriteMode,
+    keys: &EncryptionSession,
+) -> Result<LakeSnapshot> {
+    write_iceberg_io(
+        &PathIo::new(dest.as_ref()).with_keys(keys.clone()),
+        batches,
+        mode,
+        None,
+    )
+}
+
 /// [`write_iceberg`] that fails if the current version is not `expected`.
 pub fn write_iceberg_at(
     dest: impl AsRef<Path>,
@@ -394,9 +487,36 @@ pub fn write_iceberg_at(
     write_iceberg_io(&PathIo::new(dest.as_ref()), batches, mode, expected)
 }
 
+/// [`write_iceberg_at`] with Parquet modular encryption.
+pub fn write_iceberg_at_keys(
+    dest: impl AsRef<Path>,
+    batches: &[Batch],
+    mode: WriteMode,
+    expected: Option<i64>,
+    keys: &EncryptionSession,
+) -> Result<LakeSnapshot> {
+    write_iceberg_io(
+        &PathIo::new(dest.as_ref()).with_keys(keys.clone()),
+        batches,
+        mode,
+        expected,
+    )
+}
+
 /// Read an Iceberg table, optionally at a past snapshot.
 pub fn read_iceberg(dest: impl AsRef<Path>, travel: TimeTravel) -> Result<Vec<Batch>> {
     let io = PathIo::new(dest.as_ref());
+    let snap = iceberg_replay(&io, travel)?;
+    read_files(&io, &snap.files, &snap.schema, &snap.physical)
+}
+
+/// [`read_iceberg`] that unwraps encrypted data files.
+pub fn read_iceberg_keys(
+    dest: impl AsRef<Path>,
+    travel: TimeTravel,
+    keys: &EncryptionSession,
+) -> Result<Vec<Batch>> {
+    let io = PathIo::new(dest.as_ref()).with_keys(keys.clone());
     let snap = iceberg_replay(&io, travel)?;
     read_files(&io, &snap.files, &snap.schema, &snap.physical)
 }
@@ -421,6 +541,39 @@ pub fn write_delta_store(
     write_delta_store_at(store, prefix, batches, mode, None)
 }
 
+/// [`write_delta_store`] with Parquet modular encryption.
+pub fn write_delta_store_keys(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    batches: &[Batch],
+    mode: WriteMode,
+    keys: &EncryptionSession,
+) -> Result<LakeSnapshot> {
+    write_delta_io(
+        &StoreIo::new(store, prefix).with_keys(keys.clone()),
+        batches,
+        mode,
+        None,
+    )
+}
+
+/// [`write_delta_store_at`] with Parquet modular encryption.
+pub fn write_delta_store_at_keys(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    batches: &[Batch],
+    mode: WriteMode,
+    expected: Option<i64>,
+    keys: &EncryptionSession,
+) -> Result<LakeSnapshot> {
+    write_delta_io(
+        &StoreIo::new(store, prefix).with_keys(keys.clone()),
+        batches,
+        mode,
+        expected,
+    )
+}
+
 /// [`write_delta_store`] that fails if the current version is not `expected`.
 pub fn write_delta_store_at(
     store: &dyn ObjectStore,
@@ -439,6 +592,18 @@ pub fn read_delta_store(
     travel: TimeTravel,
 ) -> Result<Vec<Batch>> {
     let io = StoreIo::new(store, prefix);
+    let snap = delta_replay(&io, travel)?;
+    read_files(&io, &snap.files, &snap.schema, &snap.physical)
+}
+
+/// [`read_delta_store`] that unwraps encrypted data files.
+pub fn read_delta_store_keys(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    travel: TimeTravel,
+    keys: &EncryptionSession,
+) -> Result<Vec<Batch>> {
+    let io = StoreIo::new(store, prefix).with_keys(keys.clone());
     let snap = delta_replay(&io, travel)?;
     read_files(&io, &snap.files, &snap.schema, &snap.physical)
 }
@@ -467,6 +632,39 @@ pub fn write_iceberg_store(
     write_iceberg_store_at(store, prefix, batches, mode, None)
 }
 
+/// [`write_iceberg_store`] with Parquet modular encryption.
+pub fn write_iceberg_store_keys(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    batches: &[Batch],
+    mode: WriteMode,
+    keys: &EncryptionSession,
+) -> Result<LakeSnapshot> {
+    write_iceberg_io(
+        &StoreIo::new(store, prefix).with_keys(keys.clone()),
+        batches,
+        mode,
+        None,
+    )
+}
+
+/// [`write_iceberg_store_at`] with Parquet modular encryption.
+pub fn write_iceberg_store_at_keys(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    batches: &[Batch],
+    mode: WriteMode,
+    expected: Option<i64>,
+    keys: &EncryptionSession,
+) -> Result<LakeSnapshot> {
+    write_iceberg_io(
+        &StoreIo::new(store, prefix).with_keys(keys.clone()),
+        batches,
+        mode,
+        expected,
+    )
+}
+
 /// [`write_iceberg_store`] that fails if the current version is not `expected`.
 pub fn write_iceberg_store_at(
     store: &dyn ObjectStore,
@@ -485,6 +683,18 @@ pub fn read_iceberg_store(
     travel: TimeTravel,
 ) -> Result<Vec<Batch>> {
     let io = StoreIo::new(store, prefix);
+    let snap = iceberg_replay(&io, travel)?;
+    read_files(&io, &snap.files, &snap.schema, &snap.physical)
+}
+
+/// [`read_iceberg_store`] that unwraps encrypted data files.
+pub fn read_iceberg_store_keys(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    travel: TimeTravel,
+    keys: &EncryptionSession,
+) -> Result<Vec<Batch>> {
+    let io = StoreIo::new(store, prefix).with_keys(keys.clone());
     let snap = iceberg_replay(&io, travel)?;
     read_files(&io, &snap.files, &snap.schema, &snap.physical)
 }
@@ -508,6 +718,8 @@ struct Resolved {
     schema: SchemaRef,
     files: Vec<String>,
     physical: BTreeMap<String, String>,
+    /// `mizuchi.encryption` from the latest metadata commit, if any.
+    encryption: Option<Value>,
 }
 
 fn write_delta_io(
@@ -527,6 +739,7 @@ fn write_delta_io(
             )));
         }
     }
+    refuse_lake_encryption_mismatch(io, current.as_ref(), mode)?;
     let next_ver = current.as_ref().map(|c| c.meta.version + 1).unwrap_or(0);
     let physical = match &current {
         Some(c) if mode == WriteMode::Append => c.physical.clone(),
@@ -554,7 +767,7 @@ fn write_delta_io(
                 "format": {"provider": "parquet", "options": {}},
                 "schemaString": schema_string,
                 "partitionColumns": [],
-                "configuration": {"delta.columnMapping.mode": "name"},
+                "configuration": delta_configuration(io, None),
                 "createdTime": now
             }
         }));
@@ -610,7 +823,7 @@ fn evolve_delta_io(io: &dyn LakeIo, change: SchemaEvolution) -> Result<LakeSnaps
                 "format": {"provider": "parquet", "options": {}},
                 "schemaString": schema_string,
                 "partitionColumns": [],
-                "configuration": {"delta.columnMapping.mode": "name"},
+                "configuration": delta_configuration(io, cur.encryption.as_ref()),
                 "createdTime": now
             }
         }),
@@ -634,6 +847,7 @@ fn delta_replay(io: &dyn LakeIo, travel: TimeTravel) -> Result<Resolved> {
     let mut files: Vec<String> = Vec::new();
     let mut schema = Arc::new(Schema::empty());
     let mut physical = BTreeMap::new();
+    let mut encryption = None;
     let mut last_ts = 0i64;
     let mut last_ver = -1i64;
     if let TimeTravel::Version(v) = travel
@@ -666,6 +880,10 @@ fn delta_replay(io: &dyn LakeIo, travel: TimeTravel) -> Result<Resolved> {
                 let (s, p) = parse_delta_schema(md)?;
                 schema = s;
                 physical = p;
+                encryption = md
+                    .get("configuration")
+                    .and_then(|c| c.get("mizuchi.encryption"))
+                    .cloned();
             }
             if let Some(add) = v.get("add")
                 && let Some(p) = add.get("path").and_then(Value::as_str)
@@ -704,6 +922,7 @@ fn delta_replay(io: &dyn LakeIo, travel: TimeTravel) -> Result<Resolved> {
         schema,
         files,
         physical,
+        encryption,
     })
 }
 
@@ -746,6 +965,7 @@ fn write_iceberg_io(
             )));
         }
     }
+    refuse_lake_encryption_mismatch(io, current.as_ref(), mode)?;
     let next_ver = current.as_ref().map(|c| c.meta.version + 1).unwrap_or(1);
     let snapshot_id = now ^ (next_ver << 8);
     let physical = match &current {
@@ -789,6 +1009,7 @@ fn write_iceberg_io(
         &field_ids,
         &manifest_rel,
         current.as_ref(),
+        None,
     )?;
     io.put_create(
         &format!("metadata/v{next_ver}.metadata.json"),
@@ -827,6 +1048,7 @@ fn evolve_iceberg_io(io: &dyn LakeIo, change: SchemaEvolution) -> Result<LakeSna
         &field_ids,
         &manifest_rel,
         Some(&cur),
+        cur.encryption.as_ref(),
     )?;
     io.put_create(
         &format!("metadata/v{next_ver}.metadata.json"),
@@ -885,6 +1107,10 @@ fn iceberg_replay(io: &dyn LakeIo, travel: TimeTravel) -> Result<Resolved> {
         .and_then(Value::as_i64)
         .unwrap_or(0);
     let files = iceberg_files(io, &md)?;
+    let encryption = md
+        .get("properties")
+        .and_then(|p| p.get("mizuchi.encryption"))
+        .cloned();
     Ok(Resolved {
         meta: LakeSnapshot {
             format: "iceberg".into(),
@@ -896,6 +1122,7 @@ fn iceberg_replay(io: &dyn LakeIo, travel: TimeTravel) -> Result<Resolved> {
         schema,
         files,
         physical,
+        encryption,
     })
 }
 
@@ -950,6 +1177,7 @@ fn iceberg_metadata(
     field_ids: &BTreeMap<String, i64>,
     manifest_rel: &str,
     previous: Option<&Resolved>,
+    keep_encryption: Option<&Value>,
 ) -> Result<Value> {
     let mut snapshots = previous
         .and_then(|p| {
@@ -1005,8 +1233,76 @@ fn iceberg_metadata(
         "sort-orders": [{"order-id": 0, "fields": []}],
         "default-sort-order-id": 0,
         "refs": {"main": {"snapshot-id": snapshot_id, "type": "branch"}},
-        "properties": {}
+        "properties": iceberg_properties(io, keep_encryption)
     }))
+}
+
+fn refuse_lake_encryption_mismatch(
+    io: &dyn LakeIo,
+    current: Option<&Resolved>,
+    mode: WriteMode,
+) -> Result<()> {
+    let table_encrypted = current.and_then(|c| c.encryption.as_ref()).is_some();
+    let write_encrypted = io.encryption().is_some();
+    if table_encrypted && !write_encrypted {
+        return Err(Error::Io(
+            "encrypted lake table requires keys for writes".into(),
+        ));
+    }
+    if !table_encrypted && write_encrypted && current.is_some() && mode == WriteMode::Append {
+        return Err(Error::Io(
+            "cannot append encrypted files to an unencrypted lake table".into(),
+        ));
+    }
+    if table_encrypted && write_encrypted && mode == WriteMode::Append {
+        let record = current.and_then(|c| c.encryption.as_ref());
+        let table_tenant = record
+            .and_then(|enc| lake_record_field(enc, "tenant_id"))
+            .ok_or_else(|| Error::Io("encrypted lake table is missing tenant id".into()))?;
+        let table_kek = record
+            .and_then(|enc| lake_record_field(enc, "kek_id"))
+            .ok_or_else(|| Error::Io("encrypted lake table is missing kek id".into()))?;
+        let Some(keys) = io.encryption() else {
+            return Ok(());
+        };
+        if table_tenant != keys.tenant().as_str() {
+            return Err(Error::Io(
+                "encrypted lake table tenant does not match write keys".into(),
+            ));
+        }
+        if table_kek != keys.kek_id().as_str() {
+            return Err(Error::Io(
+                "encrypted lake table kek does not match write keys".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn lake_record_field(enc: &Value, name: &str) -> Option<String> {
+    let text = enc.as_str()?;
+    let v: Value = serde_json::from_str(text).ok()?;
+    v.get(name)?.as_str().map(str::to_string)
+}
+
+fn delta_configuration(io: &dyn LakeIo, keep: Option<&Value>) -> Value {
+    let mut cfg = json!({"delta.columnMapping.mode": "name"});
+    if let Some(keys) = io.encryption() {
+        cfg["mizuchi.encryption"] = serde_json::Value::String(keys.lake_key_record());
+    } else if let Some(prev) = keep {
+        cfg["mizuchi.encryption"] = prev.clone();
+    }
+    cfg
+}
+
+fn iceberg_properties(io: &dyn LakeIo, keep: Option<&Value>) -> Value {
+    if let Some(keys) = io.encryption() {
+        json!({"mizuchi.encryption": keys.lake_key_record()})
+    } else if let Some(prev) = keep {
+        json!({"mizuchi.encryption": prev})
+    } else {
+        json!({})
+    }
 }
 
 fn parse_iceberg_schema(md: &Value) -> Result<SchemaRef> {
@@ -1177,6 +1473,20 @@ fn is_widen(from: &DataType, to: &DataType) -> bool {
     )
 }
 
+fn lake_writer_properties(
+    enc: Option<&EncryptionSession>,
+    file_schema: &Schema,
+    physical: &BTreeMap<String, String>,
+) -> Result<Option<WriterProperties>> {
+    match enc {
+        None => parquet_writer_properties(None, file_schema),
+        Some(keys) => {
+            let mapped = keys.with_physical_names(physical);
+            parquet_writer_properties(Some(&mapped), file_schema)
+        }
+    }
+}
+
 fn physical_schema(schema: &Schema, physical: &BTreeMap<String, String>) -> SchemaRef {
     let fields: Vec<Field> = schema
         .fields()
@@ -1233,9 +1543,17 @@ fn read_files(
     Ok(out)
 }
 
-fn read_parquet_bytes(rel: &str, bytes: &[u8]) -> Result<Vec<Batch>> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
-        .map_err(|e| Error::Io(format!("{rel}: {e}")))?;
+fn read_parquet_bytes(
+    rel: &str,
+    bytes: &[u8],
+    enc: Option<&EncryptionSession>,
+) -> Result<Vec<Batch>> {
+    require_encrypted_footer(bytes, enc)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+        Bytes::copy_from_slice(bytes),
+        parquet_reader_options_with(enc)?,
+    )
+    .map_err(|e| Error::Io(format!("{rel}: {e}")))?;
     let reader = builder
         .with_batch_size(mizuchi_core::batch::DEFAULT_MAX_ROWS)
         .build()
@@ -1837,5 +2155,403 @@ mod tests {
         .unwrap();
         let got = read_iceberg_store(&store, "ice/t", TimeTravel::Latest).unwrap();
         assert!(got[0].schema().field_with_name("extra").is_ok());
+    }
+
+    fn lake_keys() -> crate::crypto::EncryptionSession {
+        lake_keys_for(Vec::new())
+    }
+
+    fn lake_keys_for(columns: Vec<String>) -> crate::crypto::EncryptionSession {
+        use crate::crypto::{
+            EncryptionSession, KeyPurpose, MemoryKeyProvider, RuntimeProfile, TenantId,
+            UnwrapGrant, unix_now,
+        };
+        use std::sync::Arc;
+        let provider = Arc::new(MemoryKeyProvider::new(RuntimeProfile::Development).unwrap());
+        let tenant = TenantId::new("acme").unwrap();
+        let grant = UnwrapGrant {
+            tenant_id: tenant.clone(),
+            purpose: KeyPurpose::Store,
+            expires_unix_secs: unix_now() + 3_600,
+        };
+        EncryptionSession::new(provider, tenant, grant, columns)
+    }
+
+    fn lake_keys_on(
+        provider: std::sync::Arc<dyn crate::crypto::KeyProvider + Send + Sync>,
+        columns: Vec<String>,
+    ) -> crate::crypto::EncryptionSession {
+        use crate::crypto::{EncryptionSession, KeyPurpose, TenantId, UnwrapGrant, unix_now};
+        let tenant = TenantId::new("acme").unwrap();
+        let grant = UnwrapGrant {
+            tenant_id: tenant.clone(),
+            purpose: KeyPurpose::Store,
+            expires_unix_secs: unix_now() + 3_600,
+        };
+        EncryptionSession::new(provider, tenant, grant, columns)
+    }
+
+    #[test]
+    fn lake_column_keys_follow_rename_to_physical_path() {
+        use crate::crypto::{KeyProvider, MemoryKeyProvider, RuntimeProfile};
+        let dest = tmp();
+        let provider: std::sync::Arc<dyn KeyProvider + Send + Sync> =
+            std::sync::Arc::new(MemoryKeyProvider::new(RuntimeProfile::Development).unwrap());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("secret", DataType::Utf8, true),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        let first = Batch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("employee_ssn=111-11-1111")])),
+                Arc::new(StringArray::from(vec![Some("note-one")])),
+            ],
+        )
+        .unwrap();
+        let keys = lake_keys_on(provider.clone(), vec!["secret".into()]);
+        write_delta_keys(&dest, &[first], WriteMode::Overwrite, &keys).unwrap();
+        evolve_delta(
+            &dest,
+            SchemaEvolution::RenameColumn {
+                from: "secret".into(),
+                to: "sensitive".into(),
+            },
+        )
+        .unwrap();
+        let renamed = Arc::new(Schema::new(vec![
+            Field::new("sensitive", DataType::Utf8, true),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        let second = Batch::try_new(
+            renamed,
+            vec![
+                Arc::new(StringArray::from(vec![Some("employee_ssn=222-22-2222")])),
+                Arc::new(StringArray::from(vec![Some("note-two")])),
+            ],
+        )
+        .unwrap();
+        let keys_after = lake_keys_on(provider, vec!["sensitive".into()]);
+        write_delta_keys(&dest, &[second], WriteMode::Append, &keys_after).unwrap();
+        let mut leaked = false;
+        for rel in walk_parquet_files(&dest) {
+            let bytes = fs::read(&rel).unwrap();
+            for needle in [
+                b"employee_ssn=111-11-1111".as_slice(),
+                b"employee_ssn=222-22-2222".as_slice(),
+            ] {
+                if bytes.windows(needle.len()).any(|w| w == needle) {
+                    leaked = true;
+                }
+            }
+        }
+        assert!(
+            !leaked,
+            "renamed column leaked plaintext after dedicated key"
+        );
+        let got = read_delta_keys(&dest, TimeTravel::Latest, &keys_after).unwrap();
+        assert!(got.iter().any(|b| b.num_rows() > 0));
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    fn walk_parquet_files(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
+                    out.push(path);
+                }
+            }
+        }
+        walk(root, &mut out);
+        out
+    }
+
+    #[test]
+    fn encrypted_delta_round_trip_needs_key() {
+        let dest = tmp();
+        let keys = lake_keys();
+        write_delta_keys(&dest, &[batch_i64()], WriteMode::Overwrite, &keys).unwrap();
+        let err = read_delta(&dest, TimeTravel::Latest).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        assert_eq!(
+            ids(&read_delta_keys(&dest, TimeTravel::Latest, &keys).unwrap()),
+            vec![1, 2]
+        );
+        let log = fs::read_dir(dest.join("_delta_log"))
+            .unwrap()
+            .next()
+            .unwrap();
+        let text = fs::read_to_string(log.unwrap().path()).unwrap();
+        assert!(text.contains("mizuchi.encryption"), "{text}");
+        assert!(!text.contains("employee_ssn"));
+        let mut saw_string = false;
+        for line in text.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(enc) = v.pointer("/metaData/configuration/mizuchi.encryption") {
+                assert!(enc.is_string(), "{enc}");
+                saw_string = true;
+            }
+        }
+        assert!(saw_string, "{text}");
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn encrypted_delta_refuses_substituted_plaintext_file() {
+        let dest = tmp();
+        let keys = lake_keys();
+        write_delta_keys(&dest, &[batch_i64()], WriteMode::Overwrite, &keys).unwrap();
+        let part = fs::read_dir(&dest)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("parquet"))
+            .expect("data file");
+        let batch = batch_i64();
+        crate::write::write_parquet_file(&part, std::slice::from_ref(&batch), batch.schema())
+            .unwrap();
+        let err = read_delta_keys(&dest, TimeTravel::Latest, &keys).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("encrypted read requires encrypted parquet"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn encrypted_iceberg_round_trip_needs_key() {
+        let dest = tmp();
+        let keys = lake_keys();
+        write_iceberg_keys(&dest, &[batch_i64()], WriteMode::Overwrite, &keys).unwrap();
+        let err = read_iceberg(&dest, TimeTravel::Latest).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        assert_eq!(
+            ids(&read_iceberg_keys(&dest, TimeTravel::Latest, &keys).unwrap()),
+            vec![1, 2]
+        );
+        let hint = fs::read_to_string(dest.join("metadata/version-hint.text")).unwrap();
+        let md = fs::read_to_string(dest.join(format!("metadata/v{}.metadata.json", hint.trim())))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&md).unwrap();
+        let enc = &v["properties"]["mizuchi.encryption"];
+        assert!(enc.is_string(), "{enc}");
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn encrypted_delta_store_round_trip_needs_key() {
+        let store = object_store::memory::InMemory::new();
+        let keys = lake_keys();
+        write_delta_store_keys(
+            &store,
+            "delta/t",
+            &[batch_i64()],
+            WriteMode::Overwrite,
+            &keys,
+        )
+        .unwrap();
+        let err = read_delta_store(&store, "delta/t", TimeTravel::Latest).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        assert_eq!(
+            ids(&read_delta_store_keys(&store, "delta/t", TimeTravel::Latest, &keys).unwrap()),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn encrypted_iceberg_store_round_trip_needs_key() {
+        let store = object_store::memory::InMemory::new();
+        let keys = lake_keys();
+        write_iceberg_store_keys(&store, "ice/t", &[batch_i64()], WriteMode::Overwrite, &keys)
+            .unwrap();
+        let err = read_iceberg_store(&store, "ice/t", TimeTravel::Latest).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        assert_eq!(
+            ids(&read_iceberg_store_keys(&store, "ice/t", TimeTravel::Latest, &keys).unwrap()),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn schema_evolution_keeps_lake_encryption_property() {
+        let keys = lake_keys();
+        let dest = tmp();
+        write_delta_keys(&dest, &[batch_i64()], WriteMode::Overwrite, &keys).unwrap();
+        evolve_delta(
+            &dest,
+            SchemaEvolution::AddColumn {
+                name: "extra".into(),
+                data_type: DataType::Int64,
+            },
+        )
+        .unwrap();
+        let mut logs: Vec<_> = fs::read_dir(dest.join("_delta_log"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        logs.sort();
+        let text = fs::read_to_string(logs.last().unwrap()).unwrap();
+        let mut saw = false;
+        for line in text.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(enc) = v.pointer("/metaData/configuration/mizuchi.encryption") {
+                assert!(enc.is_string(), "{enc}");
+                saw = true;
+            }
+        }
+        assert!(saw, "{text}");
+        assert_eq!(
+            ids(&read_delta_keys(&dest, TimeTravel::Latest, &keys).unwrap()),
+            vec![1, 2]
+        );
+        let _ = fs::remove_dir_all(&dest);
+
+        let dest = tmp();
+        write_iceberg_keys(&dest, &[batch_i64()], WriteMode::Overwrite, &keys).unwrap();
+        evolve_iceberg(
+            &dest,
+            SchemaEvolution::AddColumn {
+                name: "extra".into(),
+                data_type: DataType::Int64,
+            },
+        )
+        .unwrap();
+        let hint = fs::read_to_string(dest.join("metadata/version-hint.text")).unwrap();
+        let md = fs::read_to_string(dest.join(format!("metadata/v{}.metadata.json", hint.trim())))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&md).unwrap();
+        assert!(v["properties"]["mizuchi.encryption"].is_string(), "{md}");
+        assert_eq!(
+            ids(&read_iceberg_keys(&dest, TimeTravel::Latest, &keys).unwrap()),
+            vec![1, 2]
+        );
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn unkeyed_write_to_encrypted_lake_is_refused() {
+        let keys = lake_keys();
+        let dest = tmp();
+        write_delta_keys(&dest, &[batch_i64()], WriteMode::Overwrite, &keys).unwrap();
+        let err = write_delta(&dest, &[batch_i64()], WriteMode::Append).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("encrypted lake table requires keys"),
+            "{err}"
+        );
+        let err = write_delta(&dest, &[batch_i64()], WriteMode::Overwrite).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("encrypted lake table requires keys"),
+            "{err}"
+        );
+        write_delta_keys(&dest, &[batch_i64()], WriteMode::Append, &keys).unwrap();
+        assert_eq!(
+            ids(&read_delta_keys(&dest, TimeTravel::Latest, &keys).unwrap()).len(),
+            4
+        );
+        let _ = fs::remove_dir_all(&dest);
+
+        let dest = tmp();
+        write_iceberg_keys(&dest, &[batch_i64()], WriteMode::Overwrite, &keys).unwrap();
+        let err = write_iceberg(&dest, &[batch_i64()], WriteMode::Append).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("encrypted lake table requires keys"),
+            "{err}"
+        );
+        write_iceberg_keys(&dest, &[batch_i64()], WriteMode::Append, &keys).unwrap();
+        assert_eq!(
+            ids(&read_iceberg_keys(&dest, TimeTravel::Latest, &keys).unwrap()).len(),
+            4
+        );
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn encrypted_append_to_plaintext_lake_is_refused() {
+        let keys = lake_keys();
+        let dest = tmp();
+        write_delta(&dest, &[batch_i64()], WriteMode::Overwrite).unwrap();
+        let err = write_delta_keys(&dest, &[batch_i64()], WriteMode::Append, &keys).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot append encrypted files to an unencrypted lake table"),
+            "{err}"
+        );
+        write_delta_keys(&dest, &[batch_i64()], WriteMode::Overwrite, &keys).unwrap();
+        let err = write_delta(&dest, &[batch_i64()], WriteMode::Append).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("encrypted lake table requires keys"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&dest);
+
+        let dest = tmp();
+        write_iceberg(&dest, &[batch_i64()], WriteMode::Overwrite).unwrap();
+        let err = write_iceberg_keys(&dest, &[batch_i64()], WriteMode::Append, &keys).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot append encrypted files to an unencrypted lake table"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn encrypted_append_wrong_tenant_is_refused() {
+        use crate::crypto::{
+            EncryptionSession, KeyPurpose, MemoryKeyProvider, RuntimeProfile, TenantId,
+            UnwrapGrant, unix_now,
+        };
+        let dest = tmp();
+        let keys_a = lake_keys();
+        write_delta_keys(&dest, &[batch_i64()], WriteMode::Overwrite, &keys_a).unwrap();
+        let provider =
+            std::sync::Arc::new(MemoryKeyProvider::new(RuntimeProfile::Development).unwrap());
+        let tenant = TenantId::new("beta").unwrap();
+        let grant = UnwrapGrant {
+            tenant_id: tenant.clone(),
+            purpose: KeyPurpose::Store,
+            expires_unix_secs: unix_now() + 3_600,
+        };
+        let keys_b = EncryptionSession::new(provider, tenant, grant, Vec::new());
+        let err = write_delta_keys(&dest, &[batch_i64()], WriteMode::Append, &keys_b).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("encrypted lake table tenant does not match write keys"),
+            "{err}"
+        );
+        write_delta_keys(&dest, &[batch_i64()], WriteMode::Append, &keys_a).unwrap();
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn encrypted_append_wrong_kek_is_refused() {
+        use crate::crypto::{KeyProvider, MemoryKeyProvider, RuntimeProfile};
+        let dest = tmp();
+        let provider_a: std::sync::Arc<dyn KeyProvider + Send + Sync> =
+            std::sync::Arc::new(MemoryKeyProvider::new(RuntimeProfile::Development).unwrap());
+        let provider_b: std::sync::Arc<dyn KeyProvider + Send + Sync> =
+            std::sync::Arc::new(MemoryKeyProvider::new(RuntimeProfile::Development).unwrap());
+        let keys_a = lake_keys_on(provider_a, Vec::new());
+        let keys_b = lake_keys_on(provider_b, Vec::new());
+        write_delta_keys(&dest, &[batch_i64()], WriteMode::Overwrite, &keys_a).unwrap();
+        let err = write_delta_keys(&dest, &[batch_i64()], WriteMode::Append, &keys_b).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("encrypted lake table kek does not match write keys"),
+            "{err}"
+        );
+        write_delta_keys(&dest, &[batch_i64()], WriteMode::Append, &keys_a).unwrap();
+        let _ = fs::remove_dir_all(&dest);
     }
 }

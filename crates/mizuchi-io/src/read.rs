@@ -10,7 +10,7 @@
 //! Files. ORC is the uncompressed DIRECT subset in [`crate::orc`].
 
 use std::fs::File;
-use std::io::{BufReader, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -30,6 +30,7 @@ use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::reader::ChunkReader;
 use parquet::file::statistics::Statistics;
 
+use crate::crypto::EncryptionSession;
 use mizuchi_core::batch::{Batch, BatchPolicy, DEFAULT_MAX_ROWS};
 use mizuchi_core::error::{Error, Result};
 use mizuchi_core::expr::{BinaryOp, Expr};
@@ -98,6 +99,8 @@ pub struct ParquetReadOptions<'a> {
     pub filters: Option<&'a [Expr]>,
     /// Morsel size for decoded batches.
     pub policy: BatchPolicy,
+    /// Unwrap grant used to recover DEKs from Parquet key metadata.
+    pub encryption: Option<&'a EncryptionSession>,
 }
 
 /// Options for [`read_csv`].
@@ -142,7 +145,56 @@ pub struct OrcReadOptions<'a> {
 
 /// Load footer metadata including the optional page index.
 pub fn parquet_reader_options() -> ArrowReaderOptions {
-    ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional)
+    parquet_reader_options_with(None).expect("plaintext reader options")
+}
+
+/// [`parquet_reader_options`] plus modular-encryption unwrap when `enc` is set.
+pub fn parquet_reader_options_with(enc: Option<&EncryptionSession>) -> Result<ArrowReaderOptions> {
+    let opts = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
+    match enc {
+        Some(s) => Ok(opts.with_file_decryption_properties(s.decryption_properties()?)),
+        None => Ok(opts),
+    }
+}
+
+const PARE: &[u8; 4] = b"PARE";
+
+/// Parquet 60 decrypts optionally: a plaintext file still opens when
+/// decryption properties are set. Keyed reads require an encrypted footer.
+pub(crate) fn require_encrypted_footer(
+    bytes: &[u8],
+    enc: Option<&EncryptionSession>,
+) -> Result<()> {
+    if enc.is_none() {
+        return Ok(());
+    }
+    if bytes.len() < 4 || &bytes[bytes.len() - 4..] != PARE {
+        return Err(Error::Io(
+            "encrypted read requires encrypted parquet".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn require_encrypted_footer_file(
+    file: &File,
+    enc: Option<&EncryptionSession>,
+) -> Result<()> {
+    if enc.is_none() {
+        return Ok(());
+    }
+    let mut magic = [0u8; 4];
+    let mut peek = file.try_clone().map_err(|e| Error::Io(e.to_string()))?;
+    peek.seek(SeekFrom::End(-4))
+        .map_err(|e| Error::Io(e.to_string()))?;
+    peek.read_exact(&mut magic)
+        .map_err(|e| Error::Io(e.to_string()))?;
+    if &magic != PARE {
+        return Err(Error::Io(
+            "encrypted read requires encrypted parquet".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Read a Parquet file into engine batches.
@@ -157,10 +209,13 @@ pub fn read_parquet_reported(
 ) -> Result<(Vec<Batch>, ParquetScanStats)> {
     let path = path.as_ref();
     let file = File::open(path).map_err(|e| io_err(path, e))?;
+    require_encrypted_footer_file(&file, opts.encryption)?;
     let bloom = file.try_clone().ok();
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new_with_options(file, parquet_reader_options())
-            .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+        file,
+        parquet_reader_options_with(opts.encryption)?,
+    )
+    .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
     read_parquet_from_builder(builder, &opts, &path.display().to_string(), bloom.as_ref())
 }
 

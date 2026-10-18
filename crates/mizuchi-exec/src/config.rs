@@ -3,6 +3,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use mizuchi_core::error::{Error, Result};
+use mizuchi_io::EncryptionSession;
 
 /// Resource and path limits an embedding runner sets before opening a session.
 ///
@@ -42,6 +43,9 @@ pub struct SessionConfig {
     pub governed: bool,
     /// Policy applied in planning. Default is none (ungoverned).
     pub policy: Option<super::PolicyContext>,
+    /// Caller-supplied keys for table files and query spills. Default is off
+    /// (plaintext, same as today).
+    pub encryption: Option<EncryptionSession>,
 }
 
 pub(super) fn resolve_roots(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {

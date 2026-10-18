@@ -119,6 +119,8 @@ pub struct Session {
     /// When true, execute refuses a missing [`PolicyContext`].
     governed: bool,
     query_policy: Option<PolicyContext>,
+    /// Caller-supplied unwrap grant for table files and query spills.
+    encryption: Option<mizuchi_io::EncryptionSession>,
 }
 
 impl Default for Session {
@@ -148,6 +150,7 @@ impl Default for Session {
             query_api: None,
             governed: false,
             query_policy: None,
+            encryption: None,
         }
     }
 }
@@ -181,6 +184,7 @@ impl Clone for Session {
             query_api: self.query_api.clone(),
             governed: self.governed,
             query_policy: self.query_policy.clone(),
+            encryption: self.encryption.clone(),
         }
     }
 }
@@ -229,6 +233,7 @@ impl Session {
         session.now_micros = cfg.now_micros;
         session.governed = cfg.governed;
         session.query_policy = cfg.policy;
+        session.encryption = cfg.encryption;
         if let Some(api) = cfg.query_api {
             if api.auth_token.as_ref().is_some_and(|t| t.is_empty()) {
                 return Err(Error::Plan("query API auth_token must be non-empty".into()));
@@ -365,6 +370,13 @@ impl Session {
     }
 
     /// Directory for operator spill files (Arrow IPC). Removed per query.
+    /// Encrypt table files and query spills with caller-supplied keys.
+    /// Disk shuffle is refused until that path is sealed.
+    pub fn with_encryption(mut self, keys: mizuchi_io::EncryptionSession) -> Self {
+        self.encryption = Some(keys);
+        self
+    }
+
     pub fn with_spill_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.spill_dir = Some(dir.into());
         self
@@ -600,6 +612,14 @@ impl Session {
     ) -> Result<()> {
         let path = path.as_ref();
         config::assert_allowed(path, &self.allowed_read_paths)?;
+        let keys = self.encryption.clone();
+        let opts = mizuchi_io::ParquetReadOptions {
+            projection: opts.projection,
+            prune_row_group: opts.prune_row_group,
+            filters: opts.filters,
+            policy: opts.policy,
+            encryption: opts.encryption.or(keys.as_ref()),
+        };
         let (batches, source) = read_parquet_tree(path, opts)?;
         let schema = match batches.first() {
             Some(batch) => batch.schema(),
@@ -731,6 +751,11 @@ impl Session {
     /// from a previous run is present. Checkpoint and sink paths must pass
     /// the write allow-list (and the read allow-list, for recovery).
     pub fn stream_query(&self, schema: SchemaRef, cfg: StreamQueryConfig) -> Result<StreamQuery> {
+        if self.encryption.is_some() {
+            return Err(Error::Io(
+                "encrypted sessions cannot use streaming queries".into(),
+            ));
+        }
         self.refuse_bare_governed_write()?;
         config::assert_allowed(&cfg.checkpoint, &self.allowed_write_paths)?;
         config::assert_allowed(&cfg.checkpoint, &self.allowed_read_paths)?;
@@ -739,11 +764,11 @@ impl Session {
     }
 
     /// Write batches as Parquet after the write allow-list check.
-    pub fn write_parquet(
-        &self,
+    pub fn write_parquet<'a>(
+        &'a self,
         dest: impl AsRef<Path>,
         batches: &[Batch],
-        opts: mizuchi_io::ParquetWriteOptions<'_>,
+        opts: mizuchi_io::ParquetWriteOptions<'a>,
     ) -> Result<()> {
         let _ = self.write_parquet_reported(dest, batches, opts)?;
         Ok(())
@@ -751,6 +776,7 @@ impl Session {
 
     /// Write newline-delimited JSON after the write allow-list check.
     pub fn write_json(&self, dest: impl AsRef<Path>, batches: &[Batch]) -> Result<()> {
+        self.refuse_plaintext_format("json")?;
         self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
@@ -759,6 +785,7 @@ impl Session {
 
     /// Write an Avro Object Container File after the write allow-list check.
     pub fn write_avro(&self, dest: impl AsRef<Path>, batches: &[Batch]) -> Result<()> {
+        self.refuse_plaintext_format("avro")?;
         self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
@@ -767,31 +794,44 @@ impl Session {
 
     /// Write an uncompressed ORC file after the write allow-list check.
     pub fn write_orc(&self, dest: impl AsRef<Path>, batches: &[Batch]) -> Result<()> {
+        self.refuse_plaintext_format("orc")?;
         self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
         mizuchi_io::write_orc(dest, batches)
     }
 
+    fn refuse_plaintext_format(&self, format: &str) -> Result<()> {
+        if self.encryption.is_some() {
+            return Err(Error::Io(format!(
+                "encrypted sessions cannot write {format}"
+            )));
+        }
+        Ok(())
+    }
+
     /// [`Self::write_parquet`] plus the output side of a [`QueryReport`].
-    pub fn write_parquet_reported(
-        &self,
+    pub fn write_parquet_reported<'a>(
+        &'a self,
         dest: impl AsRef<Path>,
         batches: &[Batch],
-        opts: mizuchi_io::ParquetWriteOptions<'_>,
+        opts: mizuchi_io::ParquetWriteOptions<'a>,
     ) -> Result<QueryReport> {
         self.refuse_bare_governed_write()?;
         self.write_parquet_reported_inner(dest, batches, opts)
     }
 
-    pub(crate) fn write_parquet_reported_inner(
-        &self,
+    pub(crate) fn write_parquet_reported_inner<'a>(
+        &'a self,
         dest: impl AsRef<Path>,
         batches: &[Batch],
-        opts: mizuchi_io::ParquetWriteOptions<'_>,
+        mut opts: mizuchi_io::ParquetWriteOptions<'a>,
     ) -> Result<QueryReport> {
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
+        if opts.encryption.is_none() {
+            opts.encryption = self.encryption.as_ref();
+        }
         let stats = mizuchi_io::write_parquet_stats(dest, batches, opts, &self.cancel)?;
         Ok(self.attach_actor(QueryReport::from_write(OutputWrite {
             path: stats.path,
@@ -839,7 +879,10 @@ impl Session {
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
         let (_, batches) = self.table_data(name)?;
-        mizuchi_io::write_delta(dest, &batches, mode)
+        match &self.encryption {
+            Some(keys) => mizuchi_io::write_delta_keys(dest, &batches, mode, keys),
+            None => mizuchi_io::write_delta(dest, &batches, mode),
+        }
     }
 
     /// Load a Delta snapshot as an in-memory table after the read allow-list check.
@@ -851,7 +894,10 @@ impl Session {
     ) -> Result<()> {
         let path = path.as_ref();
         config::assert_allowed(path, &self.allowed_read_paths)?;
-        let batches = mizuchi_io::read_delta(path, travel)?;
+        let batches = match &self.encryption {
+            Some(keys) => mizuchi_io::read_delta_keys(path, travel, keys)?,
+            None => mizuchi_io::read_delta(path, travel)?,
+        };
         let schema = match batches.first() {
             Some(batch) => batch.schema(),
             None => return Err(Error::Io(format!("{} produced no batches", path.display()))),
@@ -871,7 +917,10 @@ impl Session {
         config::assert_allowed(dest, &self.allowed_read_paths)?;
         let target = mizuchi_plan::merge_target_table(sql)?;
         let head = mizuchi_io::delta_head(dest)?;
-        let batches = mizuchi_io::read_delta(dest, mizuchi_io::TimeTravel::Latest)?;
+        let batches = match &self.encryption {
+            Some(keys) => mizuchi_io::read_delta_keys(dest, mizuchi_io::TimeTravel::Latest, keys)?,
+            None => mizuchi_io::read_delta(dest, mizuchi_io::TimeTravel::Latest)?,
+        };
         let schema = match batches.first() {
             Some(b) => b.schema(),
             None => {
@@ -880,12 +929,21 @@ impl Session {
         };
         self.merge_and_commit(sql, target, schema, batches, |session, name| {
             let (_, out) = session.table_data(name)?;
-            mizuchi_io::write_delta_at(
-                dest,
-                &out,
-                mizuchi_io::WriteMode::Overwrite,
-                Some(head.version),
-            )
+            match &session.encryption {
+                Some(keys) => mizuchi_io::write_delta_at_keys(
+                    dest,
+                    &out,
+                    mizuchi_io::WriteMode::Overwrite,
+                    Some(head.version),
+                    keys,
+                ),
+                None => mizuchi_io::write_delta_at(
+                    dest,
+                    &out,
+                    mizuchi_io::WriteMode::Overwrite,
+                    Some(head.version),
+                ),
+            }
         })
     }
 
@@ -900,7 +958,10 @@ impl Session {
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
         let (_, batches) = self.table_data(name)?;
-        mizuchi_io::write_iceberg(dest, &batches, mode)
+        match &self.encryption {
+            Some(keys) => mizuchi_io::write_iceberg_keys(dest, &batches, mode, keys),
+            None => mizuchi_io::write_iceberg(dest, &batches, mode),
+        }
     }
 
     /// Load an Iceberg snapshot as an in-memory table after the read allow-list check.
@@ -912,7 +973,10 @@ impl Session {
     ) -> Result<()> {
         let path = path.as_ref();
         config::assert_allowed(path, &self.allowed_read_paths)?;
-        let batches = mizuchi_io::read_iceberg(path, travel)?;
+        let batches = match &self.encryption {
+            Some(keys) => mizuchi_io::read_iceberg_keys(path, travel, keys)?,
+            None => mizuchi_io::read_iceberg(path, travel)?,
+        };
         let schema = match batches.first() {
             Some(batch) => batch.schema(),
             None => return Err(Error::Io(format!("{} produced no batches", path.display()))),
@@ -932,7 +996,12 @@ impl Session {
         config::assert_allowed(dest, &self.allowed_read_paths)?;
         let target = mizuchi_plan::merge_target_table(sql)?;
         let head = mizuchi_io::iceberg_head(dest)?;
-        let batches = mizuchi_io::read_iceberg(dest, mizuchi_io::TimeTravel::Latest)?;
+        let batches = match &self.encryption {
+            Some(keys) => {
+                mizuchi_io::read_iceberg_keys(dest, mizuchi_io::TimeTravel::Latest, keys)?
+            }
+            None => mizuchi_io::read_iceberg(dest, mizuchi_io::TimeTravel::Latest)?,
+        };
         let schema = match batches.first() {
             Some(b) => b.schema(),
             None => {
@@ -941,12 +1010,21 @@ impl Session {
         };
         self.merge_and_commit(sql, target, schema, batches, |session, name| {
             let (_, out) = session.table_data(name)?;
-            mizuchi_io::write_iceberg_at(
-                dest,
-                &out,
-                mizuchi_io::WriteMode::Overwrite,
-                Some(head.version),
-            )
+            match &session.encryption {
+                Some(keys) => mizuchi_io::write_iceberg_at_keys(
+                    dest,
+                    &out,
+                    mizuchi_io::WriteMode::Overwrite,
+                    Some(head.version),
+                    keys,
+                ),
+                None => mizuchi_io::write_iceberg_at(
+                    dest,
+                    &out,
+                    mizuchi_io::WriteMode::Overwrite,
+                    Some(head.version),
+                ),
+            }
         })
     }
 
@@ -960,7 +1038,10 @@ impl Session {
     ) -> Result<mizuchi_io::LakeSnapshot> {
         self.refuse_bare_governed_write()?;
         let (_, batches) = self.table_data(name)?;
-        mizuchi_io::write_delta_store(store, prefix, &batches, mode)
+        match &self.encryption {
+            Some(keys) => mizuchi_io::write_delta_store_keys(store, prefix, &batches, mode, keys),
+            None => mizuchi_io::write_delta_store(store, prefix, &batches, mode),
+        }
     }
 
     /// Load a Delta snapshot from an object store prefix as an in-memory table.
@@ -971,7 +1052,10 @@ impl Session {
         prefix: &str,
         travel: mizuchi_io::TimeTravel,
     ) -> Result<()> {
-        let batches = mizuchi_io::read_delta_store(store, prefix, travel)?;
+        let batches = match &self.encryption {
+            Some(keys) => mizuchi_io::read_delta_store_keys(store, prefix, travel, keys)?,
+            None => mizuchi_io::read_delta_store(store, prefix, travel)?,
+        };
         let schema = match batches.first() {
             Some(batch) => batch.schema(),
             None => return Err(Error::Io(format!("{prefix} produced no batches"))),
@@ -989,20 +1073,38 @@ impl Session {
         self.refuse_bare_governed_write()?;
         let target = mizuchi_plan::merge_target_table(sql)?;
         let head = mizuchi_io::delta_head_store(store, prefix)?;
-        let batches = mizuchi_io::read_delta_store(store, prefix, mizuchi_io::TimeTravel::Latest)?;
+        let batches = match &self.encryption {
+            Some(keys) => mizuchi_io::read_delta_store_keys(
+                store,
+                prefix,
+                mizuchi_io::TimeTravel::Latest,
+                keys,
+            )?,
+            None => mizuchi_io::read_delta_store(store, prefix, mizuchi_io::TimeTravel::Latest)?,
+        };
         let schema = match batches.first() {
             Some(b) => b.schema(),
             None => return Err(Error::Io(format!("{prefix} produced no batches"))),
         };
         self.merge_and_commit(sql, target, schema, batches, |session, name| {
             let (_, out) = session.table_data(name)?;
-            mizuchi_io::write_delta_store_at(
-                store,
-                prefix,
-                &out,
-                mizuchi_io::WriteMode::Overwrite,
-                Some(head.version),
-            )
+            match &session.encryption {
+                Some(keys) => mizuchi_io::write_delta_store_at_keys(
+                    store,
+                    prefix,
+                    &out,
+                    mizuchi_io::WriteMode::Overwrite,
+                    Some(head.version),
+                    keys,
+                ),
+                None => mizuchi_io::write_delta_store_at(
+                    store,
+                    prefix,
+                    &out,
+                    mizuchi_io::WriteMode::Overwrite,
+                    Some(head.version),
+                ),
+            }
         })
     }
 
@@ -1016,7 +1118,10 @@ impl Session {
     ) -> Result<mizuchi_io::LakeSnapshot> {
         self.refuse_bare_governed_write()?;
         let (_, batches) = self.table_data(name)?;
-        mizuchi_io::write_iceberg_store(store, prefix, &batches, mode)
+        match &self.encryption {
+            Some(keys) => mizuchi_io::write_iceberg_store_keys(store, prefix, &batches, mode, keys),
+            None => mizuchi_io::write_iceberg_store(store, prefix, &batches, mode),
+        }
     }
 
     /// Load an Iceberg snapshot from an object store prefix as an in-memory table.
@@ -1027,7 +1132,10 @@ impl Session {
         prefix: &str,
         travel: mizuchi_io::TimeTravel,
     ) -> Result<()> {
-        let batches = mizuchi_io::read_iceberg_store(store, prefix, travel)?;
+        let batches = match &self.encryption {
+            Some(keys) => mizuchi_io::read_iceberg_store_keys(store, prefix, travel, keys)?,
+            None => mizuchi_io::read_iceberg_store(store, prefix, travel)?,
+        };
         let schema = match batches.first() {
             Some(batch) => batch.schema(),
             None => return Err(Error::Io(format!("{prefix} produced no batches"))),
@@ -1045,21 +1153,38 @@ impl Session {
         self.refuse_bare_governed_write()?;
         let target = mizuchi_plan::merge_target_table(sql)?;
         let head = mizuchi_io::iceberg_head_store(store, prefix)?;
-        let batches =
-            mizuchi_io::read_iceberg_store(store, prefix, mizuchi_io::TimeTravel::Latest)?;
+        let batches = match &self.encryption {
+            Some(keys) => mizuchi_io::read_iceberg_store_keys(
+                store,
+                prefix,
+                mizuchi_io::TimeTravel::Latest,
+                keys,
+            )?,
+            None => mizuchi_io::read_iceberg_store(store, prefix, mizuchi_io::TimeTravel::Latest)?,
+        };
         let schema = match batches.first() {
             Some(b) => b.schema(),
             None => return Err(Error::Io(format!("{prefix} produced no batches"))),
         };
         self.merge_and_commit(sql, target, schema, batches, |session, name| {
             let (_, out) = session.table_data(name)?;
-            mizuchi_io::write_iceberg_store_at(
-                store,
-                prefix,
-                &out,
-                mizuchi_io::WriteMode::Overwrite,
-                Some(head.version),
-            )
+            match &session.encryption {
+                Some(keys) => mizuchi_io::write_iceberg_store_at_keys(
+                    store,
+                    prefix,
+                    &out,
+                    mizuchi_io::WriteMode::Overwrite,
+                    Some(head.version),
+                    keys,
+                ),
+                None => mizuchi_io::write_iceberg_store_at(
+                    store,
+                    prefix,
+                    &out,
+                    mizuchi_io::WriteMode::Overwrite,
+                    Some(head.version),
+                ),
+            }
         })
     }
 
@@ -1351,10 +1476,14 @@ impl Session {
     }
 
     pub(crate) fn memory_pool(&self) -> Result<memory::MemoryPool> {
-        match &self.budget {
+        let mut pool = match &self.budget {
             Some(budget) => memory::MemoryPool::with_budget(budget.clone(), self.spill_dir.clone()),
             None => memory::MemoryPool::new(self.memory_limit, self.spill_dir.clone()),
+        }?;
+        if self.encryption.is_some() {
+            pool.set_spill_key(mizuchi_io::SpillKey::generate());
         }
+        Ok(pool)
     }
 
     pub(crate) fn table_morsels(&self, table: &str) -> Result<Vec<Batch>> {
@@ -1437,6 +1566,7 @@ fn read_parquet_tree(
                 prune_row_group: opts.prune_row_group,
                 filters: opts.filters,
                 policy: opts.policy,
+                encryption: opts.encryption,
             },
         )?);
     }
@@ -2503,6 +2633,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use mizuchi_core::udaf::ProductI64;
     use std::collections::{BTreeMap, HashSet};
+    use std::fs;
     use std::sync::Arc;
 
     fn table() -> (SchemaRef, Vec<Batch>) {
@@ -5673,5 +5804,78 @@ mod tests {
             vec!["year=2020".to_string()]
         );
         assert_eq!(col_i64(&result.batches, "id"), vec![Some(1)]);
+    }
+
+    #[test]
+    fn session_object_store_lake_writes_use_encryption() {
+        use mizuchi_io::{
+            EncryptionSession, KeyPurpose, MemoryKeyProvider, RuntimeProfile, TenantId, TimeTravel,
+            UnwrapGrant, WriteMode,
+        };
+        let provider = Arc::new(MemoryKeyProvider::new(RuntimeProfile::Development).unwrap());
+        let tenant = TenantId::new("acme").unwrap();
+        let grant = UnwrapGrant {
+            tenant_id: tenant.clone(),
+            purpose: KeyPurpose::Store,
+            expires_unix_secs: i64::MAX / 2,
+        };
+        let keys = EncryptionSession::new(provider, tenant, grant, Vec::new());
+        let (schema, batches) = table();
+        let mut session = Session::new().with_encryption(keys.clone());
+        session.register("t", schema, batches).unwrap();
+        let store = object_store::memory::InMemory::new();
+        session
+            .write_delta_store(&store, "delta/t", "t", WriteMode::Overwrite)
+            .unwrap();
+        assert!(mizuchi_io::read_delta_store(&store, "delta/t", TimeTravel::Latest).is_err());
+        let got = mizuchi_io::read_delta_store_keys(&store, "delta/t", TimeTravel::Latest, &keys)
+            .unwrap();
+        assert!(!got.is_empty());
+        session
+            .write_iceberg_store(&store, "ice/t", "t", WriteMode::Overwrite)
+            .unwrap();
+        assert!(mizuchi_io::read_iceberg_store(&store, "ice/t", TimeTravel::Latest).is_err());
+        let got = mizuchi_io::read_iceberg_store_keys(&store, "ice/t", TimeTravel::Latest, &keys)
+            .unwrap();
+        assert!(!got.is_empty());
+    }
+
+    #[test]
+    fn encrypted_session_refuses_plaintext_formats() {
+        use mizuchi_io::{
+            EncryptionSession, KeyPurpose, MemoryKeyProvider, RuntimeProfile, TenantId, UnwrapGrant,
+        };
+        let provider = Arc::new(MemoryKeyProvider::new(RuntimeProfile::Development).unwrap());
+        let tenant = TenantId::new("acme").unwrap();
+        let grant = UnwrapGrant {
+            tenant_id: tenant.clone(),
+            purpose: KeyPurpose::Store,
+            expires_unix_secs: i64::MAX / 2,
+        };
+        let keys = EncryptionSession::new(provider, tenant, grant, Vec::new());
+        let session = Session::new().with_encryption(keys);
+        let (_schema, batches) = table();
+        let dir = std::env::temp_dir().join(format!(
+            "mizuchi-enc-fmt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("t.json");
+        let err = session.write_json(&json, &batches).unwrap_err();
+        assert!(err.to_string().contains("cannot write json"), "{err}");
+        let avro = dir.join("t.avro");
+        let err = session.write_avro(&avro, &batches).unwrap_err();
+        assert!(err.to_string().contains("cannot write avro"), "{err}");
+        let orc = dir.join("t.orc");
+        let err = session.write_orc(&orc, &batches).unwrap_err();
+        assert!(err.to_string().contains("cannot write orc"), "{err}");
+        assert!(!json.exists());
+        assert!(!avro.exists());
+        assert!(!orc.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

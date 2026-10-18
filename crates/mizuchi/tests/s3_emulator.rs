@@ -155,6 +155,7 @@ mod emulator {
             ParquetWriteOptions {
                 partition_by: &cols,
                 mode,
+                encryption: None,
             },
         )
         .unwrap();
@@ -328,6 +329,7 @@ mod emulator {
             ParquetWriteOptions {
                 partition_by: &cols,
                 mode: WriteMode::Append,
+                encryption: None,
             },
         )
         .unwrap_err();

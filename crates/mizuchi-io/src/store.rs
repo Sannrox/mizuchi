@@ -16,7 +16,11 @@ use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use crate::read::{ParquetReadOptions, parquet_reader_options, read_parquet_from_builder};
+use crate::crypto::{EncryptionSession, parquet_writer_properties};
+use crate::read::{
+    ParquetReadOptions, parquet_reader_options_with, read_parquet_from_builder,
+    require_encrypted_footer,
+};
 use crate::write::{
     ParquetWriteOptions, WriteMode, split_partitions, take_rows, validate_partitions,
 };
@@ -75,9 +79,10 @@ fn read_parquet_store_counted(
     for loc in kept {
         let get = block_on(store.get(&loc)).map_err(store_err)?;
         let bytes = block_on(get.bytes()).map_err(store_err)?;
+        require_encrypted_footer(bytes.as_ref(), opts.encryption)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
             bytes.clone(),
-            parquet_reader_options(),
+            parquet_reader_options_with(opts.encryption)?,
         )
         .map_err(|e| Error::Io(format!("{loc}: {e}")))?;
         out.extend(read_parquet_from_builder(builder, &opts, loc.as_ref(), Some(&bytes))?.0);
@@ -114,6 +119,7 @@ pub fn write_parquet_store(
     batches: &[Batch],
     opts: ParquetWriteOptions<'_>,
 ) -> Result<()> {
+    crate::write::refuse_encrypted_hive_paths(&opts)?;
     if let Some(batch) = batches.first() {
         validate_partitions(batch, opts.partition_by)?;
         for other in &batches[1..] {
@@ -132,7 +138,13 @@ pub fn write_parquet_store(
     let staging_prefix = join_path(&root, &format!(".mizuchi-staging-{id}"))?;
 
     let run = (|| {
-        let staged = stage_store(store, &staging_prefix, batches, opts.partition_by)?;
+        let staged = stage_store(
+            store,
+            &staging_prefix,
+            batches,
+            opts.partition_by,
+            opts.encryption,
+        )?;
         publish_store(store, &root, &staging_prefix, &staged, opts.mode, id)?;
         let success = join_path(&root, "_SUCCESS")?;
         block_on(store.put(&success, PutPayload::from(Vec::<u8>::new()))).map_err(store_err)?;
@@ -148,6 +160,7 @@ fn stage_store(
     staging: &ObjectPath,
     batches: &[Batch],
     partition_by: &[String],
+    encryption: Option<&EncryptionSession>,
 ) -> Result<Vec<ObjectPath>> {
     let mut parts: BTreeMap<String, Vec<arrow::array::RecordBatch>> = BTreeMap::new();
     let mut schema = None;
@@ -172,7 +185,7 @@ fn stage_store(
             format!("{key}/part-00000.parquet")
         };
         let loc = join_path(staging, &rel)?;
-        let bytes = encode_parquet(&schema, &recs)?;
+        let bytes = encode_parquet(&schema, &recs, encryption)?;
         block_on(store.put(&loc, PutPayload::from(bytes))).map_err(store_err)?;
         staged.push(loc);
     }
@@ -233,10 +246,12 @@ fn publish_store(
 fn encode_parquet(
     schema: &arrow::datatypes::SchemaRef,
     batches: &[arrow::array::RecordBatch],
+    encryption: Option<&EncryptionSession>,
 ) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     {
-        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), None)
+        let props = parquet_writer_properties(encryption, schema.as_ref())?;
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), props)
             .map_err(|e| Error::Io(e.to_string()))?;
         for batch in batches {
             writer.write(batch).map_err(|e| Error::Io(e.to_string()))?;
@@ -466,6 +481,7 @@ mod tests {
             ParquetWriteOptions {
                 partition_by: &cols,
                 mode,
+                encryption: None,
             },
         )
         .unwrap();

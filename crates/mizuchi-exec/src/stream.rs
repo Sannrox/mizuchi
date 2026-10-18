@@ -1527,6 +1527,43 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_session_refuses_stream_query() {
+        use mizuchi_io::{
+            EncryptionSession, KeyPurpose, MemoryKeyProvider, RuntimeProfile, TenantId, UnwrapGrant,
+        };
+        let root = tmp("encrypted-stream");
+        let provider = Arc::new(MemoryKeyProvider::new(RuntimeProfile::Development).unwrap());
+        let tenant = TenantId::new("acme").unwrap();
+        let grant = UnwrapGrant {
+            tenant_id: tenant.clone(),
+            purpose: KeyPurpose::Store,
+            expires_unix_secs: i64::MAX / 2,
+        };
+        let keys = EncryptionSession::new(provider, tenant, grant, Vec::new());
+        let session = Session::new().with_encryption(keys);
+        let err = match session.stream_query(
+            schema(),
+            cfg(
+                &root,
+                EventWindow::Tumbling {
+                    size: Duration::from_secs(10),
+                },
+                StreamOutput::Complete,
+                Duration::from_secs(0),
+            ),
+        ) {
+            Ok(_) => panic!("encrypted stream_query should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("encrypted sessions cannot use streaming queries"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn tumbling_complete_matches_batch_groupby() {
         let root = tmp("tumbling");
         let size = Duration::from_secs(10);
