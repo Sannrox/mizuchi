@@ -37,16 +37,22 @@ pub fn system_budget() -> u64 {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn parse_memtotal(text: &str) -> Option<u64> {
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("MemTotal:") else {
+            continue;
+        };
+        let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        return Some(kb.saturating_mul(1024));
+    }
+    None
+}
+
 fn total_memory() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        for line in text.lines() {
-            let rest = line.strip_prefix("MemTotal:")?;
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            return Some(kb.saturating_mul(1024));
-        }
-        None
+        parse_memtotal(&std::fs::read_to_string("/proc/meminfo").ok()?)
     }
     #[cfg(target_os = "macos")]
     {
@@ -390,6 +396,15 @@ impl Iterator for SpillIter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_memtotal_skips_leading_lines() {
+        assert_eq!(
+            parse_memtotal("Buffers: 1 kB\nMemTotal: 2048 kB\nMemFree: 1 kB\n"),
+            Some(2048 * 1024)
+        );
+        assert_eq!(parse_memtotal("MemFree: 1 kB\n"), None);
+    }
 
     #[test]
     fn reserve_fails_closed_without_room() {
