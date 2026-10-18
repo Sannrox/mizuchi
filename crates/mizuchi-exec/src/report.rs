@@ -32,6 +32,10 @@ pub struct QueryReport {
     pub inputs: Vec<InputScan>,
     /// Datasets this call wrote.
     pub outputs: Vec<OutputWrite>,
+    /// Principal from the query policy, when set.
+    pub principal: Option<String>,
+    /// Actor from the query policy, when set.
+    pub actor: Option<String>,
 }
 
 impl QueryReport {
@@ -43,6 +47,8 @@ impl QueryReport {
             plan,
             inputs,
             outputs: Vec::new(),
+            principal: None,
+            actor: None,
         }
     }
 
@@ -52,6 +58,8 @@ impl QueryReport {
             plan: String::new(),
             inputs: Vec::new(),
             outputs: vec![output],
+            principal: None,
+            actor: None,
         }
     }
 }

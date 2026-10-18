@@ -50,7 +50,9 @@
         "engine_version": { "type": "string" },
         "plan": { "type": "string" },
         "inputs": { "type": "array", "items": { "$ref": "#/$defs/InputScan" } },
-        "outputs": { "type": "array", "items": { "$ref": "#/$defs/OutputWrite" } }
+        "outputs": { "type": "array", "items": { "$ref": "#/$defs/OutputWrite" } },
+        "principal": { "type": ["string", "null"] },
+        "actor": { "type": ["string", "null"] }
       }
     },
     "OperatorMetrics": {

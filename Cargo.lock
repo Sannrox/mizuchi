@@ -1549,6 +1549,7 @@ name = "mizuchi-exec"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "hmac",
  "mizuchi-core",
  "mizuchi-io",
  "mizuchi-plan",
