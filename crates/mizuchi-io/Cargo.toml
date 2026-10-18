@@ -8,6 +8,7 @@ publish = true
 description = "Parquet, CSV, JSON, Avro, ORC, object-store, and lake table I/O for mizuchi."
 
 [dependencies]
+aes-gcm = { workspace = true }
 arrow = { workspace = true }
 arrow-avro = { workspace = true }
 bytes = { workspace = true }
@@ -15,6 +16,8 @@ futures = { workspace = true }
 mizuchi-core = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
+rand = { workspace = true }
+sekai-keys = { workspace = true }
 serde_json = { workspace = true }
 
 [features]

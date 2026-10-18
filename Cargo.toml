@@ -34,7 +34,12 @@ mizuchi-postgres = { path = "crates/mizuchi-postgres", version = "0.1.0" }
 mizuchi-exec = { path = "crates/mizuchi-exec", version = "0.1.0" }
 arrow = { version = "60.0.0", default-features = false, features = ["csv", "ipc", "ffi", "json"] }
 arrow-avro = { version = "60.0.0", default-features = false }
-parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }
+parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap", "encryption"] }
+# Git pin until sekai-keys is on crates.io. Crates that depend on it cannot
+# cargo-publish until that registry package exists.
+sekai-keys = { git = "https://github.com/Sannrox/sekai-chisei.git", rev = "1b2e12789a2b360759a087252367cf4bc633caf0" }
+aes-gcm = "0.10"
+rand = { version = "0.8", features = ["std"] }
 sqlparser = { version = "0.63.0" }
 object_store = { version = "0.14.1", default-features = false }
 futures = { version = "0.3.31", default-features = false, features = ["std", "executor"] }

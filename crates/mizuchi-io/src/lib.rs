@@ -1,17 +1,25 @@
 //! File, object-store, and lake-table readers and writers.
 
+pub mod crypto;
 pub mod lake;
 mod orc;
 pub mod read;
 pub mod store;
 pub mod write;
 
+pub use crypto::{
+    Dek, EncryptionSession, KeyError, KeyId, KeyProvider, KeyPurpose, MemoryKeyProvider,
+    RuntimeProfile, SpillKey, TenantId, UnwrapGrant, WrappedDek,
+};
 pub use lake::{
     LakeSnapshot, SchemaEvolution, TimeTravel, delta_head, delta_head_store, evolve_delta,
     evolve_delta_store, evolve_iceberg, evolve_iceberg_store, iceberg_head, iceberg_head_store,
-    read_delta, read_delta_store, read_iceberg, read_iceberg_store, write_delta, write_delta_at,
-    write_delta_store, write_delta_store_at, write_iceberg, write_iceberg_at, write_iceberg_store,
-    write_iceberg_store_at,
+    read_delta, read_delta_keys, read_delta_store, read_delta_store_keys, read_iceberg,
+    read_iceberg_keys, read_iceberg_store, read_iceberg_store_keys, write_delta, write_delta_at,
+    write_delta_at_keys, write_delta_keys, write_delta_store, write_delta_store_at,
+    write_delta_store_at_keys, write_delta_store_keys, write_iceberg, write_iceberg_at,
+    write_iceberg_at_keys, write_iceberg_keys, write_iceberg_store, write_iceberg_store_at,
+    write_iceberg_store_at_keys, write_iceberg_store_keys,
 };
 pub use object_store::ObjectStore;
 pub use read::{

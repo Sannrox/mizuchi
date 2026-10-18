@@ -18,6 +18,7 @@ use arrow::compute::take;
 use arrow::datatypes::{DataType, SchemaRef};
 use parquet::arrow::ArrowWriter;
 
+use crate::crypto::{EncryptionSession, parquet_writer_properties};
 use mizuchi_core::CancelToken;
 use mizuchi_core::batch::Batch;
 use mizuchi_core::error::{Error, Result};
@@ -39,6 +40,9 @@ pub struct ParquetWriteOptions<'a> {
     pub partition_by: &'a [String],
     /// Append or replace committed files.
     pub mode: WriteMode,
+    /// When set, part files use Parquet modular encryption. Wrapped DEKs
+    /// sit in file key metadata; the engine never writes plaintext keys.
+    pub encryption: Option<&'a EncryptionSession>,
 }
 
 impl Default for ParquetWriteOptions<'static> {
@@ -46,6 +50,7 @@ impl Default for ParquetWriteOptions<'static> {
         Self {
             partition_by: &[],
             mode: WriteMode::Overwrite,
+            encryption: None,
         }
     }
 }
@@ -137,6 +142,17 @@ struct CommitCtrl {
     cancel_after_groups: Option<usize>,
 }
 
+/// Hive partition directories are plaintext object keys. Encrypted writes
+/// keep those values in the file, so they cannot also appear in the path.
+pub(crate) fn refuse_encrypted_hive_paths(opts: &ParquetWriteOptions<'_>) -> Result<()> {
+    if opts.encryption.is_some() && !opts.partition_by.is_empty() {
+        return Err(Error::Io(
+            "encrypted parquet writes cannot use hive partition paths".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn write_inner(
     dest: &Path,
     batches: &[Batch],
@@ -145,6 +161,7 @@ fn write_inner(
     ctrl: CommitCtrl,
 ) -> Result<WriteStats> {
     cancel.check()?;
+    refuse_encrypted_hive_paths(&opts)?;
     if let Some(batch) = batches.first() {
         validate_partitions(batch, opts.partition_by)?;
         for other in &batches[1..] {
@@ -170,6 +187,7 @@ fn write_inner(
             &staging,
             batches,
             opts.partition_by,
+            opts.encryption,
             cancel,
             ctrl.cancel_after_groups,
         )?;
@@ -261,6 +279,7 @@ fn stage_files(
     staging: &Path,
     batches: &[Batch],
     partition_by: &[String],
+    encryption: Option<&EncryptionSession>,
     cancel: &CancelToken,
     cancel_after_groups: Option<usize>,
 ) -> Result<()> {
@@ -292,7 +311,8 @@ fn stage_files(
                 }
                 let tmp = tmp_path(&final_path);
                 let file = File::create(&tmp).map_err(|e| io_err(&tmp, e))?;
-                let writer = ArrowWriter::try_new(file, batch.schema(), None)
+                let props = parquet_writer_properties(encryption, batch.schema().as_ref())?;
+                let writer = ArrowWriter::try_new(file, batch.schema(), props)
                     .map_err(|e| Error::Io(e.to_string()))?;
                 tmp_paths.insert(key.clone(), tmp);
                 writers.insert(key.clone(), writer);
@@ -567,8 +587,8 @@ fn io_err(path: &Path, err: std::io::Error) -> Error {
 mod tests {
     use super::*;
     use crate::read::{ParquetReadOptions, read_parquet};
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::{Field, Schema};
+    use arrow::array::{ArrayRef, Int64Array, StringArray, StructArray};
+    use arrow::datatypes::{Field, Fields, Schema};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -619,6 +639,7 @@ mod tests {
             ParquetWriteOptions {
                 partition_by: &cols,
                 mode,
+                encryption: None,
             },
         )
     }
@@ -636,6 +657,7 @@ mod tests {
             ParquetWriteOptions {
                 partition_by: &cols,
                 mode,
+                encryption: None,
             },
             &CancelToken::new(),
             ctrl,
@@ -766,6 +788,7 @@ mod tests {
             ParquetWriteOptions {
                 partition_by: &cols,
                 mode: WriteMode::Append,
+                encryption: None,
             },
             &token,
         )
@@ -860,6 +883,7 @@ mod tests {
             ParquetWriteOptions {
                 partition_by: &[],
                 mode: WriteMode::Overwrite,
+                encryption: None,
             },
         )
         .unwrap();
@@ -898,5 +922,372 @@ mod tests {
             .collect();
         assert!(leftover.is_empty(), "{leftover:?}");
         let _ = fs::remove_dir_all(&dest);
+    }
+
+    fn test_keys() -> crate::crypto::EncryptionSession {
+        use crate::crypto::{
+            EncryptionSession, KeyPurpose, MemoryKeyProvider, RuntimeProfile, TenantId,
+            UnwrapGrant, unix_now,
+        };
+        use std::sync::Arc;
+        let provider = Arc::new(MemoryKeyProvider::new(RuntimeProfile::Development).unwrap());
+        let tenant = TenantId::new("acme").unwrap();
+        let grant = UnwrapGrant {
+            tenant_id: tenant.clone(),
+            purpose: KeyPurpose::Store,
+            expires_unix_secs: unix_now() + 3_600,
+        };
+        EncryptionSession::new(provider, tenant, grant, Vec::new())
+    }
+
+    fn secret_batch() -> Batch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("year", DataType::Int64, true),
+            Field::new("secret", DataType::Utf8, true),
+        ]));
+        Batch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(2020)])),
+                Arc::new(StringArray::from(vec![Some("employee_ssn=123-45-6789")])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn encrypted_write_rejects_hive_partitions() {
+        let dest = tmp_dest();
+        let keys = test_keys();
+        let cols = [String::from("year")];
+        let err = write_parquet(
+            &dest,
+            &[secret_batch()],
+            ParquetWriteOptions {
+                partition_by: &cols,
+                mode: WriteMode::Overwrite,
+                encryption: Some(&keys),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("hive partition"), "{err}");
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn encrypted_parquet_round_trip_hides_plaintext() {
+        let dest = tmp_dest();
+        let keys = test_keys();
+        let batch = secret_batch();
+        write_parquet(
+            &dest,
+            &[batch],
+            ParquetWriteOptions {
+                partition_by: &[],
+                mode: WriteMode::Overwrite,
+                encryption: Some(&keys),
+            },
+        )
+        .unwrap();
+        let parts = committed_parts(&dest);
+        let bytes = fs::read(&parts[0]).unwrap();
+        let needle = b"employee_ssn=123-45-6789";
+        assert!(
+            !bytes.windows(needle.len()).any(|w| w == needle),
+            "plaintext leaked into parquet file"
+        );
+        let err = read_parquet(&parts[0], ParquetReadOptions::default()).unwrap_err();
+        assert!(
+            matches!(err, Error::Io(_)),
+            "plaintext reader must fail: {err:?}"
+        );
+        let got = read_parquet(
+            &parts[0],
+            ParquetReadOptions {
+                encryption: Some(&keys),
+                ..ParquetReadOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(got[0].num_rows(), 1);
+        assert_eq!(&bytes[bytes.len() - 4..], b"PARE");
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn keyed_read_of_plaintext_parquet_is_refused() {
+        let dest = tmp_dest();
+        write_parquet(
+            &dest,
+            &[secret_batch()],
+            ParquetWriteOptions {
+                partition_by: &[],
+                mode: WriteMode::Overwrite,
+                encryption: None,
+            },
+        )
+        .unwrap();
+        let parts = committed_parts(&dest);
+        let keys = test_keys();
+        let err = read_parquet(
+            &parts[0],
+            ParquetReadOptions {
+                encryption: Some(&keys),
+                ..ParquetReadOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("encrypted read requires encrypted parquet"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn column_keys_keep_unlisted_fields_encrypted() {
+        use crate::crypto::{
+            EncryptionSession, KeyPurpose, MemoryKeyProvider, RuntimeProfile, TenantId,
+            UnwrapGrant, unix_now,
+        };
+        let dest = tmp_dest();
+        let provider = Arc::new(MemoryKeyProvider::new(RuntimeProfile::Development).unwrap());
+        let tenant = TenantId::new("acme").unwrap();
+        let grant = UnwrapGrant {
+            tenant_id: tenant.clone(),
+            purpose: KeyPurpose::Store,
+            expires_unix_secs: unix_now() + 3_600,
+        };
+        let keys = EncryptionSession::new(provider, tenant, grant, vec!["secret".into()]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("secret", DataType::Utf8, true),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        let batch = Batch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("employee_ssn=123-45-6789")])),
+                Arc::new(StringArray::from(vec![Some("visible_if_unencrypted")])),
+            ],
+        )
+        .unwrap();
+        write_parquet(
+            &dest,
+            &[batch],
+            ParquetWriteOptions {
+                partition_by: &[],
+                mode: WriteMode::Overwrite,
+                encryption: Some(&keys),
+            },
+        )
+        .unwrap();
+        let bytes = fs::read(&committed_parts(&dest)[0]).unwrap();
+        for needle in [
+            b"employee_ssn=123-45-6789".as_slice(),
+            b"visible_if_unencrypted".as_slice(),
+        ] {
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle),
+                "plaintext leaked: {}",
+                String::from_utf8_lossy(needle)
+            );
+        }
+        let got = read_parquet(
+            &committed_parts(&dest)[0],
+            ParquetReadOptions {
+                encryption: Some(&keys),
+                ..ParquetReadOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(got[0].num_rows(), 1);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn nested_column_keys_encrypt_leaf_paths() {
+        use crate::crypto::{
+            EncryptionSession, KeyPurpose, MemoryKeyProvider, RuntimeProfile, TenantId,
+            UnwrapGrant, unix_now,
+        };
+        let dest = tmp_dest();
+        let provider = Arc::new(MemoryKeyProvider::new(RuntimeProfile::Development).unwrap());
+        let tenant = TenantId::new("acme").unwrap();
+        let grant = UnwrapGrant {
+            tenant_id: tenant.clone(),
+            purpose: KeyPurpose::Store,
+            expires_unix_secs: unix_now() + 3_600,
+        };
+        let keys = EncryptionSession::new(provider, tenant, grant, vec!["profile".into()]);
+        let ssn = Field::new("ssn", DataType::Utf8, true);
+        let profile_fields = Fields::from(vec![ssn.clone()]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("profile", DataType::Struct(profile_fields.clone()), true),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        let profile = StructArray::new(
+            profile_fields,
+            vec![Arc::new(StringArray::from(vec![Some("employee_ssn=123-45-6789")])) as ArrayRef],
+            None,
+        );
+        let batch = Batch::try_new(
+            schema,
+            vec![
+                Arc::new(profile),
+                Arc::new(StringArray::from(vec![Some("visible_if_unencrypted")])),
+            ],
+        )
+        .unwrap();
+        write_parquet(
+            &dest,
+            &[batch],
+            ParquetWriteOptions {
+                partition_by: &[],
+                mode: WriteMode::Overwrite,
+                encryption: Some(&keys),
+            },
+        )
+        .unwrap();
+        let bytes = fs::read(&committed_parts(&dest)[0]).unwrap();
+        for needle in [
+            b"employee_ssn=123-45-6789".as_slice(),
+            b"visible_if_unencrypted".as_slice(),
+        ] {
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle),
+                "plaintext leaked: {}",
+                String::from_utf8_lossy(needle)
+            );
+        }
+        let got = read_parquet(
+            &committed_parts(&dest)[0],
+            ParquetReadOptions {
+                encryption: Some(&keys),
+                ..ParquetReadOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(got[0].num_rows(), 1);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn unavailable_key_fails_encrypted_read() {
+        use crate::crypto::{
+            EncryptionSession, KeyProvider, KeyPurpose, MemoryKeyProvider, RuntimeProfile,
+            TenantId, UnwrapGrant, unix_now,
+        };
+        use std::sync::Arc;
+        let dest = tmp_dest();
+        let provider = Arc::new(MemoryKeyProvider::new(RuntimeProfile::Development).unwrap());
+        let tenant = TenantId::new("acme").unwrap();
+        let grant = UnwrapGrant {
+            tenant_id: tenant.clone(),
+            purpose: KeyPurpose::Store,
+            expires_unix_secs: unix_now() + 3_600,
+        };
+        let keys = EncryptionSession::new(
+            Arc::clone(&provider) as Arc<_>,
+            tenant.clone(),
+            grant,
+            Vec::new(),
+        );
+        write_parquet(
+            &dest,
+            &[secret_batch()],
+            ParquetWriteOptions {
+                partition_by: &[],
+                mode: WriteMode::Overwrite,
+                encryption: Some(&keys),
+            },
+        )
+        .unwrap();
+        let dead = EncryptionSession::new(
+            Arc::clone(&provider) as Arc<_>,
+            tenant,
+            UnwrapGrant {
+                tenant_id: keys.tenant().clone(),
+                purpose: KeyPurpose::Store,
+                expires_unix_secs: unix_now() - 10,
+            },
+            Vec::new(),
+        );
+        let err = read_parquet(
+            &committed_parts(&dest)[0],
+            ParquetReadOptions {
+                encryption: Some(&dead),
+                ..ParquetReadOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+
+        let part = &committed_parts(&dest)[0];
+        let bytes = fs::read(part).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        let mut rest = text.as_ref();
+        let mut revoked = 0usize;
+        while let Some(i) = rest.find("\"dek_id\":\"") {
+            rest = &rest[i + 10..];
+            let Some(end) = rest.find('"') else { break };
+            if let Ok(id) = crate::crypto::KeyId::new(&rest[..end]) {
+                provider.revoke_dek(&id).unwrap();
+                revoked += 1;
+            }
+            rest = &rest[end + 1..];
+        }
+        assert!(
+            revoked > 0,
+            "wrapped DEK ids must be in parquet key metadata"
+        );
+        let err = read_parquet(
+            part,
+            ParquetReadOptions {
+                encryption: Some(&keys),
+                ..ParquetReadOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("revok") || matches!(err, Error::Io(_)),
+            "{err:?}"
+        );
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn encrypted_write_overhead_is_measured() {
+        let dest_plain = tmp_dest();
+        let dest_enc = tmp_dest();
+        let keys = test_keys();
+        write_parquet(
+            &dest_plain,
+            &[sample_batch()],
+            ParquetWriteOptions::default(),
+        )
+        .unwrap();
+        write_parquet(
+            &dest_enc,
+            &[sample_batch()],
+            ParquetWriteOptions {
+                partition_by: &[],
+                mode: WriteMode::Overwrite,
+                encryption: Some(&keys),
+            },
+        )
+        .unwrap();
+        let plain = fs::metadata(&committed_parts(&dest_plain)[0])
+            .unwrap()
+            .len();
+        let enc = fs::metadata(&committed_parts(&dest_enc)[0]).unwrap().len();
+        assert!(plain > 0 && enc > 0, "plain={plain} enc={enc}");
+        let ratio = enc as f64 / plain as f64;
+        assert!(
+            ratio < 8.0,
+            "encrypted parquet overhead {ratio:.2}x (plain={plain} enc={enc})"
+        );
+        let _ = fs::remove_dir_all(&dest_plain);
+        let _ = fs::remove_dir_all(&dest_enc);
     }
 }
