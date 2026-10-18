@@ -2,8 +2,11 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use arrow::array::{Array, Int64Array, LargeStringArray, StringArray};
-use arrow::datatypes::{DataType, Schema};
+use arrow::array::{Array, DictionaryArray, Int64Array, LargeStringArray, StringArray};
+use arrow::datatypes::{
+    DataType, Int8Type, Int16Type, Int32Type, Int64Type, Schema, UInt8Type, UInt16Type, UInt32Type,
+    UInt64Type,
+};
 
 use mizuchi_core::batch::Batch;
 
@@ -42,6 +45,11 @@ pub fn table_stats_from_batches(schema: &Schema, batches: &[Batch]) -> TableStat
         let stats = match field.data_type() {
             DataType::Int64 => i64_column_stats(batches, name),
             DataType::Utf8 | DataType::LargeUtf8 => utf8_column_stats(batches, name),
+            DataType::Dictionary(_, value)
+                if matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+            {
+                utf8_column_stats(batches, name)
+            }
             _ => ColumnStats {
                 ndv: None,
                 min_i64: None,
@@ -99,6 +107,68 @@ fn i64_column_stats(batches: &[Batch], name: &str) -> ColumnStats {
     }
 }
 
+fn dictionary_value_utf8(values: &dyn Array, idx: usize) -> Option<Option<&str>> {
+    if let Some(a) = values.as_any().downcast_ref::<StringArray>() {
+        return Some(if a.is_null(idx) {
+            None
+        } else {
+            Some(a.value(idx))
+        });
+    }
+    if let Some(a) = values.as_any().downcast_ref::<LargeStringArray>() {
+        return Some(if a.is_null(idx) {
+            None
+        } else {
+            Some(a.value(idx))
+        });
+    }
+    None
+}
+
+fn dictionary_utf8_referenced<K: arrow::datatypes::ArrowDictionaryKeyType>(
+    col: &dyn Array,
+    ndv: &mut HashSet<String>,
+    null_count: &mut u64,
+) -> bool {
+    let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<K>>() else {
+        return false;
+    };
+    let values = dict.values();
+    if !(values.as_any().is::<StringArray>() || values.as_any().is::<LargeStringArray>()) {
+        return false;
+    }
+    for i in 0..dict.len() {
+        if dict.is_null(i) {
+            *null_count += 1;
+            continue;
+        }
+        let Some(idx) = dict.key(i) else {
+            *null_count += 1;
+            continue;
+        };
+        match dictionary_value_utf8(values.as_ref(), idx) {
+            Some(Some(s)) => {
+                ndv.insert(s.to_string());
+            }
+            Some(None) | None => {
+                *null_count += 1;
+            }
+        }
+    }
+    true
+}
+
+fn dictionary_utf8_ndv(col: &dyn Array, ndv: &mut HashSet<String>, null_count: &mut u64) -> bool {
+    dictionary_utf8_referenced::<Int8Type>(col, ndv, null_count)
+        || dictionary_utf8_referenced::<Int16Type>(col, ndv, null_count)
+        || dictionary_utf8_referenced::<Int32Type>(col, ndv, null_count)
+        || dictionary_utf8_referenced::<Int64Type>(col, ndv, null_count)
+        || dictionary_utf8_referenced::<UInt8Type>(col, ndv, null_count)
+        || dictionary_utf8_referenced::<UInt16Type>(col, ndv, null_count)
+        || dictionary_utf8_referenced::<UInt32Type>(col, ndv, null_count)
+        || dictionary_utf8_referenced::<UInt64Type>(col, ndv, null_count)
+}
+
 fn utf8_column_stats(batches: &[Batch], name: &str) -> ColumnStats {
     let mut ndv = HashSet::new();
     let mut null_count = 0u64;
@@ -125,6 +195,8 @@ fn utf8_column_stats(batches: &[Batch], name: &str) -> ColumnStats {
                     ndv.insert(arr.value(i).to_string());
                 }
             }
+        } else if dictionary_utf8_ndv(col.as_ref(), &mut ndv, &mut null_count) {
+            seen = true;
         }
     }
     ColumnStats {
@@ -144,7 +216,7 @@ pub fn inner_equi_rows(left_rows: f64, right_rows: f64, left_ndv: f64, right_ndv
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::LargeStringArray;
+    use arrow::array::{LargeStringArray, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -166,5 +238,49 @@ mod tests {
         assert_eq!(col.ndv, Some(2));
         assert_eq!(col.null_count, 1);
         assert_eq!(stats.row_count, 4);
+    }
+
+    #[test]
+    fn dictionary_ndv_counts_referenced_values_only() {
+        use arrow::array::{DictionaryArray, Int32Array};
+        use arrow::datatypes::Int32Type;
+        use std::sync::Arc;
+
+        let schema = Schema::new(vec![Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]);
+        let keys = Int32Array::from(vec![Some(0), Some(0), None]);
+        let values: arrow::array::ArrayRef = Arc::new(StringArray::from(vec!["A", "B", "C"]));
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+        let batch = Batch::try_new(Arc::new(schema.clone()), vec![Arc::new(dict)]).unwrap();
+        let stats = table_stats_from_batches(&schema, &[batch]);
+        let col = &stats.columns["s"];
+        assert_eq!(col.ndv, Some(1));
+        assert_eq!(col.null_count, 1);
+        assert_eq!(stats.row_count, 3);
+    }
+
+    #[test]
+    fn large_utf8_dictionary_ndv_and_nulls() {
+        use arrow::array::{DictionaryArray, Int32Array, LargeStringArray};
+        use arrow::datatypes::Int32Type;
+        use std::sync::Arc;
+
+        let schema = Schema::new(vec![Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeUtf8)),
+            true,
+        )]);
+        let keys = Int32Array::from(vec![Some(0), None, Some(0)]);
+        let values: arrow::array::ArrayRef = Arc::new(LargeStringArray::from(vec!["A", "unused"]));
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+        let batch = Batch::try_new(Arc::new(schema.clone()), vec![Arc::new(dict)]).unwrap();
+        let stats = table_stats_from_batches(&schema, &[batch]);
+        let col = &stats.columns["s"];
+        assert_eq!(col.ndv, Some(1));
+        assert_eq!(col.null_count, 1);
+        assert_eq!(stats.row_count, 3);
     }
 }

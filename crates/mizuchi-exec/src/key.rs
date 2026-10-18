@@ -112,6 +112,9 @@ pub(super) fn identity_map_with_capacity<V>(n: usize) -> IdentityMap<V> {
     HashMap::with_capacity_and_hasher(n, IdentityBuild::default())
 }
 
+/// Short Utf8 keys live inline so hash tables do not allocate `String`.
+const PACKED_UTF8: usize = 16;
+
 #[derive(Clone, Debug)]
 pub(crate) enum Scalar {
     Null,
@@ -126,7 +129,37 @@ pub(crate) enum Scalar {
     U64(u64),
     F32(u32),
     F64(u64),
+    /// Utf8 of length `1..=PACKED_UTF8` stored little-endian in `bytes`.
+    Utf8Packed {
+        bytes: [u8; PACKED_UTF8],
+        len: u8,
+    },
     Utf8(String),
+}
+
+impl Scalar {
+    /// Grouping/join key for a Utf8 cell: pack short values, allocate otherwise.
+    pub(super) fn from_utf8(s: &str) -> Self {
+        let b = s.as_bytes();
+        if b.len() <= PACKED_UTF8 {
+            let mut bytes = [0u8; PACKED_UTF8];
+            bytes[..b.len()].copy_from_slice(b);
+            Self::Utf8Packed {
+                bytes,
+                len: b.len() as u8,
+            }
+        } else {
+            Self::Utf8(s.to_owned())
+        }
+    }
+
+    pub(super) fn as_utf8(&self) -> Option<&str> {
+        match self {
+            Self::Utf8(s) => Some(s.as_str()),
+            Self::Utf8Packed { bytes, len } => std::str::from_utf8(&bytes[..*len as usize]).ok(),
+            _ => None,
+        }
+    }
 }
 
 impl PartialEq for Scalar {
@@ -145,6 +178,11 @@ impl PartialEq for Scalar {
             (Self::F32(a), Self::F32(b)) => canonical_f32(*a) == canonical_f32(*b),
             (Self::F64(a), Self::F64(b)) => canonical_f64(*a) == canonical_f64(*b),
             (Self::Utf8(a), Self::Utf8(b)) => a == b,
+            (Self::Utf8Packed { bytes: a, len: n }, Self::Utf8Packed { bytes: b, len: m }) => {
+                n == m && a[..*n as usize] == b[..*m as usize]
+            }
+            (Self::Utf8(a), Self::Utf8Packed { .. }) => other.as_utf8() == Some(a.as_str()),
+            (Self::Utf8Packed { .. }, Self::Utf8(a)) => self.as_utf8() == Some(a.as_str()),
             _ => false,
         }
     }
@@ -221,6 +259,12 @@ impl Hash for Scalar {
                 HASH_UTF8.hash(state);
                 v.hash(state);
             }
+            Self::Utf8Packed { bytes, len } => {
+                HASH_UTF8.hash(state);
+                std::str::from_utf8(&bytes[..*len as usize])
+                    .expect("packed utf8")
+                    .hash(state);
+            }
         }
     }
 }
@@ -284,9 +328,9 @@ pub(super) fn scalar_at(array: &dyn Array, i: usize) -> Result<Scalar> {
         arrow::datatypes::DataType::Float64 => {
             Scalar::F64(array.as_primitive::<Float64Type>().value(i).to_bits())
         }
-        DataType::Utf8 => Scalar::Utf8(array.as_string::<i32>().value(i).to_owned()),
-        DataType::LargeUtf8 => Scalar::Utf8(array.as_string::<i64>().value(i).to_owned()),
-        DataType::Dictionary(_, _) => Scalar::Utf8(dict_utf8_at(array, i)?.to_owned()),
+        DataType::Utf8 => Scalar::from_utf8(array.as_string::<i32>().value(i)),
+        DataType::LargeUtf8 => Scalar::from_utf8(array.as_string::<i64>().value(i)),
+        DataType::Dictionary(_, _) => Scalar::from_utf8(dict_utf8_at(array, i)?),
         DataType::Null => Scalar::Null,
         dt => {
             return Err(Error::Eval(format!(
@@ -464,6 +508,15 @@ pub(super) fn row_matches(key: &[Scalar], cols: &[ArrayRef], row: usize) -> Resu
     Ok(true)
 }
 
+fn utf8_cell_eq(s: &str, array: &dyn Array, row: usize) -> Result<bool> {
+    Ok(match array.data_type() {
+        DataType::Utf8 => s == array.as_string::<i32>().value(row),
+        DataType::LargeUtf8 => s == array.as_string::<i64>().value(row),
+        DataType::Dictionary(_, _) => s == dict_utf8_at(array, row)?,
+        _ => false,
+    })
+}
+
 fn cell_matches(part: &Scalar, array: &dyn Array, row: usize) -> Result<bool> {
     if array.is_null(row) {
         return Ok(*part == Scalar::Null);
@@ -484,9 +537,12 @@ fn cell_matches(part: &Scalar, array: &dyn Array, row: usize) -> Result<bool> {
         (Scalar::F64(v), DataType::Float64) => {
             Scalar::F64(*v) == Scalar::F64(array.as_primitive::<Float64Type>().value(row).to_bits())
         }
-        (Scalar::Utf8(v), DataType::Utf8) => v == array.as_string::<i32>().value(row),
-        (Scalar::Utf8(v), DataType::LargeUtf8) => v == array.as_string::<i64>().value(row),
-        (Scalar::Utf8(v), DataType::Dictionary(_, _)) => v == dict_utf8_at(array, row)?,
+        (part, DataType::Utf8 | DataType::LargeUtf8 | DataType::Dictionary(_, _)) => {
+            match part.as_utf8() {
+                Some(v) => utf8_cell_eq(v, array, row)?,
+                None => false,
+            }
+        }
         _ => false,
     })
 }
@@ -598,6 +654,44 @@ mod tests {
         let nulls: Vec<ArrayRef> = vec![Arc::new(arrow::array::NullArray::new(2))];
         assert!(row_has_null(&nulls, 0));
         assert!(row_has_null(&nulls, 1));
+    }
+
+    #[test]
+    fn packed_utf8_keys_round_trip_including_nulls() {
+        let cols: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![
+            None,
+            Some(""),
+            Some("a"),
+            Some("abcdefghijklmnop"),
+            Some("abcdefghijklmnopq"),
+            Some("é"),
+        ]))];
+        let keys: Vec<Scalar> = (0..cols[0].len())
+            .map(|row| extract_key(&cols, row).unwrap().pop().unwrap())
+            .collect();
+        assert_eq!(keys[0], Scalar::Null);
+        assert!(matches!(keys[1], Scalar::Utf8Packed { len: 0, .. }));
+        assert!(matches!(keys[2], Scalar::Utf8Packed { len: 1, .. }));
+        assert!(matches!(keys[3], Scalar::Utf8Packed { len: 16, .. }));
+        assert!(matches!(keys[4], Scalar::Utf8(ref s) if s.len() == 17));
+        assert!(matches!(keys[5], Scalar::Utf8Packed { len: 2, .. }));
+        assert_eq!(keys[2], Scalar::Utf8("a".into()));
+        assert_eq!(
+            hash_scalars(&[keys[2].clone()]),
+            hash_scalars(&[Scalar::Utf8("a".into())])
+        );
+        for (row, key) in keys.iter().enumerate() {
+            assert_eq!(
+                hash_row(&cols, row).unwrap(),
+                hash_scalars(std::slice::from_ref(key))
+            );
+            assert!(row_matches(std::slice::from_ref(key), &cols, row).unwrap());
+            if row > 0 {
+                assert!(!row_matches(std::slice::from_ref(key), &cols, row - 1).unwrap());
+            }
+        }
+        assert!(row_has_null(&cols, 0));
+        assert!(!row_has_null(&cols, 2));
     }
 
     #[test]
