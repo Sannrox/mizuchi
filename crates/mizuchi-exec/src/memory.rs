@@ -4,7 +4,8 @@
 //! cannot fit and a spill directory was given, they write Arrow IPC runs and
 //! release the reservation. Without a directory, the engine fails closed.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +20,71 @@ use mizuchi_core::error::{Error, Result};
 /// Bytes held by `batch` according to Arrow's array size accounting.
 pub(super) fn batch_bytes(batch: &Batch) -> u64 {
     batch.as_arrow().get_array_memory_size() as u64
+}
+
+const BUDGET_MIN: u64 = 64 * 1024 * 1024;
+const BUDGET_MAX: u64 = 256 * 1024 * 1024 * 1024;
+
+/// One quarter of machine memory, clamped to 64 MiB .. 256 GiB.
+///
+/// Embedders pass this to [`super::Session::with_memory_limit`] when they
+/// want a default per-query cap. `Session::new` stays unbounded so runners
+/// keep policy.
+pub fn system_budget() -> u64 {
+    match total_memory() {
+        Some(total) => (total / 4).clamp(BUDGET_MIN, BUDGET_MAX),
+        None => BUDGET_MIN * 4,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_memtotal(text: &str) -> Option<u64> {
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("MemTotal:") else {
+            continue;
+        };
+        let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        return Some(kb.saturating_mul(1024));
+    }
+    None
+}
+
+fn total_memory() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        parse_memtotal(&std::fs::read_to_string("/proc/meminfo").ok()?)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut val: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: sysctlbyname with hw.memsize writes a u64 into `val`.
+        let rc = unsafe {
+            sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                (&raw mut val).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 { Some(val) } else { None }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn sysctlbyname(
+        name: *const core::ffi::c_char,
+        oldp: *mut core::ffi::c_void,
+        oldlenp: *mut usize,
+        newp: *mut core::ffi::c_void,
+        newlen: usize,
+    ) -> i32;
 }
 
 /// Shared owner budget. Concurrent sessions of one owner draw from this cap.
@@ -41,6 +107,66 @@ pub(crate) struct MemoryPool {
 
 static JOB_SEQ: AtomicU64 = AtomicU64::new(1);
 
+fn mkdir_private(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path)
+    }
+}
+
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+    }
+}
+
+fn exclusive_private_dir(parent: &Path, prefix: &str) -> Result<PathBuf> {
+    fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
+    let pid = std::process::id();
+    loop {
+        let dir = parent.join(format!(
+            "{}-{}-{}",
+            prefix,
+            pid,
+            JOB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        match mkdir_private(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(Error::Io(e.to_string())),
+        }
+    }
+}
+
+fn exclusive_job_dir(root: &Path) -> Result<PathBuf> {
+    exclusive_private_dir(root, "mem")
+}
+
+/// Unique owner-only directory under the process temp dir.
+pub(super) fn private_spill_root() -> Result<PathBuf> {
+    exclusive_private_dir(&std::env::temp_dir(), "mizuchi-spill")
+}
+
 impl MemoryPool {
     pub(super) fn new(limit: Option<u64>, spill_dir: Option<PathBuf>) -> Result<Self> {
         Self::from_parts(limit, Arc::new(AtomicU64::new(0)), spill_dir)
@@ -57,11 +183,7 @@ impl MemoryPool {
         spill_dir: Option<PathBuf>,
     ) -> Result<Self> {
         let spill_dir = match spill_dir {
-            Some(root) => {
-                let dir = root.join(format!("mem-{}", JOB_SEQ.fetch_add(1, Ordering::Relaxed)));
-                fs::create_dir_all(&dir).map_err(|e| Error::Io(e.to_string()))?;
-                Some(dir)
-            }
+            Some(root) => Some(exclusive_job_dir(&root)?),
             None => None,
         };
         Ok(Self {
@@ -193,11 +315,28 @@ impl Drop for Reservation<'_> {
     }
 }
 
+fn mkdir_private_all(path: &Path) -> std::io::Result<()> {
+    if path.as_os_str().is_empty() || path == Path::new(".") {
+        return Ok(());
+    }
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        mkdir_private_all(parent)?;
+    }
+    match mkdir_private(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 pub fn write_spill(path: &Path, schema: SchemaRef, batches: &[Batch]) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
+        mkdir_private_all(parent).map_err(|e| Error::Io(e.to_string()))?;
     }
-    let file = File::create(path).map_err(|e| Error::Io(e.to_string()))?;
+    let file = create_private_file(path).map_err(|e| Error::Io(e.to_string()))?;
     let mut writer =
         FileWriter::try_new(file, schema.as_ref()).map_err(|e| Error::Io(e.to_string()))?;
     for batch in batches {
@@ -212,17 +351,9 @@ pub fn write_spill(path: &Path, schema: SchemaRef, batches: &[Batch]) -> Result<
 }
 
 pub fn read_spill(path: &Path, schema: SchemaRef) -> Result<Vec<Batch>> {
-    if !path.exists() {
-        return Ok(vec![Batch::empty(schema)?]);
-    }
-    let file = File::open(path).map_err(|e| Error::Io(e.to_string()))?;
-    let reader = FileReader::try_new(file, None).map_err(|e| Error::Io(e.to_string()))?;
     let mut out = Vec::new();
-    for batch in reader {
-        let batch = batch.map_err(|e| Error::Io(e.to_string()))?;
-        if batch.num_rows() > 0 {
-            out.push(Batch::from_arrow(batch)?);
-        }
+    for batch in spill_batches(path)? {
+        out.push(batch?);
     }
     if out.is_empty() {
         out.push(Batch::empty(schema)?);
@@ -230,9 +361,50 @@ pub fn read_spill(path: &Path, schema: SchemaRef) -> Result<Vec<Batch>> {
     Ok(out)
 }
 
+/// One Arrow IPC record at a time so a multi-batch spill file is not all live.
+pub(super) fn spill_batches(path: &Path) -> Result<SpillIter> {
+    if !path.exists() {
+        return Ok(SpillIter { reader: None });
+    }
+    let file = File::open(path).map_err(|e| Error::Io(e.to_string()))?;
+    let reader = FileReader::try_new(file, None).map_err(|e| Error::Io(e.to_string()))?;
+    Ok(SpillIter {
+        reader: Some(reader),
+    })
+}
+
+pub(super) struct SpillIter {
+    reader: Option<FileReader<File>>,
+}
+
+impl Iterator for SpillIter {
+    type Item = Result<Batch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let reader = self.reader.as_mut()?;
+        loop {
+            match reader.next() {
+                None => return None,
+                Some(Err(e)) => return Some(Err(Error::Io(e.to_string()))),
+                Some(Ok(batch)) if batch.num_rows() == 0 => continue,
+                Some(Ok(batch)) => return Some(Batch::from_arrow(batch)),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_memtotal_skips_leading_lines() {
+        assert_eq!(
+            parse_memtotal("Buffers: 1 kB\nMemTotal: 2048 kB\nMemFree: 1 kB\n"),
+            Some(2048 * 1024)
+        );
+        assert_eq!(parse_memtotal("MemFree: 1 kB\n"), None);
+    }
 
     #[test]
     fn reserve_fails_closed_without_room() {
@@ -264,5 +436,45 @@ mod tests {
             .collect();
         let _ = fs::remove_dir_all(&root);
         assert!(leftover.is_empty(), "{leftover:?}");
+    }
+
+    #[test]
+    fn job_dirs_are_exclusive_under_one_root() {
+        let root = std::env::temp_dir().join(format!(
+            "mizuchi-pool-excl-{}-{}",
+            std::process::id(),
+            JOB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let a = MemoryPool::new(None, Some(root.clone())).unwrap();
+        let b = MemoryPool::new(None, Some(root.clone())).unwrap();
+        let pa = a.spill_path().unwrap();
+        let pb = b.spill_path().unwrap();
+        assert_ne!(pa.parent(), pb.parent());
+        drop(a);
+        drop(b);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spill_dir_and_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "mizuchi-pool-mode-{}-{}",
+            std::process::id(),
+            JOB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let pool = MemoryPool::new(None, Some(root.clone())).unwrap();
+        let path = pool.spill_path().unwrap();
+        let job = path.parent().unwrap();
+        let dir_mode = fs::metadata(job).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "{job:?} mode {dir_mode:o}");
+        write_spill(&path, Arc::new(arrow::datatypes::Schema::empty()), &[]).unwrap();
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "{path:?} mode {file_mode:o}");
+        drop(pool);
+        let _ = fs::remove_dir_all(&root);
     }
 }

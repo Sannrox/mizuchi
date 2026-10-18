@@ -8,9 +8,10 @@ The CPU profile of a physical plan is exclusive operator time: inclusive
 `elapsed_ns` from `Session::query_metrics` minus the children's inclusive
 times, ranked highest first. The allocation profile is the query memory-pool
 high-water (`peak_bytes`) and bytes rewritten by concat/take
-(`copied_bytes`). Join and aggregate reserve only when a
-`memory_limit` is set, so `gb_bench profile` uses a 24 GiB cap (above the
-SF1 working set). `gb_bench run` does not set a cap. `peak_bytes` on a
+(`copied_bytes`). Join, aggregate, and sort reserve against the query
+pool. `gb_bench profile` uses `Session::with_system_memory_budget` (one
+quarter of machine memory, with spill). `gb_bench run` stays unbounded so
+published walls isolate compute. `peak_bytes` on a
 blocking operator is the pool high-water observed when that operator
 finished. Exclusive time subtracts pipelined children only; blocking
 children (join/aggregate/sort) already finished and must not be subtracted. Default `cargo test` drives this path

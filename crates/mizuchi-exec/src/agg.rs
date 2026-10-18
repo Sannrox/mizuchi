@@ -46,6 +46,7 @@ const PERFECT_MAX_SLOTS: usize = 1 << 20;
 const LOCAL_FLUSH_GROUPS: usize = 4096;
 const AGG_PART_MIN: usize = 4;
 const AGG_PART_MAX: usize = 64;
+const AGG_GRACE_DEPTH: u32 = 4;
 
 #[cfg(test)]
 pub(crate) mod agg_path_counters {
@@ -124,7 +125,8 @@ pub(super) fn run(
 ) -> Result<Vec<Batch>> {
     let mut table = GroupedTable::new(group, aggs, schema.clone())?;
     let mut held: Vec<super::memory::Reservation<'_>> = Vec::new();
-    let mut partials: Vec<std::path::PathBuf> = Vec::new();
+    let npart = AGG_PART_MAX;
+    let mut partials: Vec<Vec<std::path::PathBuf>> = vec![Vec::new(); npart];
     while let Some(batch) = input.next_batch(cancel)? {
         if batch.num_rows() == 0 {
             continue;
@@ -144,7 +146,15 @@ pub(super) fn run(
                         &mut table,
                         GroupedTable::new(group, aggs, schema.clone())?,
                     );
-                    spill_grouped(old, schema.clone(), policy, pool, &mut partials)?;
+                    spill_grouped(
+                        old,
+                        schema.clone(),
+                        policy,
+                        pool,
+                        group.len(),
+                        npart,
+                        &mut partials,
+                    )?;
                     held.clear();
                     let r = pool.try_reserve(sz).map_err(|_| {
                         Error::Memory("a single aggregate batch exceeds the memory limit".into())
@@ -155,11 +165,20 @@ pub(super) fn run(
         }
         table.update(&batch, pool)?;
     }
-    if partials.is_empty() {
+    if partials.iter().all(|p| p.is_empty()) {
         return table.finish(policy);
     }
-    spill_grouped(table, schema.clone(), policy, pool, &mut partials)?;
-    merge_partial_files(&partials, group, aggs, schema, policy)
+    spill_grouped(
+        table,
+        schema.clone(),
+        policy,
+        pool,
+        group.len(),
+        npart,
+        &mut partials,
+    )?;
+    drop(held);
+    merge_partial_files(&partials, group, aggs, schema, policy, pool)
 }
 
 fn spill_grouped(
@@ -167,15 +186,157 @@ fn spill_grouped(
     schema: SchemaRef,
     policy: &BatchPolicy,
     pool: &MemoryPool,
-    partials: &mut Vec<std::path::PathBuf>,
+    group_n: usize,
+    npart: usize,
+    partials: &mut [Vec<std::path::PathBuf>],
 ) -> Result<()> {
     let finished = table.finish(policy)?;
-    if finished.is_empty() {
-        return Ok(());
+    for batch in finished {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let idx: Vec<u32> = (0..batch.num_rows() as u32).collect();
+        let batch = take_rows(&batch, &idx)?;
+        for (i, piece) in scatter_groups(&batch, group_n, npart)?
+            .into_iter()
+            .enumerate()
+        {
+            let Some(piece) = piece else {
+                continue;
+            };
+            let path = pool.write_spill_file(schema.clone(), std::slice::from_ref(&piece))?;
+            partials[i].push(path);
+        }
     }
-    let path = pool.write_spill_file(schema, &finished)?;
-    partials.push(path);
     Ok(())
+}
+
+fn scatter_groups(batch: &Batch, group_n: usize, npart: usize) -> Result<Vec<Option<Batch>>> {
+    scatter_groups_at(batch, group_n, npart, 0)
+}
+
+fn scatter_groups_at(
+    batch: &Batch,
+    group_n: usize,
+    npart: usize,
+    depth: u32,
+) -> Result<Vec<Option<Batch>>> {
+    debug_assert!(npart.is_power_of_two() && npart > 0);
+    if batch.num_rows() == 0 {
+        return Ok(vec![None; npart]);
+    }
+    if group_n == 0 || npart == 1 {
+        let mut out = vec![None; npart];
+        out[0] = Some(batch.clone());
+        return Ok(out);
+    }
+    let keys: Vec<ArrayRef> = (0..group_n)
+        .map(|i| batch.as_arrow().column(i).clone())
+        .collect();
+    let mask = npart - 1;
+    let shift = (depth * 6) % 64;
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); npart];
+    for row in 0..batch.num_rows() {
+        let h = mix_hash(hash_row(&keys, row)?);
+        buckets[((h >> shift) as usize) & mask].push(row as u32);
+    }
+    buckets
+        .into_iter()
+        .map(|idx| {
+            if idx.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(take_rows(batch, &idx)?))
+            }
+        })
+        .collect()
+}
+
+fn take_rows(batch: &Batch, idx: &[u32]) -> Result<Batch> {
+    let arr = UInt32Array::from(idx.to_vec());
+    let columns = batch
+        .as_arrow()
+        .columns()
+        .iter()
+        .map(|col| {
+            compute::take(col.as_ref(), &arr, None).map_err(|e| Error::InvalidBatch(e.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Batch::try_new(batch.schema(), columns)
+}
+
+/// Rebuild so Arrow reports the taken rows, not an IPC reader's parent buffer.
+fn compact_batch(batch: Batch) -> Result<Batch> {
+    if batch.num_rows() == 0 {
+        return Ok(batch);
+    }
+    let idx: Vec<u32> = (0..batch.num_rows() as u32).collect();
+    take_rows(&batch, &idx)
+}
+
+fn spill_halves(
+    batch: &Batch,
+    schema: SchemaRef,
+    pool: &MemoryPool,
+    more: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
+    let mid = batch.num_rows() / 2;
+    let left: Vec<u32> = (0..mid as u32).collect();
+    let right: Vec<u32> = (mid as u32..batch.num_rows() as u32).collect();
+    more.push(pool.write_spill_file(
+        schema.clone(),
+        std::slice::from_ref(&take_rows(batch, &left)?),
+    )?);
+    more.push(pool.write_spill_file(schema, std::slice::from_ref(&take_rows(batch, &right)?))?);
+    Ok(())
+}
+
+fn spill_finished(
+    finished: Vec<Batch>,
+    schema: SchemaRef,
+    pool: &MemoryPool,
+    more: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
+    for batch in finished {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        more.push(pool.write_spill_file(schema.clone(), std::slice::from_ref(&batch))?);
+    }
+    Ok(())
+}
+
+fn scalar_mem(s: &Scalar) -> u64 {
+    24 + match s {
+        Scalar::Utf8(t) => t.len() as u64,
+        _ => 0,
+    }
+}
+
+fn accum_retained(accums: &[Accum]) -> u64 {
+    accums.iter().map(Accum::retained_bytes).sum()
+}
+
+/// Payload bytes in `batch`, not Arrow's 64-byte min-allocation per buffer.
+fn piece_payload(batch: &Batch) -> u64 {
+    let rows = batch.num_rows() as u64;
+    if rows == 0 {
+        return 0;
+    }
+    batch
+        .as_arrow()
+        .columns()
+        .iter()
+        .map(|c| match c.data_type() {
+            DataType::Utf8 => c.as_string::<i32>().values().len() as u64 + rows.saturating_mul(4),
+            DataType::LargeUtf8 => {
+                c.as_string::<i64>().values().len() as u64 + rows.saturating_mul(8)
+            }
+            DataType::Boolean => rows.div_ceil(8),
+            _ => rows.saturating_mul(8),
+        })
+        .fold(0u64, u64::saturating_add)
+        .max(64)
 }
 
 pub(super) fn can_combine(aggs: &[(String, AggCall)]) -> bool {
@@ -198,10 +359,53 @@ pub(super) fn combine_partials(
     aggs: &[(String, AggCall)],
     schema: SchemaRef,
     policy: &BatchPolicy,
+    pool: &MemoryPool,
 ) -> Result<Vec<Batch>> {
     if partials.is_empty() {
         return HashAgg::new(group, aggs, schema)?.finish(policy);
     }
+    if !pool.has_limit() {
+        return combine_partials_in_memory(&partials, group, aggs, schema, policy, pool);
+    }
+    let mut compact = Vec::with_capacity(partials.len());
+    for batch in partials {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        compact.push(compact_batch(batch)?);
+    }
+    if compact.is_empty() {
+        return HashAgg::new(group, aggs, schema)?.finish(policy);
+    }
+    match combine_partials_in_memory(&compact, group, aggs, schema.clone(), policy, pool) {
+        Ok(out) => return Ok(out),
+        Err(Error::Memory(_)) if pool.can_spill() => {}
+        Err(e) => return Err(e),
+    }
+    let npart = AGG_PART_MAX;
+    let mut parts: Vec<Vec<std::path::PathBuf>> = vec![Vec::new(); npart];
+    for batch in compact {
+        for (i, piece) in scatter_groups(&batch, group.len(), npart)?
+            .into_iter()
+            .enumerate()
+        {
+            let Some(piece) = piece else {
+                continue;
+            };
+            parts[i].push(pool.write_spill_file(schema.clone(), std::slice::from_ref(&piece))?);
+        }
+    }
+    merge_partial_files(&parts, group, aggs, schema, policy, pool)
+}
+
+fn combine_partials_in_memory(
+    partials: &[Batch],
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+    policy: &BatchPolicy,
+    pool: &MemoryPool,
+) -> Result<Vec<Batch>> {
     let group_n = group.len();
     let merge_group: Vec<NamedExpr> = (0..group_n)
         .map(|i| NamedExpr {
@@ -229,8 +433,32 @@ pub(super) fn combine_partials(
         })
         .collect();
     let mut table = HashAgg::combining(&merge_group, &merge_aggs, schema)?;
+    let mut held: Vec<super::memory::Reservation<'_>> = Vec::new();
     for batch in partials {
-        table.update(&batch)?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        if pool.has_limit() {
+            let sz = piece_payload(batch);
+            if table.n_groups() > 0
+                && let Some(limit) = pool.limit()
+                && table.retained_bytes().saturating_add(sz) > limit
+            {
+                return Err(Error::Memory(
+                    "aggregate merge exceeds the memory limit".into(),
+                ));
+            }
+            let incoming = pool.try_reserve(sz)?;
+            table.update(batch)?;
+            drop(incoming);
+            held.clear();
+            let proxy = table.retained_bytes();
+            if proxy > 0 {
+                held.push(pool.try_reserve(proxy)?);
+            }
+        } else {
+            table.update(batch)?;
+        }
     }
     table.finish(policy)
 }
@@ -493,12 +721,50 @@ pub(super) fn merge_finish(
 }
 
 fn merge_partial_files(
+    parts: &[Vec<std::path::PathBuf>],
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+    policy: &BatchPolicy,
+    pool: &MemoryPool,
+) -> Result<Vec<Batch>> {
+    let mut out = Vec::new();
+    for files in parts {
+        if files.is_empty() {
+            continue;
+        }
+        out.extend(merge_partition(
+            files,
+            group,
+            aggs,
+            schema.clone(),
+            policy,
+            pool,
+            0,
+        )?);
+    }
+    if out.is_empty() {
+        HashAgg::new(group, aggs, schema)?.finish(policy)
+    } else {
+        Ok(out)
+    }
+}
+
+fn merge_partition(
     paths: &[std::path::PathBuf],
     group: &[NamedExpr],
     aggs: &[(String, AggCall)],
     schema: SchemaRef,
     policy: &BatchPolicy,
+    pool: &MemoryPool,
+    depth: u32,
 ) -> Result<Vec<Batch>> {
+    if paths.len() == 1 && !pool.has_limit() {
+        return memory::read_spill(&paths[0], schema)?
+            .into_iter()
+            .map(compact_batch)
+            .collect();
+    }
     let group_n = group.len();
     let merge_group: Vec<NamedExpr> = (0..group_n)
         .map(|i| NamedExpr {
@@ -526,12 +792,132 @@ fn merge_partial_files(
         })
         .collect();
     let mut table = HashAgg::combining(&merge_group, &merge_aggs, schema.clone())?;
+    let mut held: Vec<super::memory::Reservation<'_>> = Vec::new();
+    let mut more = Vec::new();
     for path in paths {
-        for batch in memory::read_spill(path, schema.clone())? {
+        for batch in memory::spill_batches(path)? {
+            let batch = compact_batch(batch?)?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let sz = piece_payload(&batch);
+            if table.n_groups() > 0
+                && let Some(limit) = pool.limit()
+                && table.retained_bytes().saturating_add(sz) > limit
+            {
+                let finished = table.finish(policy)?;
+                spill_finished(finished, schema.clone(), pool, &mut more)?;
+                held.clear();
+                table = HashAgg::combining(&merge_group, &merge_aggs, schema.clone())?;
+            }
+            let incoming = match pool.try_reserve(sz) {
+                Ok(r) => r,
+                Err(e) if !pool.can_spill() => return Err(e),
+                Err(_) => {
+                    if table.n_groups() > 0 {
+                        let finished = table.finish(policy)?;
+                        spill_finished(finished, schema.clone(), pool, &mut more)?;
+                        held.clear();
+                        table = HashAgg::combining(&merge_group, &merge_aggs, schema.clone())?;
+                    }
+                    match pool.try_reserve(sz) {
+                        Ok(r) => r,
+                        Err(_) if batch.num_rows() > 1 => {
+                            spill_halves(&batch, schema.clone(), pool, &mut more)?;
+                            continue;
+                        }
+                        Err(_) => {
+                            return Err(Error::Memory(
+                                "a single aggregate batch exceeds the memory limit".into(),
+                            ));
+                        }
+                    }
+                }
+            };
             table.update(&batch)?;
+            drop(incoming);
+            held.clear();
+            let proxy = table.retained_bytes();
+            if proxy == 0 {
+                continue;
+            }
+            match pool.try_reserve(proxy) {
+                Ok(r) => held.push(r),
+                Err(e) if !pool.can_spill() => return Err(e),
+                Err(_) => {
+                    let finished = table.finish(policy)?;
+                    spill_finished(finished, schema.clone(), pool, &mut more)?;
+                    table = HashAgg::combining(&merge_group, &merge_aggs, schema.clone())?;
+                }
+            }
         }
     }
-    table.finish(policy)
+    if more.is_empty() {
+        return table.finish(policy);
+    }
+    let finished = table.finish(policy)?;
+    drop(held);
+    spill_finished(finished, schema.clone(), pool, &mut more)?;
+    if more.len() >= paths.len() {
+        return repartition_merge(&more, group, aggs, schema, policy, pool, depth + 1);
+    }
+    merge_partition(&more, group, aggs, schema, policy, pool, depth)
+}
+
+fn repartition_merge(
+    paths: &[std::path::PathBuf],
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+    policy: &BatchPolicy,
+    pool: &MemoryPool,
+    depth: u32,
+) -> Result<Vec<Batch>> {
+    if depth > AGG_GRACE_DEPTH {
+        return Err(Error::Memory(
+            "aggregate partition could not fit under the memory limit".into(),
+        ));
+    }
+    let nsub = 4;
+    let mut parts: Vec<Vec<std::path::PathBuf>> = vec![Vec::new(); nsub];
+    for path in paths {
+        for batch in memory::spill_batches(path)? {
+            let batch = compact_batch(batch?)?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            for (i, piece) in scatter_groups_at(&batch, group.len(), nsub, depth)?
+                .into_iter()
+                .enumerate()
+            {
+                let Some(piece) = piece else {
+                    continue;
+                };
+                let p = pool.write_spill_file(schema.clone(), std::slice::from_ref(&piece))?;
+                parts[i].push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for files in parts {
+        if files.is_empty() {
+            continue;
+        }
+        out.extend(merge_partition(
+            &files,
+            group,
+            aggs,
+            schema.clone(),
+            policy,
+            pool,
+            depth,
+        )?);
+    }
+    if out.is_empty() {
+        HashAgg::new(group, aggs, schema)?.finish(policy)
+    } else {
+        Ok(out)
+    }
 }
 
 /// Grouped aggregation that starts as a hash table and switches to a perfect
@@ -1430,6 +1816,9 @@ pub(super) struct HashAgg {
     slots: IdentityMap<Vec<usize>>,
     keys: Vec<Vec<Scalar>>,
     accums: Vec<Vec<Accum>>,
+    retained: u64,
+    /// MIN/MAX/COUNT DISTINCT/UDAF can grow retained bytes after insert.
+    grow: bool,
 }
 
 impl HashAgg {
@@ -1464,6 +1853,16 @@ impl HashAgg {
             slots: identity_map_with_capacity(8),
             keys: Vec::new(),
             accums: Vec::new(),
+            retained: 0,
+            grow: aggs.iter().any(|(_, c)| {
+                matches!(
+                    c,
+                    AggCall::Min(_)
+                        | AggCall::Max(_)
+                        | AggCall::CountDistinct(_)
+                        | AggCall::User { .. }
+                )
+            }),
         })
     }
 
@@ -1505,10 +1904,15 @@ impl HashAgg {
             *slot = self.ensure_group_row(key_cols, row)?;
         }
         let n_groups = self.accums.len();
+        let grow = self.grow;
         if n_groups > 64 || n < 32 {
             for (row, &slot) in row_slot.iter().enumerate() {
+                let old = grow.then(|| accum_retained(&self.accums[slot]));
                 for (accum, arg) in self.accums[slot].iter_mut().zip(arg_cols.iter()) {
                     accum.update(arg.as_deref(), row)?;
+                }
+                if let Some(old) = old {
+                    self.charge_accums(slot, old);
                 }
             }
             return Ok(());
@@ -1521,8 +1925,12 @@ impl HashAgg {
             if rows.is_empty() {
                 continue;
             }
+            let old = grow.then(|| accum_retained(&self.accums[slot]));
             for (accum, arg) in self.accums[slot].iter_mut().zip(arg_cols.iter()) {
                 accum.update_rows(arg.as_deref(), rows)?;
+            }
+            if let Some(old) = old {
+                self.charge_accums(slot, old);
             }
         }
         Ok(())
@@ -1532,8 +1940,12 @@ impl HashAgg {
         if self.keys.is_empty() {
             self.insert_group(Vec::new())?;
         }
+        let old = self.grow.then(|| accum_retained(&self.accums[0]));
         for (accum, arg) in self.accums[0].iter_mut().zip(arg_cols.iter()) {
             accum.update_array(arg.as_deref(), n)?;
+        }
+        if let Some(old) = old {
+            self.charge_accums(0, old);
         }
         Ok(())
     }
@@ -1582,8 +1994,12 @@ impl HashAgg {
             let key = std::mem::take(&mut other.keys[i]);
             let accums = std::mem::take(&mut other.accums[i]);
             let slot = self.ensure_group(key)?;
+            let old = self.grow.then(|| accum_retained(&self.accums[slot]));
             for (dst, src) in self.accums[slot].iter_mut().zip(accums) {
                 dst.merge(src)?;
+            }
+            if let Some(old) = old {
+                self.charge_accums(slot, old);
             }
         }
         Ok(())
@@ -1591,6 +2007,15 @@ impl HashAgg {
 
     fn n_groups(&self) -> usize {
         self.accums.len()
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        self.retained
+    }
+
+    fn charge_accums(&mut self, slot: usize, old: u64) {
+        let new = accum_retained(&self.accums[slot]);
+        self.retained = self.retained.saturating_sub(old).saturating_add(new);
     }
 
     fn insert_group_hashed(&mut self, h: u64, key: Vec<Scalar>) -> Result<usize> {
@@ -1609,9 +2034,13 @@ impl HashAgg {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        let extra = 32
+            + key.iter().map(scalar_mem).sum::<u64>()
+            + accums.iter().map(Accum::retained_bytes).sum::<u64>();
         self.slots.entry(h).or_default().push(slot);
         self.keys.push(key);
         self.accums.push(accums);
+        self.retained = self.retained.saturating_add(extra);
         Ok(slot)
     }
 
@@ -1619,9 +2048,13 @@ impl HashAgg {
         bump_hash_inserts();
         let h = hash_scalars(&key);
         let slot = self.keys.len();
+        let extra = 32
+            + key.iter().map(scalar_mem).sum::<u64>()
+            + accums.iter().map(Accum::retained_bytes).sum::<u64>();
         self.slots.entry(h).or_default().push(slot);
         self.keys.push(key);
         self.accums.push(accums);
+        self.retained = self.retained.saturating_add(extra);
         Ok(())
     }
 
@@ -1640,8 +2073,14 @@ impl HashAgg {
             let h = hash_scalars(&key);
             let p = radix_slot(h, mask);
             let slot = parts[p].ensure_group(key)?;
+            let old = parts[p]
+                .grow
+                .then(|| accum_retained(&parts[p].accums[slot]));
             for (dst, src) in parts[p].accums[slot].iter_mut().zip(accums) {
                 dst.merge(src)?;
+            }
+            if let Some(old) = old {
+                parts[p].charge_accums(slot, old);
             }
         }
         self.keys.clear();
@@ -1697,7 +2136,10 @@ impl HashAgg {
 #[derive(Clone)]
 enum Accum {
     Count(i64),
-    CountDistinct(HashSet<Scalar>),
+    CountDistinct {
+        seen: HashSet<Scalar>,
+        bytes: u64,
+    },
     SumI64 {
         sum: i64,
         seen: bool,
@@ -1729,10 +2171,24 @@ enum Accum {
 }
 
 impl Accum {
+    fn retained_bytes(&self) -> u64 {
+        32 + match self {
+            Self::CountDistinct { bytes, .. } => *bytes,
+            Self::User { state, .. } => scalar_mem(state),
+            Self::Min { current } | Self::Max { current } => {
+                current.as_ref().map(scalar_mem).unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+
     fn from_call(call: &AggCall, result_type: &DataType, combining: bool) -> Result<Self> {
         Ok(match call {
             AggCall::CountStar | AggCall::Count(_) => Self::Count(0),
-            AggCall::CountDistinct(_) => Self::CountDistinct(HashSet::new()),
+            AggCall::CountDistinct(_) => Self::CountDistinct {
+                seen: HashSet::new(),
+                bytes: 0,
+            },
             AggCall::Sum(_) => match result_type {
                 DataType::Float32 | DataType::Float64 => Self::SumF64 {
                     sum: 0.0,
@@ -1835,12 +2291,15 @@ impl Accum {
                 }
                 Ok(())
             }
-            Self::CountDistinct(seen) => {
+            Self::CountDistinct { seen, bytes } => {
                 let array =
                     arg.ok_or_else(|| Error::Eval("COUNT DISTINCT needs an argument".into()))?;
                 let value = scalar_at(array, row)?;
                 if value != Scalar::Null {
-                    seen.insert(value);
+                    let extra = scalar_mem(&value);
+                    if seen.insert(value) {
+                        *bytes = bytes.saturating_add(extra);
+                    }
                 }
                 Ok(())
             }
@@ -1876,7 +2335,7 @@ impl Accum {
     /// Whole-array update for the ungrouped path. COUNT/SUM/AVG/MIN/MAX use
     /// Arrow compute kernels; COUNT DISTINCT and user aggs stay row-wise.
     fn update_array(&mut self, arg: Option<&dyn Array>, n: usize) -> Result<()> {
-        if matches!(self, Self::CountDistinct(_) | Self::User { .. }) {
+        if matches!(self, Self::CountDistinct { .. } | Self::User { .. }) {
             for row in 0..n {
                 self.update(arg, row)?;
             }
@@ -1933,14 +2392,14 @@ impl Accum {
             }
             Self::Min { current } => update_minmax_array(current, arg, true),
             Self::Max { current } => update_minmax_array(current, arg, false),
-            Self::CountDistinct(_) | Self::User { .. } => unreachable!("handled above"),
+            Self::CountDistinct { .. } | Self::User { .. } => unreachable!("handled above"),
         }
     }
 
     fn finish(&self) -> Scalar {
         match self {
             Self::Count(n) => Scalar::I64(*n),
-            Self::CountDistinct(seen) => Scalar::I64(seen.len() as i64),
+            Self::CountDistinct { seen, .. } => Scalar::I64(seen.len() as i64),
             Self::SumI64 { sum, seen } => {
                 if *seen {
                     Scalar::I64(*sum)
@@ -1982,8 +2441,13 @@ impl Accum {
                 *a += b;
                 Ok(())
             }
-            (Self::CountDistinct(a), Self::CountDistinct(b)) => {
-                a.extend(b);
+            (Self::CountDistinct { seen: a, bytes }, Self::CountDistinct { seen: b, .. }) => {
+                for v in b {
+                    let extra = scalar_mem(&v);
+                    if a.insert(v) {
+                        *bytes = bytes.saturating_add(extra);
+                    }
+                }
                 Ok(())
             }
             (
@@ -2831,6 +3295,75 @@ mod tests {
             total += counts.value(i);
         }
         assert_eq!(total, n as i64);
+    }
+
+    #[test]
+    fn retained_bytes_counts_utf8_group_keys() {
+        let key = "k".repeat(8_192);
+        let batch = Batch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("g", DataType::Utf8, true),
+                Field::new("v", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![Some(key.as_str())])),
+                Arc::new(Int64Array::from(vec![Some(1)])),
+            ],
+        )
+        .unwrap();
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Utf8, true),
+            Field::new("c", DataType::Int64, true),
+        ]));
+        let mut table = HashAgg::new(
+            &[NamedExpr {
+                expr: Expr::nth(0),
+                name: "g".into(),
+            }],
+            &[("c".into(), AggCall::CountStar)],
+            out_schema,
+        )
+        .unwrap();
+        table.update(&batch).unwrap();
+        assert!(
+            table.retained_bytes() >= 8_192,
+            "retained={}",
+            table.retained_bytes()
+        );
+        assert!(piece_payload(&batch) >= 8_192, "{}", piece_payload(&batch));
+    }
+
+    #[test]
+    fn overlapping_count_merge_does_not_charge_value_payload() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Utf8, true),
+            Field::new("c", DataType::Int64, true),
+        ]));
+        let key = "k".repeat(8_192);
+        let partial = |n: i64| {
+            Batch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec![Some(key.as_str())])),
+                    Arc::new(Int64Array::from(vec![Some(n)])),
+                ],
+            )
+            .unwrap()
+        };
+        let mut table = HashAgg::combining(
+            &[NamedExpr {
+                expr: Expr::nth(0),
+                name: "g".into(),
+            }],
+            &[("c".into(), AggCall::Sum(Expr::nth(1)))],
+            schema.clone(),
+        )
+        .unwrap();
+        table.update(&partial(1)).unwrap();
+        let after_first = table.retained_bytes();
+        table.update(&partial(2)).unwrap();
+        assert_eq!(table.retained_bytes(), after_first);
+        assert!(after_first >= 8_192, "retained={after_first}");
     }
 
     #[test]

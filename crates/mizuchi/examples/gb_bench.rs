@@ -558,10 +558,10 @@ fn load_session(flags: &Flags, account: bool) -> (Session, u64) {
         flags.workers
     );
     let mut session = Session::new().with_workers(flags.workers).expect("workers");
-    // Join/aggregate reserve only with a cap. Profile sets 24 GiB (above SF1
-    // peaks). Wall-clock `run` stays unbounded so SF10 matches results.md.
+    // Profile uses a system-fraction cap plus spill. Wall-clock `run` stays
+    // unbounded so SF10 matches results.md.
     if account {
-        session = session.with_memory_limit(24u64 * 1024 * 1024 * 1024);
+        session = session.with_system_memory_budget();
     }
     let mut input_bytes = 0u64;
     for name in TABLES {

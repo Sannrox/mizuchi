@@ -29,8 +29,8 @@ SF10 1_280_729_644 bytes.
 | tpcds_store_sales | 7518.938 | 104.787 | 0.014 | 391.952 | 0.052 |
 
 SF1 DuckDB ratios are at or above 0.33 on every query. `tpcds_store_sales`
-is faster than DataFusion at this scale. SF10 walls below were not re-timed
-with this change.
+is faster than DataFusion at this scale. SF10 walls were not re-timed
+(`bench-data/` is not in the default checkout).
 
 ## Parquet scan pushdown
 
