@@ -6,6 +6,7 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- Grouped aggregation uses a perfect hash when integer, boolean, or single-byte string key ranges fit a dense index, so those groups do not allocate `Scalar` keys or probe a hash table. Wider domains radix-partition by hash bits, flush small thread-local tables, and merge partitions in parallel.
 - Unbounded inner joins scatter build morsels into hash partitions on worker threads, finalise each partition without an insert lock, and probe left morsels as they arrive so the probe side is not collected first.
 - Memory-limited and spilled inner joins hash-partition both sides and join each partition once, so a hash table is not rebuilt for every left×right chunk pair.
 - Unbounded inner join plus aggregate (`run_then_agg`) reuses `hash_join_streamed` when unique-key fold does not apply: one build table, then parallel probe morsels. After morsels stayed unconcatenated, the batch-pair fallback rebuilt a hash table per left×right pair and made `tpcds_store_sales` hundreds of times slower with workers > 1. `scripts/bench-gb.sh` and `docs/bench/baseline.json` time the suite with workers > 1; `scripts/check-bench-regression.sh` rejects a 1-worker run.

@@ -61,16 +61,17 @@ q1 evaluates several arithmetic aggregates per `lineitem` row (`SUM` of
 `l_extendedprice * (1 - l_discount) * (1 + l_tax)` and related). q6 is a
 selective Filter plus one product. Filter and projection already run Arrow
 compute over whole arrays. Ungrouped aggregate updates (q6) fold COUNT/SUM/AVG
-kernels over those arrays. Grouped lookup (q1) hashes Utf8 and primitive cells
-in place and allocates `Scalar` keys only when inserting a new group.
+kernels over those arrays. Grouped lookup (q1) indexes single-byte Utf8 keys with a
+perfect hash (no per-group `Scalar`). Wider domains hash in place and
+radix-partition so workers merge disjoint partitions.
 
 ### Hash aggregate
 
 q1 is a two-key grouped aggregate over six million `lineitem` rows at SF1.
 q3 and store_sales group the join output. HashAggregate exclusive time plus
-the SF1 wall for q1 put grouped aggregation in the top limiters. Updates hash
-the grouping row in place, probe collision lists, and mutate per-group
-accumulators.
+the SF1 wall for q1 put grouped aggregation in the top limiters. q1's
+CHAR keys use a perfect-hash index; high-cardinality groups radix-partition
+and merge in parallel.
 
 ### Hash join
 

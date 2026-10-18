@@ -63,5 +63,30 @@ fn main() -> mizuchi::Result<()> {
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
         println!("{name}\t{ms:.3} ms\t{rows} rows");
     }
+
+    let high_schema = Arc::new(mizuchi::Schema::new(vec![
+        mizuchi::Field::new("k", mizuchi::DataType::Int64, false),
+        mizuchi::Field::new("v", mizuchi::DataType::Int64, false),
+    ]));
+    let high_keys: Vec<i64> = (0..N).map(|i| i.wrapping_mul(1i64 << 40)).collect();
+    let high_vals: Vec<i64> = (0..N).collect();
+    let high = Batch::try_new(
+        high_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(high_keys)),
+            Arc::new(Int64Array::from(high_vals)),
+        ],
+    )?;
+    for workers in [1usize, 4] {
+        let mut session = Session::new().with_workers(workers)?;
+        session.register("h", high_schema.clone(), vec![high.clone()])?;
+        let sql = "SELECT k, COUNT(*) AS c, SUM(v) AS s FROM h GROUP BY k";
+        let _warmup = session.execute_sql(sql)?;
+        let start = Instant::now();
+        let out = session.execute_sql(sql)?;
+        let ms = start.elapsed().as_secs_f64() * 1_000.0;
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        println!("agg_grouped_highcard\t{workers}w\t{ms:.3} ms\t{rows} rows");
+    }
     Ok(())
 }

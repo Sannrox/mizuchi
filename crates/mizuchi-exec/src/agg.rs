@@ -1,16 +1,20 @@
 //! Hash aggregate over Arrow batches.
 //!
 //! Grouping expressions and aggregate arguments are evaluated column-at-a-time.
-//! Groups live in a hash table keyed by those grouping values. COUNT(expr),
-//! SUM, AVG, MIN, and MAX skip nulls; COUNT(*) counts every input row.
-//! COUNT(DISTINCT expr) counts unique non-null values per group. Ungrouped
-//! aggregation of empty input still emits one row (COUNT is 0, the rest null).
-//! Grouped aggregation of empty input emits no rows. Null grouping keys form
-//! one group.
+//! Small integer, boolean, and single-byte string key ranges use a perfect
+//! hash: accumulators are indexed by the packed key with no per-group
+//! `Scalar`. Other grouped input radix-partitions by hash bits, flushes
+//! thread-local tables when they fill, and merges partitions in parallel.
+//! COUNT(expr), SUM, AVG, MIN, and MAX skip nulls; COUNT(*) counts every
+//! input row. COUNT(DISTINCT expr) counts unique non-null values per group.
+//! Ungrouped aggregation of empty input still emits one row (COUNT is 0, the
+//! rest null). Grouped aggregation of empty input emits no rows. Null grouping
+//! keys form one group.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
@@ -26,8 +30,8 @@ use arrow::datatypes::{
 use super::CancelToken;
 use super::Operator;
 use super::key::{
-    IdentityMap, Scalar, eval_all, extract_key, hash_row, hash_scalars, identity_map_with_capacity,
-    row_matches, scalar_at,
+    IdentityMap, Scalar, dict_utf8_at, eval_all, extract_key, hash_row, hash_scalars,
+    identity_map_with_capacity, row_matches, scalar_at,
 };
 use super::memory::{self, MemoryPool, batch_bytes};
 use mizuchi_core::batch::{Batch, BatchPolicy};
@@ -35,6 +39,79 @@ use mizuchi_core::error::{Error, Result};
 use mizuchi_core::expr::Expr;
 use mizuchi_core::udaf::CombineAgg;
 use mizuchi_plan::{AggCall, NamedExpr};
+
+/// Dense perfect-hash cap, including the null slot per dimension.
+const PERFECT_MAX_SLOTS: usize = 1 << 20;
+/// Flush a worker-local hash table into radix partitions at this many groups.
+const LOCAL_FLUSH_GROUPS: usize = 4096;
+const AGG_PART_MIN: usize = 4;
+const AGG_PART_MAX: usize = 64;
+
+#[cfg(test)]
+pub(crate) mod agg_path_counters {
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicUsize;
+
+    pub static PERFECT_ROWS: AtomicUsize = AtomicUsize::new(0);
+    pub static HASH_INSERTS: AtomicUsize = AtomicUsize::new(0);
+    pub static PARALLEL_MERGES: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        /// Per-test, because `store` would race across default cargo threads.
+        pub static RADIX_PARTS: Cell<usize> = const { Cell::new(0) };
+        pub static RADIX_OCCUPIED: Cell<usize> = const { Cell::new(0) };
+    }
+}
+
+fn bump_perfect_rows(n: usize) {
+    let _ = n;
+    #[cfg(test)]
+    agg_path_counters::PERFECT_ROWS.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn bump_hash_inserts() {
+    #[cfg(test)]
+    agg_path_counters::HASH_INSERTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn set_radix_parts(n: usize) {
+    let _ = n;
+    #[cfg(test)]
+    agg_path_counters::RADIX_PARTS.with(|c| c.set(n));
+}
+
+fn set_radix_occupied(n: usize) {
+    let _ = n;
+    #[cfg(test)]
+    agg_path_counters::RADIX_OCCUPIED.with(|c| c.set(n));
+}
+
+#[cfg(test)]
+fn perfect_index_bytes(slots: usize) -> u64 {
+    (slots * std::mem::size_of::<u32>()) as u64
+}
+
+/// Avalanche before taking low bits. FastHasher's finish is the raw multiply
+/// state; integer keys that live in the high bits otherwise collapse onto one
+/// radix partition.
+fn mix_hash(h: u64) -> u64 {
+    let mut x = h;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    x
+}
+
+fn radix_slot(h: u64, mask: usize) -> usize {
+    (mix_hash(h) as usize) & mask
+}
+
+fn bump_parallel_merges() {
+    #[cfg(test)]
+    agg_path_counters::PARALLEL_MERGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 pub(super) fn run(
     mut input: Box<dyn Operator>,
@@ -45,7 +122,7 @@ pub(super) fn run(
     pool: &MemoryPool,
     cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
-    let mut table = HashAgg::new(group, aggs, schema.clone())?;
+    let mut table = GroupedTable::new(group, aggs, schema.clone())?;
     let mut held: Vec<super::memory::Reservation<'_>> = Vec::new();
     let mut partials: Vec<std::path::PathBuf> = Vec::new();
     while let Some(batch) = input.next_batch(cancel)? {
@@ -63,9 +140,11 @@ pub(super) fn run(
                     if !spill_ok(aggs) {
                         return Err(Error::Memory("this aggregate cannot spill".into()));
                     }
-                    let old =
-                        std::mem::replace(&mut table, HashAgg::new(group, aggs, schema.clone())?);
-                    spill_hash(old, schema.clone(), policy, pool, &mut partials)?;
+                    let old = std::mem::replace(
+                        &mut table,
+                        GroupedTable::new(group, aggs, schema.clone())?,
+                    );
+                    spill_grouped(old, schema.clone(), policy, pool, &mut partials)?;
                     held.clear();
                     let r = pool.try_reserve(sz).map_err(|_| {
                         Error::Memory("a single aggregate batch exceeds the memory limit".into())
@@ -74,17 +153,17 @@ pub(super) fn run(
                 }
             }
         }
-        table.update(&batch)?;
+        table.update(&batch, pool)?;
     }
     if partials.is_empty() {
         return table.finish(policy);
     }
-    spill_hash(table, schema.clone(), policy, pool, &mut partials)?;
+    spill_grouped(table, schema.clone(), policy, pool, &mut partials)?;
     merge_partial_files(&partials, group, aggs, schema, policy)
 }
 
-fn spill_hash(
-    table: HashAgg,
+fn spill_grouped(
+    table: GroupedTable,
     schema: SchemaRef,
     policy: &BatchPolicy,
     pool: &MemoryPool,
@@ -455,6 +534,889 @@ fn merge_partial_files(
     table.finish(policy)
 }
 
+/// Grouped aggregation that starts as a hash table and switches to a perfect
+/// hash when the first batch's key domain fits in [`PERFECT_MAX_SLOTS`].
+enum GroupedTable {
+    Hash(HashAgg),
+    Perfect(PerfectAgg),
+}
+
+impl GroupedTable {
+    fn new(group: &[NamedExpr], aggs: &[(String, AggCall)], schema: SchemaRef) -> Result<Self> {
+        Ok(Self::Hash(HashAgg::new(group, aggs, schema)?))
+    }
+
+    fn update(&mut self, batch: &Batch, pool: &MemoryPool) -> Result<()> {
+        match self {
+            Self::Hash(table) => {
+                // Memory-limited queries keep a hash table. A dense index of
+                // [`PERFECT_MAX_SLOTS`] would steal budget from later batches.
+                if table.grouped
+                    && table.n_groups() == 0
+                    && batch.num_rows() > 0
+                    && !pool.has_limit()
+                {
+                    let key_cols = eval_all(&table.group_exprs, batch)?;
+                    if let Some(spec) = infer_spec(&key_cols) {
+                        let mut perfect = PerfectAgg::from_hash(table, spec)?;
+                        perfect.update_encoded(batch, &key_cols)?;
+                        *self = Self::Perfect(perfect);
+                        return Ok(());
+                    }
+                }
+                table.update(batch)
+            }
+            Self::Perfect(table) => {
+                if table.try_update(batch)? {
+                    return Ok(());
+                }
+                let mut hash = table.take_hash()?;
+                hash.update(batch)?;
+                *self = Self::Hash(hash);
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(self, policy: &BatchPolicy) -> Result<Vec<Batch>> {
+        match self {
+            Self::Hash(table) => table.finish(policy),
+            Self::Perfect(table) => table.finish(policy),
+        }
+    }
+}
+
+/// Parallel grouped aggregation: perfect-hash when the domain fits, otherwise
+/// radix-partitioned hash tables merged one partition per task.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_parallel(
+    morsels: Vec<Batch>,
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+    policy: &BatchPolicy,
+    workers: usize,
+    cancel: &CancelToken,
+) -> Result<Vec<Batch>> {
+    if morsels.is_empty() {
+        return HashAgg::new(group, aggs, schema)?.finish(policy);
+    }
+    let exprs: Vec<Expr> = group.iter().map(|g| g.expr.clone()).collect();
+    if let Some(spec) = infer_spec_morsels(&morsels, &exprs)? {
+        return run_perfect_parallel(spec, morsels, group, aggs, schema, policy, workers, cancel);
+    }
+    if workers <= 1 {
+        let mut table = HashAgg::new(group, aggs, schema)?;
+        for batch in morsels {
+            cancel.check()?;
+            table.update(&batch)?;
+        }
+        return table.finish(policy);
+    }
+    run_radix(morsels, group, aggs, schema, policy, workers, cancel)
+}
+
+fn agg_partition_count(workers: usize) -> usize {
+    workers
+        .max(1)
+        .next_power_of_two()
+        .clamp(AGG_PART_MIN, AGG_PART_MAX)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_perfect_parallel(
+    spec: PerfectSpec,
+    morsels: Vec<Batch>,
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+    policy: &BatchPolicy,
+    workers: usize,
+    cancel: &CancelToken,
+) -> Result<Vec<Batch>> {
+    let n = workers.max(1).min(morsels.len());
+    if n == 1 {
+        let mut table = PerfectAgg::new(group, aggs, schema, spec)?;
+        for (i, batch) in morsels.iter().enumerate() {
+            cancel.check()?;
+            if !table.try_update(batch)? {
+                let mut hash = table.take_hash()?;
+                for rest in morsels.into_iter().skip(i) {
+                    cancel.check()?;
+                    hash.update(&rest)?;
+                }
+                return hash.finish(policy);
+            }
+        }
+        return table.finish(policy);
+    }
+    let mut chunks: Vec<Vec<Batch>> = vec![Vec::new(); n];
+    for (i, batch) in morsels.into_iter().enumerate() {
+        chunks[i % n].push(batch);
+    }
+    let tables = Mutex::new(Vec::new());
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for chunk in chunks {
+            let tables = &tables;
+            let spec = spec.clone();
+            let schema = schema.clone();
+            handles.push(scope.spawn(move || -> Result<()> {
+                cancel.check()?;
+                let mut table = PerfectAgg::new(group, aggs, schema, spec)?;
+                for batch in chunk {
+                    cancel.check()?;
+                    if !table.try_update(&batch)? {
+                        return Err(Error::Eval(
+                            "perfect-hash domain missed a row after global infer".into(),
+                        ));
+                    }
+                }
+                tables
+                    .lock()
+                    .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?
+                    .push(table);
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join()
+                .map_err(|_| Error::Eval("worker panicked".into()))??;
+        }
+        Ok(())
+    })?;
+    let mut tables = tables
+        .into_inner()
+        .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?;
+    let Some(mut acc) = tables.pop() else {
+        return HashAgg::new(group, aggs, schema)?.finish(policy);
+    };
+    for table in tables {
+        acc.merge_table(table)?;
+    }
+    acc.finish(policy)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_radix(
+    morsels: Vec<Batch>,
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+    policy: &BatchPolicy,
+    workers: usize,
+    cancel: &CancelToken,
+) -> Result<Vec<Batch>> {
+    let npart = agg_partition_count(workers);
+    set_radix_parts(npart);
+    let n = workers.max(1).min(morsels.len());
+    let mut chunks: Vec<Vec<Batch>> = vec![Vec::new(); n];
+    for (i, batch) in morsels.into_iter().enumerate() {
+        chunks[i % n].push(batch);
+    }
+    let worker_parts = Mutex::new(Vec::new());
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for chunk in chunks {
+            let worker_parts = &worker_parts;
+            let schema = schema.clone();
+            handles.push(scope.spawn(move || -> Result<()> {
+                let mut local = HashAgg::new(group, aggs, schema.clone())?;
+                let mut parts = (0..npart)
+                    .map(|_| HashAgg::new(group, aggs, schema.clone()))
+                    .collect::<Result<Vec<_>>>()?;
+                for batch in chunk {
+                    cancel.check()?;
+                    local.update(&batch)?;
+                    if local.n_groups() >= LOCAL_FLUSH_GROUPS {
+                        local.flush_into(&mut parts)?;
+                    }
+                }
+                local.flush_into(&mut parts)?;
+                worker_parts
+                    .lock()
+                    .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?
+                    .push(parts);
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join()
+                .map_err(|_| Error::Eval("worker panicked".into()))??;
+        }
+        Ok(())
+    })?;
+    let worker_parts = worker_parts
+        .into_inner()
+        .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?;
+    let mut by_part: Vec<Vec<HashAgg>> = (0..npart).map(|_| Vec::new()).collect();
+    for parts in worker_parts {
+        for (p, table) in parts.into_iter().enumerate() {
+            by_part[p].push(table);
+        }
+    }
+    set_radix_occupied(
+        by_part
+            .iter()
+            .filter(|tables| tables.iter().any(|t| t.n_groups() > 0))
+            .count(),
+    );
+    let finished = Mutex::new(vec![Vec::new(); npart]);
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for (p, tables) in by_part.into_iter().enumerate() {
+            let finished = &finished;
+            let schema = schema.clone();
+            handles.push(scope.spawn(move || -> Result<()> {
+                cancel.check()?;
+                bump_parallel_merges();
+                let out = merge_finish(tables, group, aggs, schema, policy)?;
+                finished
+                    .lock()
+                    .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?[p] = out;
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join()
+                .map_err(|_| Error::Eval("worker panicked".into()))??;
+        }
+        Ok(())
+    })?;
+    let finished = finished
+        .into_inner()
+        .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?;
+    Ok(finished.into_iter().flatten().collect())
+}
+
+#[derive(Clone)]
+struct Dim {
+    width: u32,
+    kind: DimKind,
+}
+
+#[derive(Clone)]
+enum DimKind {
+    Int { min: i64 },
+    UInt { min: u64 },
+    Bool,
+    Byte,
+}
+
+#[derive(Clone)]
+struct PerfectSpec {
+    dims: Vec<Dim>,
+    slots: usize,
+}
+
+struct PerfectAgg {
+    spec: PerfectSpec,
+    group_exprs: Vec<Expr>,
+    aggs: Vec<AggCall>,
+    schema: SchemaRef,
+    combining: bool,
+    empty: Vec<Accum>,
+    /// 0 = empty, else 1-based index into `accums`.
+    index: Vec<u32>,
+    accums: Vec<Vec<Accum>>,
+    slots_hit: Vec<u32>,
+}
+
+impl PerfectAgg {
+    fn new(
+        group: &[NamedExpr],
+        aggs: &[(String, AggCall)],
+        schema: SchemaRef,
+        spec: PerfectSpec,
+    ) -> Result<Self> {
+        let group_n = group.len();
+        let empty = aggs
+            .iter()
+            .enumerate()
+            .map(|(i, (_, call))| {
+                Accum::from_call(call, schema.field(group_n + i).data_type(), false)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            index: vec![0; spec.slots],
+            spec,
+            group_exprs: group.iter().map(|g| g.expr.clone()).collect(),
+            aggs: aggs.iter().map(|(_, c)| c.clone()).collect(),
+            schema,
+            combining: false,
+            empty,
+            accums: Vec::new(),
+            slots_hit: Vec::new(),
+        })
+    }
+
+    fn from_hash(table: &HashAgg, spec: PerfectSpec) -> Result<Self> {
+        let group_n = table.group_exprs.len();
+        let empty = table
+            .aggs
+            .iter()
+            .enumerate()
+            .map(|(i, call)| {
+                Accum::from_call(
+                    call,
+                    table.schema.field(group_n + i).data_type(),
+                    table.combining,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            index: vec![0; spec.slots],
+            spec,
+            group_exprs: table.group_exprs.clone(),
+            aggs: table.aggs.clone(),
+            schema: table.schema.clone(),
+            combining: table.combining,
+            empty,
+            accums: Vec::new(),
+            slots_hit: Vec::new(),
+        })
+    }
+
+    fn try_update(&mut self, batch: &Batch) -> Result<bool> {
+        if batch.num_rows() == 0 {
+            return Ok(true);
+        }
+        let key_cols = eval_all(&self.group_exprs, batch)?;
+        let n = batch.num_rows();
+        let mut codes = vec![0usize; n];
+        for (row, code) in codes.iter_mut().enumerate() {
+            match encode_row(&self.spec, &key_cols, row) {
+                Some(c) => *code = c,
+                None => return Ok(false),
+            }
+        }
+        self.apply_codes(batch, &key_cols, &codes)?;
+        Ok(true)
+    }
+
+    fn update_encoded(&mut self, batch: &Batch, key_cols: &[ArrayRef]) -> Result<()> {
+        let n = batch.num_rows();
+        let mut codes = vec![0usize; n];
+        for (row, code) in codes.iter_mut().enumerate() {
+            *code = encode_row(&self.spec, key_cols, row).ok_or_else(|| {
+                Error::Eval("perfect-hash encode failed on the inferred batch".into())
+            })?;
+        }
+        self.apply_codes(batch, key_cols, &codes)
+    }
+
+    fn apply_codes(
+        &mut self,
+        batch: &Batch,
+        _key_cols: &[ArrayRef],
+        codes: &[usize],
+    ) -> Result<()> {
+        let mut arg_cols: Vec<Option<ArrayRef>> = Vec::with_capacity(self.aggs.len());
+        for call in &self.aggs {
+            arg_cols.push(match call {
+                AggCall::CountStar => None,
+                AggCall::Count(e)
+                | AggCall::CountDistinct(e)
+                | AggCall::Sum(e)
+                | AggCall::Avg(e)
+                | AggCall::Min(e)
+                | AggCall::Max(e)
+                | AggCall::User { arg: e, .. } => Some(e.eval(batch)?),
+            });
+        }
+        bump_perfect_rows(codes.len());
+        for (row, &code) in codes.iter().enumerate() {
+            let dense = self.ensure_slot(code)?;
+            for (accum, arg) in self.accums[dense].iter_mut().zip(arg_cols.iter()) {
+                accum.update(arg.as_deref(), row)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_slot(&mut self, code: usize) -> Result<usize> {
+        let cur = self.index[code];
+        if cur != 0 {
+            return Ok((cur - 1) as usize);
+        }
+        let dense = self.accums.len();
+        self.accums.push(self.empty.clone());
+        self.slots_hit.push(code as u32);
+        self.index[code] = (dense as u32) + 1;
+        Ok(dense)
+    }
+
+    fn merge_table(&mut self, mut other: PerfectAgg) -> Result<()> {
+        for (i, &slot) in other.slots_hit.iter().enumerate() {
+            let dense = self.ensure_slot(slot as usize)?;
+            let src = std::mem::take(&mut other.accums[i]);
+            for (dst, a) in self.accums[dense].iter_mut().zip(src) {
+                dst.merge(a)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn take_hash(&mut self) -> Result<HashAgg> {
+        let group: Vec<NamedExpr> = self
+            .group_exprs
+            .iter()
+            .enumerate()
+            .map(|(i, expr)| NamedExpr {
+                expr: expr.clone(),
+                name: self.schema.field(i).name().clone(),
+            })
+            .collect();
+        let aggs: Vec<(String, AggCall)> = self
+            .aggs
+            .iter()
+            .enumerate()
+            .map(|(i, call)| {
+                (
+                    self.schema.field(self.group_exprs.len() + i).name().clone(),
+                    call.clone(),
+                )
+            })
+            .collect();
+        let mut table = if self.combining {
+            HashAgg::combining(&group, &aggs, self.schema.clone())?
+        } else {
+            HashAgg::new(&group, &aggs, self.schema.clone())?
+        };
+        let dts: Vec<DataType> = (0..self.group_exprs.len())
+            .map(|i| self.schema.field(i).data_type().clone())
+            .collect();
+        for (i, &slot) in self.slots_hit.iter().enumerate() {
+            let key = decode_slot(&self.spec, slot as usize, &dts)?;
+            table.insert_ready(key, std::mem::take(&mut self.accums[i]))?;
+        }
+        self.accums.clear();
+        self.slots_hit.clear();
+        self.index.fill(0);
+        Ok(table)
+    }
+
+    fn finish(self, policy: &BatchPolicy) -> Result<Vec<Batch>> {
+        if self.accums.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = self.accums.len();
+        let group_n = self.group_exprs.len();
+        let dts: Vec<DataType> = (0..group_n)
+            .map(|i| self.schema.field(i).data_type().clone())
+            .collect();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
+        for (g, field) in self.schema.fields().iter().enumerate().take(group_n) {
+            let values: Vec<Scalar> = self
+                .slots_hit
+                .iter()
+                .map(|&slot| decode_slot(&self.spec, slot as usize, &dts).map(|k| k[g].clone()))
+                .collect::<Result<_>>()?;
+            columns.push(build_array(&values, field.data_type())?);
+        }
+        for (a, field) in self.schema.fields().iter().enumerate().skip(group_n) {
+            let ai = a - group_n;
+            let values: Vec<Scalar> = (0..n).map(|i| self.accums[i][ai].finish()).collect();
+            columns.push(build_array(&values, field.data_type())?);
+        }
+        let full = Batch::try_new(self.schema, columns)?;
+        Ok(full
+            .split_by_policy(policy)
+            .into_iter()
+            .filter(|b| b.num_rows() > 0)
+            .collect())
+    }
+}
+
+fn infer_spec_morsels(morsels: &[Batch], exprs: &[Expr]) -> Result<Option<PerfectSpec>> {
+    let mut spec: Option<PerfectSpec> = None;
+    for batch in morsels {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let cols = eval_all(exprs, batch)?;
+        spec = Some(match spec {
+            None => match infer_spec(&cols) {
+                Some(s) => s,
+                None => return Ok(None),
+            },
+            Some(cur) => match union_spec(&cur, &cols) {
+                Some(s) => s,
+                None => return Ok(None),
+            },
+        });
+    }
+    Ok(spec)
+}
+
+fn infer_spec(cols: &[ArrayRef]) -> Option<PerfectSpec> {
+    if cols.is_empty() {
+        return None;
+    }
+    let mut dims = Vec::with_capacity(cols.len());
+    for col in cols {
+        dims.push(infer_dim(col.as_ref())?);
+    }
+    let slots = product_slots(&dims)?;
+    Some(PerfectSpec { dims, slots })
+}
+
+fn union_spec(cur: &PerfectSpec, cols: &[ArrayRef]) -> Option<PerfectSpec> {
+    if cols.len() != cur.dims.len() {
+        return None;
+    }
+    let mut dims = Vec::with_capacity(cur.dims.len());
+    for (dim, col) in cur.dims.iter().zip(cols) {
+        dims.push(union_dim(dim, col.as_ref())?);
+    }
+    let slots = product_slots(&dims)?;
+    Some(PerfectSpec { dims, slots })
+}
+
+fn product_slots(dims: &[Dim]) -> Option<usize> {
+    let mut n = 1u128;
+    for dim in dims {
+        n = n.checked_mul(u128::from(dim.width))?;
+        if n > PERFECT_MAX_SLOTS as u128 {
+            return None;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    Some(n as usize)
+}
+
+fn infer_dim(array: &dyn Array) -> Option<Dim> {
+    match array.data_type() {
+        DataType::Boolean => Some(Dim {
+            width: 3,
+            kind: DimKind::Bool,
+        }),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            int_dim(array, true)
+        }
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            int_dim(array, false)
+        }
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Dictionary(_, _) => {
+            if utf8_is_byte(array) {
+                Some(Dim {
+                    width: 257,
+                    kind: DimKind::Byte,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn union_dim(dim: &Dim, array: &dyn Array) -> Option<Dim> {
+    match (&dim.kind, array.data_type()) {
+        (DimKind::Bool, DataType::Boolean) => Some(dim.clone()),
+        (
+            DimKind::Int { min },
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
+        ) => match int_bounds(array, true) {
+            None => Some(dim.clone()),
+            Some((bmin, bmax)) => {
+                let old_max = int_dim_max(dim);
+                let min = match old_max {
+                    Some(_) => (*min).min(bmin),
+                    None => bmin,
+                };
+                let max = old_max.map(|m| m.max(bmax)).unwrap_or(bmax);
+                int_width(min, max).map(|width| Dim {
+                    width,
+                    kind: DimKind::Int { min },
+                })
+            }
+        },
+        (
+            DimKind::UInt { min },
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64,
+        ) => match uint_bounds(array) {
+            None => Some(dim.clone()),
+            Some((bmin, bmax)) => {
+                let old_max = uint_dim_max(dim);
+                let min = match old_max {
+                    Some(_) => (*min).min(bmin),
+                    None => bmin,
+                };
+                let max = old_max.map(|m| m.max(bmax)).unwrap_or(bmax);
+                uint_width(min, max).map(|width| Dim {
+                    width,
+                    kind: DimKind::UInt { min },
+                })
+            }
+        },
+        (DimKind::Byte, DataType::Utf8 | DataType::LargeUtf8 | DataType::Dictionary(_, _)) => {
+            if utf8_is_byte(array) {
+                Some(dim.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn int_dim(array: &dyn Array, signed: bool) -> Option<Dim> {
+    if signed {
+        match int_bounds(array, true) {
+            None => Some(Dim {
+                width: 1,
+                kind: DimKind::Int { min: 0 },
+            }),
+            Some((min, max)) => int_width(min, max).map(|width| Dim {
+                width,
+                kind: DimKind::Int { min },
+            }),
+        }
+    } else {
+        match uint_bounds(array) {
+            None => Some(Dim {
+                width: 1,
+                kind: DimKind::UInt { min: 0 },
+            }),
+            Some((min, max)) => uint_width(min, max).map(|width| Dim {
+                width,
+                kind: DimKind::UInt { min },
+            }),
+        }
+    }
+}
+
+fn int_dim_max(dim: &Dim) -> Option<i64> {
+    match dim.kind {
+        DimKind::Int { min } if dim.width >= 2 => Some(min.wrapping_add(i64::from(dim.width - 2))),
+        _ => None,
+    }
+}
+
+fn uint_dim_max(dim: &Dim) -> Option<u64> {
+    match dim.kind {
+        DimKind::UInt { min } if dim.width >= 2 => Some(min.wrapping_add(u64::from(dim.width - 2))),
+        _ => None,
+    }
+}
+
+fn int_width(min: i64, max: i64) -> Option<u32> {
+    if max < min {
+        return None;
+    }
+    let span = (max as i128) - (min as i128) + 1;
+    let width = span + 1;
+    if width <= 0 || width > PERFECT_MAX_SLOTS as i128 {
+        None
+    } else {
+        Some(width as u32)
+    }
+}
+
+fn uint_width(min: u64, max: u64) -> Option<u32> {
+    if max < min {
+        return None;
+    }
+    let span = (max as u128) - (min as u128) + 1;
+    let width = span + 1;
+    if width > PERFECT_MAX_SLOTS as u128 {
+        None
+    } else {
+        Some(width as u32)
+    }
+}
+
+fn int_bounds(array: &dyn Array, _signed: bool) -> Option<(i64, i64)> {
+    if array.null_count() == array.len() {
+        return None;
+    }
+    let min = min_scalar(array).ok()?;
+    let max = max_scalar(array).ok()?;
+    Some((scalar_as_i64(&min)?, scalar_as_i64(&max)?))
+}
+
+fn uint_bounds(array: &dyn Array) -> Option<(u64, u64)> {
+    if array.null_count() == array.len() {
+        return None;
+    }
+    let min = min_scalar(array).ok()?;
+    let max = max_scalar(array).ok()?;
+    Some((scalar_as_u64(&min)?, scalar_as_u64(&max)?))
+}
+
+fn scalar_as_i64(s: &Scalar) -> Option<i64> {
+    match s {
+        Scalar::I8(v) => Some(i64::from(*v)),
+        Scalar::I16(v) => Some(i64::from(*v)),
+        Scalar::I32(v) => Some(i64::from(*v)),
+        Scalar::I64(v) => Some(*v),
+        Scalar::U8(v) => Some(i64::from(*v)),
+        Scalar::U16(v) => Some(i64::from(*v)),
+        Scalar::U32(v) => Some(i64::from(*v)),
+        _ => None,
+    }
+}
+
+fn scalar_as_u64(s: &Scalar) -> Option<u64> {
+    match s {
+        Scalar::U8(v) => Some(u64::from(*v)),
+        Scalar::U16(v) => Some(u64::from(*v)),
+        Scalar::U32(v) => Some(u64::from(*v)),
+        Scalar::U64(v) => Some(*v),
+        _ => None,
+    }
+}
+
+fn utf8_is_byte(array: &dyn Array) -> bool {
+    for i in 0..array.len() {
+        if array.is_null(i) {
+            continue;
+        }
+        match utf8_cell(array, i) {
+            Ok(s) if s.len() == 1 => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn utf8_cell(array: &dyn Array, row: usize) -> Result<&str> {
+    match array.data_type() {
+        DataType::Utf8 => Ok(array.as_string::<i32>().value(row)),
+        DataType::LargeUtf8 => Ok(array.as_string::<i64>().value(row)),
+        DataType::Dictionary(_, _) => dict_utf8_at(array, row),
+        dt => Err(Error::Eval(format!("not a utf8 grouping key: {dt}"))),
+    }
+}
+
+fn encode_row(spec: &PerfectSpec, cols: &[ArrayRef], row: usize) -> Option<usize> {
+    if cols.len() != spec.dims.len() {
+        return None;
+    }
+    let mut idx = 0usize;
+    let mut stride = 1usize;
+    for (dim, col) in spec.dims.iter().zip(cols) {
+        let code = encode_dim(dim, col.as_ref(), row)?;
+        idx += code as usize * stride;
+        stride = stride.checked_mul(dim.width as usize)?;
+    }
+    if idx >= spec.slots {
+        return None;
+    }
+    Some(idx)
+}
+
+fn encode_dim(dim: &Dim, array: &dyn Array, row: usize) -> Option<u32> {
+    match dim.kind {
+        DimKind::Bool => {
+            if array.is_null(row) {
+                Some(0)
+            } else {
+                Some(if array.as_boolean().value(row) { 2 } else { 1 })
+            }
+        }
+        DimKind::Int { min } => {
+            if array.is_null(row) {
+                Some(0)
+            } else {
+                let v = integer_value(array, row).ok()?;
+                let code = (v as i128) - (min as i128) + 1;
+                if code < 1 || code >= i128::from(dim.width) {
+                    None
+                } else {
+                    Some(code as u32)
+                }
+            }
+        }
+        DimKind::UInt { min } => {
+            if array.is_null(row) {
+                Some(0)
+            } else {
+                let v = unsigned_value(array, row).ok()?;
+                if v < min {
+                    return None;
+                }
+                let code = (v as u128) - (min as u128) + 1;
+                if code < 1 || code >= u128::from(dim.width) {
+                    None
+                } else {
+                    Some(code as u32)
+                }
+            }
+        }
+        DimKind::Byte => {
+            if array.is_null(row) {
+                Some(0)
+            } else {
+                let s = utf8_cell(array, row).ok()?;
+                if s.len() != 1 {
+                    return None;
+                }
+                Some(u32::from(s.as_bytes()[0]) + 1)
+            }
+        }
+    }
+}
+
+fn decode_slot(spec: &PerfectSpec, slot: usize, dts: &[DataType]) -> Result<Vec<Scalar>> {
+    let mut rest = slot;
+    let mut out = Vec::with_capacity(spec.dims.len());
+    for (dim, dt) in spec.dims.iter().zip(dts) {
+        let width = dim.width as usize;
+        let code = rest % width;
+        rest /= width;
+        out.push(decode_dim(dim, code as u32, dt)?);
+    }
+    Ok(out)
+}
+
+fn decode_dim(dim: &Dim, code: u32, dt: &DataType) -> Result<Scalar> {
+    if code == 0 {
+        return Ok(Scalar::Null);
+    }
+    match dim.kind {
+        DimKind::Bool => Ok(Scalar::Bool(code == 2)),
+        DimKind::Int { min } => {
+            let v = min.wrapping_add(i64::from(code) - 1);
+            int_scalar(dt, v)
+        }
+        DimKind::UInt { min } => {
+            let v = min.wrapping_add(u64::from(code) - 1);
+            uint_scalar(dt, v)
+        }
+        DimKind::Byte => {
+            let b = (code - 1) as u8;
+            Ok(Scalar::Utf8(String::from_utf8_lossy(&[b]).into_owned()))
+        }
+    }
+}
+
+fn int_scalar(dt: &DataType, v: i64) -> Result<Scalar> {
+    Ok(match dt {
+        DataType::Int8 => Scalar::I8(v as i8),
+        DataType::Int16 => Scalar::I16(v as i16),
+        DataType::Int32 => Scalar::I32(v as i32),
+        DataType::Int64 => Scalar::I64(v),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Dictionary(_, _) => {
+            return Err(Error::Eval("integer perfect-hash decoded as utf8".into()));
+        }
+        _ => Scalar::I64(v),
+    })
+}
+
+fn uint_scalar(dt: &DataType, v: u64) -> Result<Scalar> {
+    Ok(match dt {
+        DataType::UInt8 => Scalar::U8(v as u8),
+        DataType::UInt16 => Scalar::U16(v as u16),
+        DataType::UInt32 => Scalar::U32(v as u32),
+        DataType::UInt64 => Scalar::U64(v),
+        _ => Scalar::U64(v),
+    })
+}
+
 #[derive(Clone)]
 pub(super) struct HashAgg {
     group_exprs: Vec<Expr>,
@@ -463,8 +1425,8 @@ pub(super) struct HashAgg {
     grouped: bool,
     combining: bool,
     /// Precomputed key hash → candidate slots. The map uses the hash as the
-    /// bucket key. New groups allocate `Scalar` keys once; lookups hash array
-    /// values in place (no per-row `String`).
+    /// bucket key. Lookups hash array values in place (no per-row `String`).
+    /// Perfect-hash grouped input never stores these keys.
     slots: IdentityMap<Vec<usize>>,
     keys: Vec<Vec<Scalar>>,
     accums: Vec<Vec<Accum>>,
@@ -627,7 +1589,12 @@ impl HashAgg {
         Ok(())
     }
 
+    fn n_groups(&self) -> usize {
+        self.accums.len()
+    }
+
     fn insert_group_hashed(&mut self, h: u64, key: Vec<Scalar>) -> Result<usize> {
+        bump_hash_inserts();
         let slot = self.keys.len();
         let n_group = self.group_exprs.len();
         let accums = self
@@ -646,6 +1613,41 @@ impl HashAgg {
         self.keys.push(key);
         self.accums.push(accums);
         Ok(slot)
+    }
+
+    fn insert_ready(&mut self, key: Vec<Scalar>, accums: Vec<Accum>) -> Result<()> {
+        bump_hash_inserts();
+        let h = hash_scalars(&key);
+        let slot = self.keys.len();
+        self.slots.entry(h).or_default().push(slot);
+        self.keys.push(key);
+        self.accums.push(accums);
+        Ok(())
+    }
+
+    /// Move groups into radix partitions by key hash. Equal keys stay in one
+    /// partition so the later per-partition merge is disjoint.
+    fn flush_into(&mut self, parts: &mut [HashAgg]) -> Result<()> {
+        if self.keys.is_empty() {
+            return Ok(());
+        }
+        let npart = parts.len();
+        debug_assert!(npart.is_power_of_two() && npart > 0);
+        let mask = npart - 1;
+        for i in 0..self.keys.len() {
+            let key = std::mem::take(&mut self.keys[i]);
+            let accums = std::mem::take(&mut self.accums[i]);
+            let h = hash_scalars(&key);
+            let p = radix_slot(h, mask);
+            let slot = parts[p].ensure_group(key)?;
+            for (dst, src) in parts[p].accums[slot].iter_mut().zip(accums) {
+                dst.merge(src)?;
+            }
+        }
+        self.keys.clear();
+        self.accums.clear();
+        self.slots.clear();
+        Ok(())
     }
 
     fn finish(mut self, policy: &BatchPolicy) -> Result<Vec<Batch>> {
@@ -1962,5 +2964,361 @@ mod tests {
             total += sums.value(i);
         }
         assert_eq!(total, (0..n as i64).map(|i| i * 2).sum::<i64>());
+    }
+
+    fn grouped_counts(session: &mut crate::Session, sql: &str) -> Vec<(i64, i64)> {
+        let out = session.execute_sql(sql).unwrap();
+        let mut rows = Vec::new();
+        for b in &out {
+            let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let c = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((k.value(i), c.value(i)));
+            }
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    #[test]
+    fn perfect_hash_small_int_range_skips_scalar_insert() {
+        let before = agg_path_counters::PERFECT_ROWS.load(std::sync::atomic::Ordering::Relaxed);
+        let n = 50_000i64;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..n)),
+                Arc::new(Int64Array::from_iter_values(std::iter::repeat_n(
+                    1, n as usize,
+                ))),
+            ],
+        )
+        .unwrap();
+        let mut session = crate::Session::new().with_workers(2).unwrap();
+        session.register("t", schema, vec![batch]).unwrap();
+        let rows = grouped_counts(&mut session, "SELECT k, COUNT(*) AS c FROM t GROUP BY k");
+        assert_eq!(rows.len(), n as usize);
+        assert_eq!(rows[0], (0, 1));
+        assert_eq!(rows[n as usize - 1], (n - 1, 1));
+        let perfect = agg_path_counters::PERFECT_ROWS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            perfect.saturating_sub(before) >= n as usize,
+            "perfect rows delta {perfect} - {before}"
+        );
+    }
+
+    #[test]
+    fn perfect_hash_two_utf8_bytes_skips_scalar_insert() {
+        let before = agg_path_counters::PERFECT_ROWS.load(std::sync::atomic::Ordering::Relaxed);
+        let flags = ["A", "N", "R"];
+        let status = ["O", "F"];
+        let n = 6_000usize;
+        let f: Vec<Option<&str>> = (0..n).map(|i| Some(flags[i % 3])).collect();
+        let s: Vec<Option<&str>> = (0..n).map(|i| Some(status[i % 2])).collect();
+        let qty: Vec<i64> = (0..n as i64).collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("flag", DataType::Utf8, true),
+            Field::new("st", DataType::Utf8, true),
+            Field::new("qty", DataType::Int64, true),
+        ]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(f)),
+                Arc::new(StringArray::from(s)),
+                Arc::new(Int64Array::from(qty)),
+            ],
+        )
+        .unwrap();
+        let mut session = crate::Session::new().with_workers(2).unwrap();
+        session.register("t", schema, vec![batch]).unwrap();
+        let out = session
+            .execute_sql("SELECT flag, st, COUNT(*) AS c, SUM(qty) AS s FROM t GROUP BY flag, st")
+            .unwrap();
+        let mut total = 0i64;
+        for b in &out {
+            let c = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..c.len() {
+                total += c.value(i);
+            }
+        }
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 6);
+        assert_eq!(total, n as i64);
+        let perfect = agg_path_counters::PERFECT_ROWS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            perfect.saturating_sub(before) >= n,
+            "perfect rows delta {perfect} - {before}"
+        );
+    }
+
+    #[test]
+    fn grouped_range_too_large_falls_back_to_hash() {
+        let before = agg_path_counters::HASH_INSERTS.load(std::sync::atomic::Ordering::Relaxed);
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![
+                0i64,
+                i64::MAX,
+                1,
+                i64::MAX,
+            ]))],
+        )
+        .unwrap();
+        let mut session = crate::Session::new().with_workers(2).unwrap();
+        session.register("t", schema, vec![batch]).unwrap();
+        let rows = grouped_counts(&mut session, "SELECT k, COUNT(*) AS c FROM t GROUP BY k");
+        assert_eq!(rows, vec![(0, 1), (1, 1), (i64::MAX, 2)]);
+        let inserts = agg_path_counters::HASH_INSERTS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            inserts.saturating_sub(before) >= 3,
+            "hash inserts delta {inserts} - {before}"
+        );
+    }
+
+    #[test]
+    fn radix_partition_high_cardinality_merges_in_parallel() {
+        let merges_before =
+            agg_path_counters::PARALLEL_MERGES.load(std::sync::atomic::Ordering::Relaxed);
+        let n = 16_384i64;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let keys: Vec<i64> = (0..n).map(|i| i.wrapping_mul(1i64 << 40)).collect();
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(Int64Array::from_iter_values(std::iter::repeat_n(
+                    2, n as usize,
+                ))),
+            ],
+        )
+        .unwrap();
+        let mut session = crate::Session::new().with_workers(4).unwrap();
+        session.register("t", schema, vec![batch]).unwrap();
+        let rows = grouped_counts(&mut session, "SELECT k, SUM(v) AS c FROM t GROUP BY k");
+        assert_eq!(rows.len(), n as usize);
+        assert!(rows.iter().all(|(_, c)| *c == 2));
+        let parts = agg_path_counters::RADIX_PARTS.with(|c| c.get());
+        let occupied = agg_path_counters::RADIX_OCCUPIED.with(|c| c.get());
+        assert!(parts >= 4, "radix parts {parts}");
+        assert!(occupied >= 4, "occupied radix partitions {occupied}");
+        let merges = agg_path_counters::PARALLEL_MERGES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            merges.saturating_sub(merges_before) >= 4,
+            "parallel merges delta {merges} - {merges_before}"
+        );
+    }
+
+    #[test]
+    fn radix_slot_spreads_shifted_int_keys() {
+        let mask = 7;
+        let mut seen = [false; 8];
+        for i in 0..256i64 {
+            let h = hash_scalars(&[Scalar::I64(i.wrapping_mul(1i64 << 40))]);
+            seen[radix_slot(h, mask)] = true;
+        }
+        let occupied = seen.iter().filter(|s| **s).count();
+        assert!(occupied >= 4, "occupied {occupied} of 8");
+    }
+
+    #[test]
+    fn perfect_and_hash_paths_agree_on_null_group_key() {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let small = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![
+                Some(1),
+                None,
+                Some(1),
+                None,
+                Some(2),
+            ]))],
+        )
+        .unwrap();
+        let mut session = crate::Session::new().with_workers(2).unwrap();
+        session.register("t", schema.clone(), vec![small]).unwrap();
+        let out = session
+            .execute_sql("SELECT k, COUNT(*) AS c FROM t GROUP BY k")
+            .unwrap();
+        let mut got = Vec::new();
+        for b in &out {
+            let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let c = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                got.push((
+                    k.is_null(i),
+                    if k.is_null(i) { 0 } else { k.value(i) },
+                    c.value(i),
+                ));
+            }
+        }
+        got.sort_unstable();
+        assert_eq!(got, vec![(false, 1, 2), (false, 2, 1), (true, 0, 2)]);
+    }
+
+    #[test]
+    fn streaming_uint_below_first_min_falls_back_without_panic() {
+        let in_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::UInt64, true)]));
+        let first = Batch::try_new(
+            in_schema.clone(),
+            vec![Arc::new(UInt64Array::from(vec![10u64, 11]))],
+        )
+        .unwrap();
+        let second =
+            Batch::try_new(in_schema, vec![Arc::new(UInt64Array::from(vec![5u64, 10]))]).unwrap();
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::UInt64, true),
+            Field::new("c", DataType::Int64, true),
+        ]));
+        let pool = MemoryPool::new(None, None).unwrap();
+        let out = run(
+            Box::new(crate::Exec::Scan {
+                batches: vec![first, second],
+                index: 0,
+            }),
+            &[NamedExpr {
+                expr: Expr::nth(0),
+                name: "k".into(),
+            }],
+            &[("c".into(), AggCall::CountStar)],
+            out_schema,
+            &BatchPolicy::unlimited(),
+            &pool,
+            &crate::CancelToken::new(),
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for b in &out {
+            let k = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+            let c = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((k.value(i), c.value(i)));
+            }
+        }
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(5, 1), (10, 2), (11, 1)]);
+    }
+
+    fn sparse_wide_int_scan() -> (crate::Exec, SchemaRef) {
+        let in_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let batch = Batch::try_new(
+            in_schema,
+            vec![Arc::new(Int64Array::from(vec![0i64, 1_048_574]))],
+        )
+        .unwrap();
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("c", DataType::Int64, true),
+        ]));
+        (
+            crate::Exec::Scan {
+                batches: vec![batch],
+                index: 0,
+            },
+            out_schema,
+        )
+    }
+
+    fn run_sparse_wide_int(pool: &MemoryPool) -> Vec<(i64, i64)> {
+        let (scan, out_schema) = sparse_wide_int_scan();
+        let out = run(
+            Box::new(scan),
+            &[NamedExpr {
+                expr: Expr::nth(0),
+                name: "k".into(),
+            }],
+            &[("c".into(), AggCall::CountStar)],
+            out_schema,
+            &BatchPolicy::unlimited(),
+            pool,
+            &crate::CancelToken::new(),
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for b in &out {
+            let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let c = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((k.value(i), c.value(i)));
+            }
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    #[test]
+    fn sparse_perfect_domain_falls_back_when_index_exceeds_budget() {
+        let pool = MemoryPool::new(Some(8 * 1024), None).unwrap();
+        let rows = run_sparse_wide_int(&pool);
+        assert_eq!(rows, vec![(0, 1), (1_048_574, 1)]);
+        assert!(
+            pool.peak() < perfect_index_bytes(PERFECT_MAX_SLOTS),
+            "peak {} reserved the dense index",
+            pool.peak()
+        );
+    }
+
+    #[test]
+    fn memory_limited_sparse_domain_keeps_budget_for_later_batches() {
+        let in_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let first = Batch::try_new(
+            in_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![0i64, 1_048_574]))],
+        )
+        .unwrap();
+        let n = 300_000i64;
+        let keys: Vec<i64> = (0..n)
+            .map(|i| if i % 2 == 0 { 0 } else { 1_048_574 })
+            .collect();
+        let second = Batch::try_new(in_schema, vec![Arc::new(Int64Array::from(keys))]).unwrap();
+        let limit = 5 * 1024 * 1024;
+        assert!(
+            batch_bytes(&second) + perfect_index_bytes(PERFECT_MAX_SLOTS) > limit,
+            "second batch {} plus index must exceed the limit",
+            batch_bytes(&second)
+        );
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("c", DataType::Int64, true),
+        ]));
+        let pool = MemoryPool::new(Some(limit), None).unwrap();
+        let out = run(
+            Box::new(crate::Exec::Scan {
+                batches: vec![first, second],
+                index: 0,
+            }),
+            &[NamedExpr {
+                expr: Expr::nth(0),
+                name: "k".into(),
+            }],
+            &[("c".into(), AggCall::CountStar)],
+            out_schema,
+            &BatchPolicy::unlimited(),
+            &pool,
+            &crate::CancelToken::new(),
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for b in &out {
+            let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let c = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((k.value(i), c.value(i)));
+            }
+        }
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(0, 150_001), (1_048_574, 150_001)]);
+        assert!(
+            pool.peak() < perfect_index_bytes(PERFECT_MAX_SLOTS),
+            "peak {} reserved the dense index",
+            pool.peak()
+        );
     }
 }
