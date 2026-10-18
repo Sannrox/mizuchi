@@ -194,39 +194,50 @@ pub(super) fn run_then_agg(
     if joined.is_empty() {
         return agg::merge_finish(Vec::new(), group, aggs, out_schema, &session.policy);
     }
-    let n = session.workers.max(1).min(joined.len());
-    let mut chunks = vec![Vec::new(); n];
-    for (i, batch) in joined.into_iter().enumerate() {
-        chunks[i % n].push(batch);
+    if group.is_empty() {
+        let n = session.workers.max(1).min(joined.len());
+        let mut chunks = vec![Vec::new(); n];
+        for (i, batch) in joined.into_iter().enumerate() {
+            chunks[i % n].push(batch);
+        }
+        let tables = Mutex::new(Vec::new());
+        let token = session.exec_token();
+        thread::scope(|scope| -> Result<()> {
+            let mut handles = Vec::new();
+            for chunk in chunks {
+                let tables = &tables;
+                let out_schema = out_schema.clone();
+                let token = &token;
+                handles.push(scope.spawn(move || -> Result<()> {
+                    token.check()?;
+                    let table = agg::fold_batches(chunk, group, aggs, out_schema)?;
+                    tables
+                        .lock()
+                        .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?
+                        .push(table);
+                    Ok(())
+                }));
+            }
+            for h in handles {
+                h.join()
+                    .map_err(|_| Error::Eval("worker panicked".into()))??;
+            }
+            Ok(())
+        })?;
+        let tables = tables
+            .into_inner()
+            .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?;
+        return agg::merge_finish(tables, group, aggs, out_schema, &session.policy);
     }
-    let tables = Mutex::new(Vec::new());
-    let token = session.exec_token();
-    thread::scope(|scope| -> Result<()> {
-        let mut handles = Vec::new();
-        for chunk in chunks {
-            let tables = &tables;
-            let out_schema = out_schema.clone();
-            let token = &token;
-            handles.push(scope.spawn(move || -> Result<()> {
-                token.check()?;
-                let table = agg::fold_batches(chunk, group, aggs, out_schema)?;
-                tables
-                    .lock()
-                    .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?
-                    .push(table);
-                Ok(())
-            }));
-        }
-        for h in handles {
-            h.join()
-                .map_err(|_| Error::Eval("worker panicked".into()))??;
-        }
-        Ok(())
-    })?;
-    let tables = tables
-        .into_inner()
-        .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?;
-    agg::merge_finish(tables, group, aggs, out_schema, &session.policy)
+    agg::run_parallel(
+        joined,
+        group,
+        aggs,
+        out_schema,
+        &session.policy,
+        session.workers,
+        &session.exec_token(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

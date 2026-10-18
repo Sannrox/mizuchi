@@ -520,39 +520,50 @@ fn agg_from_batches(
             .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?;
         return super::agg::combine_partials(partials, group, aggs, schema, &session.policy);
     }
-    let tables = Mutex::new(Vec::new());
-    thread::scope(|scope| -> Result<()> {
-        let mut handles = Vec::new();
-        let token = session.exec_token();
-        for chunk in chunks {
-            let tables = &tables;
-            let schema = schema.clone();
-            let token = token.clone();
-            handles.push(scope.spawn(move || -> Result<()> {
-                let prev = Session::push_cancel(token);
-                let result = (|| {
-                    session.exec_token().check()?;
-                    let table = super::agg::fold_batches(chunk, group, aggs, schema)?;
-                    tables
-                        .lock()
-                        .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?
-                        .push(table);
-                    Ok(())
-                })();
-                Session::restore_cancel(prev);
-                result
-            }));
-        }
-        for h in handles {
-            h.join()
-                .map_err(|_| Error::Eval("worker panicked".into()))??;
-        }
-        Ok(())
-    })?;
-    let tables = tables
-        .into_inner()
-        .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?;
-    super::agg::merge_finish(tables, group, aggs, schema, &session.policy)
+    if group.is_empty() {
+        let tables = Mutex::new(Vec::new());
+        thread::scope(|scope| -> Result<()> {
+            let mut handles = Vec::new();
+            let token = session.exec_token();
+            for chunk in chunks {
+                let tables = &tables;
+                let schema = schema.clone();
+                let token = token.clone();
+                handles.push(scope.spawn(move || -> Result<()> {
+                    let prev = Session::push_cancel(token);
+                    let result = (|| {
+                        session.exec_token().check()?;
+                        let table = super::agg::fold_batches(chunk, group, aggs, schema)?;
+                        tables
+                            .lock()
+                            .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?
+                            .push(table);
+                        Ok(())
+                    })();
+                    Session::restore_cancel(prev);
+                    result
+                }));
+            }
+            for h in handles {
+                h.join()
+                    .map_err(|_| Error::Eval("worker panicked".into()))??;
+            }
+            Ok(())
+        })?;
+        let tables = tables
+            .into_inner()
+            .map_err(|_| Error::Eval("agg combine lock poisoned".into()))?;
+        return super::agg::merge_finish(tables, group, aggs, schema, &session.policy);
+    }
+    super::agg::run_parallel(
+        chunks.into_iter().flatten().collect(),
+        group,
+        aggs,
+        schema,
+        &session.policy,
+        session.workers,
+        &session.exec_token(),
+    )
 }
 
 fn map_morsels(

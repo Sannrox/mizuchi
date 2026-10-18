@@ -87,12 +87,9 @@ impl MemoryPool {
         self.limit
     }
 
-    pub(super) fn try_reserve(&self, bytes: u64) -> Result<Reservation<'_>> {
+    fn add_used(&self, bytes: u64) -> Result<()> {
         if bytes == 0 {
-            return Ok(Reservation {
-                pool: self,
-                bytes: 0,
-            });
+            return Ok(());
         }
         if let Some(limit) = self.limit {
             let mut current = self.used.load(Ordering::SeqCst);
@@ -116,6 +113,11 @@ impl MemoryPool {
         }
         let live = self.used.load(Ordering::SeqCst);
         self.peak.fetch_max(live, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(super) fn try_reserve(&self, bytes: u64) -> Result<Reservation<'_>> {
+        self.add_used(bytes)?;
         Ok(Reservation { pool: self, bytes })
     }
 
