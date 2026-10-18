@@ -38,11 +38,11 @@ pub use mizuchi_core::{
     Expr, ProductI64, Result, UnaryOp, from_arrow_schema, is_supported_data_type, to_arrow_schema,
 };
 pub use mizuchi_exec::{
-    Cluster, ClusterConfig, Engine, EventWindow, InputScan, MergeStats, MicroBatchAgg,
-    OperatorMetrics, OutputWrite, QUERY_API_CONTRACT, QUERY_API_SCHEMA, QueryApiConfig,
-    QueryApiServer, QueryLog, QueryRecord, QueryReport, QueryResult, QueryRetention, QueryStatus,
-    RunningQuery, Session, SessionConfig, StreamOutput, StreamQuery, StreamQueryConfig,
-    StreamTrigger, WorkerResources,
+    Cluster, ClusterConfig, Engine, EventWindow, InputScan, JwtVerifier, MergeStats, MicroBatchAgg,
+    OperatorMetrics, OutputWrite, PolicyContext, QUERY_API_CONTRACT, QUERY_API_SCHEMA,
+    QueryApiConfig, QueryApiServer, QueryLog, QueryRecord, QueryReport, QueryResult,
+    QueryRetention, QueryStatus, RunningQuery, Session, SessionConfig, StreamOutput, StreamQuery,
+    StreamQueryConfig, StreamTrigger, TokenIdentity, WorkerResources,
 };
 #[cfg(feature = "flight")]
 pub use mizuchi_flight::{RemoteCluster, serve_worker, spawn_worker};

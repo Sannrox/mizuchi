@@ -9,11 +9,13 @@ mod config;
 mod engine;
 mod incremental;
 mod join;
+mod jwt;
 mod key;
 pub mod memory;
 mod merge;
 mod metrics;
 mod op;
+mod policy;
 mod query_api;
 mod query_ui;
 mod recursive;
@@ -54,10 +56,12 @@ pub use cluster::{Cluster, ClusterConfig, WorkerResources};
 pub use config::SessionConfig;
 pub use engine::Engine;
 pub use incremental::MicroBatchAgg;
+pub use jwt::{JwtVerifier, TokenIdentity};
 pub use merge::MergeStats;
 pub use metrics::OperatorMetrics;
 pub use mizuchi_core::CancelToken;
 pub use op::{CpuLowering, Lowering, Operator};
+pub use policy::PolicyContext;
 pub use query_api::{
     QUERY_API_CONTRACT, QUERY_API_SCHEMA, QueryApiConfig, QueryApiServer, QueryLog, QueryRecord,
     QueryRetention, QueryStatus, RunningQuery,
@@ -111,6 +115,9 @@ pub struct Session {
     now_micros: Option<i64>,
     query_log: Option<Arc<query_api::QueryLog>>,
     query_api: Option<query_api::QueryApiConfig>,
+    /// When true, execute refuses a missing [`PolicyContext`].
+    governed: bool,
+    query_policy: Option<PolicyContext>,
 }
 
 impl Default for Session {
@@ -138,6 +145,8 @@ impl Default for Session {
             now_micros: None,
             query_log: None,
             query_api: None,
+            governed: false,
+            query_policy: None,
         }
     }
 }
@@ -169,6 +178,8 @@ impl Clone for Session {
             now_micros: self.now_micros,
             query_log: self.query_log.clone(),
             query_api: self.query_api.clone(),
+            governed: self.governed,
+            query_policy: self.query_policy.clone(),
         }
     }
 }
@@ -189,6 +200,7 @@ struct MemTable {
     /// Bumped on every [`Session::register`] of this name.
     generation: u64,
     source: TableSource,
+    tenant: Option<String>,
 }
 
 impl Session {
@@ -214,6 +226,8 @@ impl Session {
         session.allowed_write_paths = config::resolve_roots(cfg.allowed_write_paths)?;
         session.allow_network = cfg.allow_network;
         session.now_micros = cfg.now_micros;
+        session.governed = cfg.governed;
+        session.query_policy = cfg.policy;
         if let Some(api) = cfg.query_api {
             if api.auth_token.as_ref().is_some_and(|t| t.is_empty()) {
                 return Err(Error::Plan("query API auth_token must be non-empty".into()));
@@ -424,11 +438,11 @@ impl Session {
             stats.partition_columns = existing.partition_columns.clone();
             stats.partitions = existing.partitions.clone();
         }
-        let generation = self
-            .tables
-            .get(&name)
+        let existing = self.tables.get(&name);
+        let generation = existing
             .map(|t| t.generation.saturating_add(1))
             .unwrap_or(1);
+        let tenant = existing.and_then(|t| t.tenant.clone());
         self.invalidate_cache(&name);
         self.catalog.register(name.clone(), schema.clone())?;
         self.catalog.set_stats(name.clone(), stats.clone())?;
@@ -440,6 +454,7 @@ impl Session {
                 stats,
                 generation,
                 source: TableSource::default(),
+                tenant,
             },
         );
         Ok(())
@@ -484,6 +499,7 @@ impl Session {
                         stats,
                         generation: 1,
                         source: TableSource::default(),
+                        tenant: None,
                     },
                 );
             }
@@ -569,7 +585,8 @@ impl Session {
 
     /// `SHOW TABLES` as a two-column batch (`namespace`, `table_name`).
     pub fn show_tables(&self, namespace: Option<&str>) -> Result<Vec<Batch>> {
-        show_tables_batches(&self.catalog, namespace)
+        let catalog = self.planning_catalog()?;
+        show_tables_batches(&catalog, namespace)
     }
 
     /// Register a Parquet file or dataset directory as an in-memory table
@@ -761,14 +778,14 @@ impl Session {
         let dest = dest.as_ref();
         config::assert_allowed(dest, &self.allowed_write_paths)?;
         let stats = mizuchi_io::write_parquet_stats(dest, batches, opts, &self.cancel)?;
-        Ok(QueryReport::from_write(OutputWrite {
+        Ok(self.attach_actor(QueryReport::from_write(OutputWrite {
             path: stats.path,
             partitions: stats.partitions,
             mode: stats.mode,
             rows: stats.rows,
             bytes: stats.bytes,
             commit_id: stats.commit_id,
-        }))
+        })))
     }
 
     /// Batches and schema of a registered table.
@@ -783,11 +800,13 @@ impl Session {
     /// Apply a `MERGE` statement to a registered target table.
     pub fn merge_sql(&mut self, sql: &str) -> Result<MergeStats> {
         self.cancel.check()?;
-        let mut catalog = Catalog::new();
-        for (name, table) in &self.tables {
-            catalog.register(name, table.schema.clone())?;
-            catalog.set_stats(name, table.stats.clone())?;
+        self.require_policy()?;
+        if self.query_policy.is_some() {
+            return Err(Error::Plan(
+                "MERGE is not supported with a policy context".into(),
+            ));
         }
+        let catalog = self.planning_catalog()?;
         let plan = mizuchi_plan::bind_merge_at(sql, &catalog, self.query_now_micros())?;
         let (batches, stats) = merge::run(self, &plan)?;
         self.register(stats.table.clone(), plan.target_schema, batches)?;
@@ -1067,7 +1086,11 @@ impl Session {
         let plan_sql = report::plan_text(plan);
         self.with_query_span(&plan_sql, |instrument| {
             self.exec_token().check()?;
-            let plan = mizuchi_plan::optimize(plan.clone())?;
+            self.enforce_policy(plan, true)?;
+            let plan = self.apply_row_filters(plan.clone())?;
+            let plan = mizuchi_plan::optimize(plan)?;
+            let plan = self.pin_scan_projections(plan)?;
+            self.enforce_policy(&plan, false)?;
             let (batches, stats) = self.execute_run(&plan, instrument)?;
             Ok((
                 QueryResult {
@@ -1136,11 +1159,12 @@ impl Session {
     ) -> Result<(QueryResult, query_api::RunStats)> {
         self.exec_token().check()?;
         if let Ok(Ddl::ShowTables { namespace }) = bind_ddl(sql) {
+            self.require_policy()?;
             let batches = self.show_tables(namespace.as_deref())?;
             return Ok((
                 QueryResult {
                     batches,
-                    report: QueryReport::new("SHOW TABLES".into(), Vec::new()),
+                    report: self.attach_actor(QueryReport::new("SHOW TABLES".into(), Vec::new())),
                     peak_bytes: 0,
                     spilled_bytes: 0,
                 },
@@ -1157,7 +1181,7 @@ impl Session {
             return Ok((
                 QueryResult {
                     batches,
-                    report: QueryReport::new(text, Vec::new()),
+                    report: self.attach_actor(QueryReport::new(text, Vec::new())),
                     peak_bytes: 0,
                     spilled_bytes: 0,
                 },
@@ -1180,7 +1204,15 @@ impl Session {
     fn report_for(&self, plan: &LogicalPlan) -> QueryReport {
         let mut inputs = Vec::new();
         collect_scan_reports(plan, self, &mut inputs);
-        QueryReport::new(report::plan_text(plan), inputs)
+        self.attach_actor(QueryReport::new(report::plan_text(plan), inputs))
+    }
+
+    fn attach_actor(&self, mut report: QueryReport) -> QueryReport {
+        if let Some(policy) = &self.query_policy {
+            report.principal = Some(policy.principal.clone());
+            report.actor = Some(policy.actor.clone());
+        }
+        report
     }
 
     fn execute_run(
@@ -1311,21 +1343,15 @@ impl Session {
     }
 
     fn bind_optimized(&self, sql: &str) -> Result<LogicalPlan> {
-        let mut catalog = self.catalog.planning_copy();
-        for (name, table) in &self.tables {
-            if catalog.table(name).is_err() {
-                catalog.register(name, table.schema.clone())?;
-            }
-            let mut stats = table.stats.clone();
-            if stats.partitions.is_empty()
-                && let Ok(parts) = catalog.partitions(name)
-            {
-                stats.partitions = parts;
-            }
-            catalog.set_stats(name, stats)?;
-        }
+        self.require_policy()?;
+        let catalog = self.planning_catalog()?;
         let plan = mizuchi_plan::plan_sql_at(sql, &catalog, &self.udafs, self.query_now_micros())?;
-        mizuchi_plan::optimize(plan)
+        self.enforce_policy(&plan, true)?;
+        let plan = self.apply_row_filters(plan)?;
+        let plan = mizuchi_plan::optimize(plan)?;
+        let plan = self.pin_scan_projections(plan)?;
+        self.enforce_policy(&plan, false)?;
+        Ok(plan)
     }
 
     fn execute_cached(

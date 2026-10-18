@@ -36,6 +36,9 @@ pub struct QueryApiConfig {
     pub bind: SocketAddr,
     /// When set, data endpoints require `Authorization: Bearer <token>`.
     pub auth_token: Option<String>,
+    /// When set, a Bearer JWT verified with this HS256/JWKS config is
+    /// accepted next to [`Self::auth_token`].
+    pub jwt: Option<super::JwtVerifier>,
     /// JSONL file for completed queries. `None` keeps history in memory.
     pub history_path: Option<PathBuf>,
     /// How many completed queries to keep.
@@ -50,6 +53,7 @@ impl std::fmt::Debug for QueryApiConfig {
         f.debug_struct("QueryApiConfig")
             .field("bind", &self.bind)
             .field("auth_token", &self.auth_token.as_ref().map(|_| "_"))
+            .field("jwt", &self.jwt.as_ref().map(|_| "_"))
             .field("history_path", &self.history_path)
             .field("retention", &self.retention)
             .field("ui_dir", &self.ui_dir)
@@ -497,7 +501,10 @@ impl QueryApiServer {
             .map_err(|e| Error::Io(e.to_string()))?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let inflight = Arc::new(AtomicUsize::new(0));
-        let auth = cfg.auth_token.clone();
+        let auth = ApiAuth {
+            static_token: cfg.auth_token.clone(),
+            jwt: cfg.jwt.clone(),
+        };
         let ui_dir = cfg.ui_dir.clone();
         let stop = shutdown.clone();
         let live = inflight.clone();
@@ -529,10 +536,16 @@ impl Drop for QueryApiServer {
     }
 }
 
+#[derive(Clone)]
+struct ApiAuth {
+    static_token: Option<String>,
+    jwt: Option<super::JwtVerifier>,
+}
+
 fn serve_loop(
     listener: TcpListener,
     log: Arc<QueryLog>,
-    auth: Option<String>,
+    auth: ApiAuth,
     ui_dir: Option<PathBuf>,
     shutdown: Arc<AtomicBool>,
     inflight: Arc<AtomicUsize>,
@@ -553,7 +566,7 @@ fn serve_loop(
                 let ui_dir = ui_dir.clone();
                 let inflight = Arc::clone(&inflight);
                 thread::spawn(move || {
-                    let _ = handle_stream(&log, auth.as_deref(), ui_dir.as_deref(), &mut stream);
+                    let _ = handle_stream(&log, &auth, ui_dir.as_deref(), &mut stream);
                     inflight.fetch_sub(1, Ordering::SeqCst);
                 });
             }
@@ -572,7 +585,7 @@ fn serve_loop(
 
 fn handle_stream(
     log: &QueryLog,
-    auth: Option<&str>,
+    auth: &ApiAuth,
     ui_dir: Option<&Path>,
     stream: &mut TcpStream,
 ) -> Result<()> {
@@ -600,10 +613,7 @@ fn handle_stream(
         let rel = path.strip_prefix("/ui/").unwrap_or("");
         return write_ui(stream, query_ui::serve(root, rel));
     }
-    let (status, payload) = if let Some(token) = auth
-        && !is_public(raw_path, ui_dir.is_some())
-        && !bearer_ok(&head, token)
-    {
+    let (status, payload) = if !is_public(raw_path, ui_dir.is_some()) && !authorized(&head, auth) {
         (401, json!({"error": "unauthorized"}))
     } else {
         dispatch(log, method, raw_path)
@@ -616,18 +626,44 @@ fn is_public(path: &str, ui: bool) -> bool {
     p == "/healthz" || p == "/v1/schema" || (ui && query_ui::is_ui_route(p))
 }
 
-fn bearer_ok(head: &str, token: &str) -> bool {
-    let Some(value) = header_value(head, "authorization") else {
+fn authorized(head: &str, auth: &ApiAuth) -> bool {
+    if auth.static_token.is_none() && auth.jwt.is_none() {
+        return true;
+    }
+    let Some(presented) = bearer_presented(head) else {
         return false;
     };
+    if let Some(token) = &auth.static_token
+        && bearer_token_matches(presented, token)
+    {
+        return true;
+    }
+    if let Some(jwt) = &auth.jwt
+        && jwt.verify(presented).is_ok()
+    {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+fn bearer_ok(head: &str, token: &str) -> bool {
+    match bearer_presented(head) {
+        Some(presented) => bearer_token_matches(presented, token),
+        None => false,
+    }
+}
+
+fn bearer_presented(head: &str) -> Option<&str> {
+    let value = header_value(head, "authorization")?;
     let value = value.trim();
     let prefix = "Bearer ";
     if value.len() < prefix.len()
         || !value.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
     {
-        return false;
+        return None;
     }
-    bearer_token_matches(&value[prefix.len()..], token)
+    Some(&value[prefix.len()..])
 }
 
 /// Hash both secrets, then compare the fixed-length digests in constant time.
@@ -786,6 +822,8 @@ fn report_to_json(r: &QueryReport) -> Value {
         "plan": r.plan,
         "inputs": r.inputs.iter().map(input_json).collect::<Vec<_>>(),
         "outputs": r.outputs.iter().map(output_json).collect::<Vec<_>>(),
+        "principal": r.principal,
+        "actor": r.actor,
     })
 }
 
@@ -1294,6 +1332,7 @@ mod tests {
         let cfg = QueryApiConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             auth_token: Some("secret".into()),
+            jwt: None,
             history_path: None,
             retention: QueryRetention::default(),
             ui_dir: None,
@@ -1396,6 +1435,7 @@ mod tests {
             query_api: Some(QueryApiConfig {
                 bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9),
                 auth_token: None,
+                jwt: None,
                 history_path: None,
                 retention: QueryRetention::default(),
                 ui_dir: None,
@@ -1413,6 +1453,7 @@ mod tests {
         let cfg = QueryApiConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             auth_token: None,
+            jwt: None,
             history_path: None,
             retention: QueryRetention::default(),
             ui_dir: None,
@@ -1431,6 +1472,7 @@ mod tests {
         let cfg = QueryApiConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             auth_token: Some(String::new()),
+            jwt: None,
             history_path: None,
             retention: QueryRetention::default(),
             ui_dir: None,
@@ -1445,6 +1487,7 @@ mod tests {
         let cfg = QueryApiConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9),
             auth_token: None,
+            jwt: None,
             history_path: None,
             retention: QueryRetention::default(),
             ui_dir: None,
@@ -1458,6 +1501,7 @@ mod tests {
         let cfg = QueryApiConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             auth_token: Some("super-secret".into()),
+            jwt: None,
             history_path: None,
             retention: QueryRetention::default(),
             ui_dir: None,
@@ -1465,6 +1509,55 @@ mod tests {
         let text = format!("{cfg:?}");
         assert!(!text.contains("super-secret"), "{text}");
         assert!(text.contains("auth_token: Some(\"_\")") || text.contains("auth_token: Some(_)"));
+    }
+
+    #[test]
+    fn jwt_bearer_is_accepted_next_to_static_token() {
+        let secret = b"jwt-secret";
+        let jwt = crate::JwtVerifier::hs256(secret)
+            .unwrap()
+            .issuer("mizuchi")
+            .audience("query-api");
+        let log = StdArc::new(QueryLog::memory(QueryRetention::default()));
+        let cfg = QueryApiConfig {
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            auth_token: Some("static".into()),
+            jwt: Some(jwt),
+            history_path: None,
+            retention: QueryRetention::default(),
+            ui_dir: None,
+        };
+        let server = QueryApiServer::bind(log, &cfg).unwrap();
+        let addr = server.addr();
+        let (st, _) = http_json(addr, "GET", "/v1/queries", None);
+        assert_eq!(st, 401);
+        let (st, _) = http_json(addr, "GET", "/v1/queries", Some("static"));
+        assert_eq!(st, 200);
+        let token = crate::jwt::mint_hs256(
+            secret,
+            &json!({
+                "tenant": "a",
+                "sub": "alice",
+                "iss": "mizuchi",
+                "aud": "query-api",
+            }),
+        )
+        .unwrap();
+        let (st, _) = http_json(addr, "GET", "/v1/queries", Some(&token));
+        assert_eq!(st, 200);
+        let bad = crate::jwt::mint_hs256(
+            b"other",
+            &json!({
+                "tenant": "a",
+                "sub": "alice",
+                "iss": "mizuchi",
+                "aud": "query-api",
+            }),
+        )
+        .unwrap();
+        let (st, _) = http_json(addr, "GET", "/v1/queries", Some(&bad));
+        assert_eq!(st, 401);
+        drop(server);
     }
 
     fn http_raw(
@@ -1511,6 +1604,7 @@ mod tests {
         let cfg = QueryApiConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             auth_token: Some("secret".into()),
+            jwt: None,
             history_path: None,
             retention: QueryRetention::default(),
             ui_dir: Some(root.clone()),

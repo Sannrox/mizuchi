@@ -37,6 +37,11 @@ pub struct SessionConfig {
     /// When set, the session records query history and may serve the
     /// versioned metrics HTTP API (ADR 0012). Default is off.
     pub query_api: Option<super::query_api::QueryApiConfig>,
+    /// When true, execute refuses a missing [`super::PolicyContext`].
+    /// Default is off.
+    pub governed: bool,
+    /// Policy applied in planning. Default is none (ungoverned).
+    pub policy: Option<super::PolicyContext>,
 }
 
 pub(super) fn resolve_roots(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {

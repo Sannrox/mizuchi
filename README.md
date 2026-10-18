@@ -77,9 +77,11 @@ serves a versioned HTTP API (`/v1`, contract `mizuchi.query-api/v1` in
 `/healthz`) so external UIs can list completed queries, inspect plans and
 operator metrics, watch running queries, and cancel (ADR 0012). The JSON
 schema is `crates/mizuchi-exec/schemas/query-api-v1.json`. Bind address, optional bearer
-token, history path, and optional unpacked console directory (`ui_dir`, served
-at `/ui/`) are set by the embedder (ADR 0014); loopback listens do not
-require `allow_network`.
+token or HS256 JWT/JWKS verifier, history path, and optional unpacked console
+directory (`ui_dir`, served at `/ui/`) are set by the embedder (ADR 0014);
+loopback listens do not require `allow_network`. `SessionConfig.governed`
+plus a `PolicyContext` (allowed tables, row filters, column masks) apply in
+planning; off by default.
 `mizuchi::VERSION` and `Session::explain` are the strings a runner
 records. A complete walk-through is `cargo run -p mizuchi --example embed`.
 The engine opens TCP only when `SessionConfig.allow_network` is set
