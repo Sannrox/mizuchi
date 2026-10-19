@@ -55,6 +55,12 @@ pub trait Lowering: Send + Sync {
     ) -> Result<Box<dyn Operator>> {
         CpuLowering::limit(input, skip, fetch)
     }
+
+    /// Default CPU lowering may run scan/filter/project as a morsel pipeline.
+    /// A custom lowering collects the pull tree so overridden operators run.
+    fn is_cpu(&self) -> bool {
+        false
+    }
 }
 
 /// Default CPU operators.

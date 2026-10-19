@@ -19,12 +19,13 @@ on the tiny in-memory generator (`tests/suite_profile.rs`). Release Parquet
 runs use `bash scripts/profile-suite.sh tiny` or `1` when `bench-data/` is
 present; those files stay gitignored.
 
-`EXPLAIN ANALYZE` times the pull operator tree. `execute_sql` with
-`Session::with_workers` > 1 runs scan/filter/project morsels, combinable
-aggregates (AVG merges per-thread sum and count), inner hash-join probe,
-and wrapping sort/limit on that many threads. Integer equi-keys in a tight
-min/max span use a compact range map; unique i64 keys probe with a direct
-index. Grouped aggregates assign group slots then update in a tight loop.
+`EXPLAIN ANALYZE` times the pull operator tree. `execute_sql` always runs
+the morsel scheduler (ADR 0015), including one worker: scan/filter/project
+morsels, combinable aggregates (AVG merges per-thread sum and count),
+inner hash-join probe, and wrapping sort/limit on `Session::with_workers`
+threads. Integer equi-keys in a tight min/max span use a compact range
+map; unique i64 keys probe with a direct index. Grouped aggregates assign
+group slots then update in a tight loop.
 
 ## Operator mix
 
@@ -102,10 +103,11 @@ copies are smaller than a full probe rewrite on q3/store_sales.
 
 ### Scheduling
 
-`Session::with_workers` runs scan/filter/project morsels, combinable
-aggregates, inner join probe, and wrapping sort/limit. Join build stays
-single-threaded. SF1 q1 is 5.6× at 8 workers versus 1; q3/store_sales
-scale about 1.4–2.0× because build and materialization remain serial.
+`Session::with_workers` runs the same morsel scheduler at any worker count
+(ADR 0015): scan/filter/project morsels, combinable aggregates, inner join
+probe, and wrapping sort/limit. Join build stays single-threaded. SF1 q1
+is 5.6× at 8 workers versus 1; q3/store_sales scale about 1.4–2.0× because
+build and materialization remain serial.
 
 ## Ranked limiters
 

@@ -1,10 +1,12 @@
-//! Morsel work queue across a bounded thread pool.
+//! Morsel-driven pipeline scheduler (ADR 0015).
 //!
-//! Scan/filter/project morsels, combinable aggregates (including AVG via
-//! per-thread sum/count merge), inner hash-join probe, and the Sort/Limit
-//! wrappers around those plans run on `Session::with_workers` threads.
-//! Operators check cancellation between morsels. Plans that still need a
-//! single-threaded pipeline fall back to pull execution.
+//! The physical plan splits at blocking operators (join build, aggregate,
+//! sort). Scan/filter/project pipelines pull morsels from a shared queue.
+//! Combinable aggregates (including AVG via per-thread sum/count merge),
+//! inner hash-join probe, and wrapping Sort/Limit run on
+//! `Session::with_workers` threads. Worker count 1 uses the same code on the
+//! calling thread. Operators the scheduler does not yet pipeline collect the
+//! pull tree. Inner-join-plus-aggregate stays a fused breaker (#131).
 
 use std::sync::Mutex;
 use std::thread;
@@ -14,74 +16,40 @@ use arrow::datatypes::SchemaRef;
 use super::join::{self, JoinSpec};
 use super::memory::MemoryPool;
 use super::runtime_filter;
-use super::{Exec, Session, collect, physical, project_batch};
+use super::{Exec, Operator, Session, collect, physical, project_batch};
 use mizuchi_core::batch::Batch;
 use mizuchi_core::error::{Error, Result};
 use mizuchi_core::expr::Expr;
 use mizuchi_plan::{AggCall, JoinType, LogicalPlan, NamedExpr};
 
-pub(super) fn try_parallel(
-    plan: &LogicalPlan,
-    session: &Session,
-    pool: &MemoryPool,
-) -> Result<Option<Vec<Batch>>> {
+/// Execute `plan` on the morsel scheduler for any worker count.
+pub(super) fn run(plan: &LogicalPlan, session: &Session, pool: &MemoryPool) -> Result<Vec<Batch>> {
     session.exec_token().check()?;
+    if !session.cpu_lowering() {
+        return collect(physical(plan, session, pool)?, &session.exec_token());
+    }
     match plan {
-        LogicalPlan::Sort { input, order } => {
-            let Some(child) = try_parallel(input, session, pool)? else {
-                return Ok(None);
-            };
-            Ok(Some(super::sort::ordered(
-                Box::new(Exec::Scan {
-                    batches: child,
-                    index: 0,
-                }),
-                input.schema().clone(),
-                order,
-                0,
-                None,
-                &session.policy,
-                pool,
-                &session.exec_token(),
-            )?))
-        }
+        LogicalPlan::Sort { input, order } => sort_input(input, order, 0, None, session, pool),
         LogicalPlan::Limit { input, skip, fetch } => match input.as_ref() {
             LogicalPlan::Sort {
                 input: sorted,
                 order,
-            } => {
-                let Some(child) = try_parallel(sorted, session, pool)? else {
-                    return Ok(None);
-                };
-                Ok(Some(super::sort::ordered(
-                    Box::new(Exec::Scan {
-                        batches: child,
-                        index: 0,
-                    }),
-                    sorted.schema().clone(),
-                    order,
-                    *skip,
-                    *fetch,
-                    &session.policy,
-                    pool,
-                    &session.exec_token(),
-                )?))
-            }
+            } => sort_input(sorted, order, *skip, *fetch, session, pool),
             _ => {
-                let Some(child) = try_parallel(input, session, pool)? else {
-                    return Ok(None);
-                };
-                Ok(Some(collect(
+                if matches!(*fetch, Some(0)) {
+                    return Ok(Vec::new());
+                }
+                if let Some(pipe) = pipeline(input, session) {
+                    return limited_pipeline(&pipe, *skip, *fetch, session);
+                }
+                collect(
                     Box::new(Exec::Limit {
-                        input: Box::new(Exec::Scan {
-                            batches: child,
-                            index: 0,
-                        }),
+                        input: physical(input, session, pool)?,
                         skip: *skip,
                         fetch: *fetch,
                     }),
                     &session.exec_token(),
-                )?))
+                )
             }
         },
         LogicalPlan::Aggregate {
@@ -90,20 +58,17 @@ pub(super) fn try_parallel(
             aggs,
             schema,
         } => {
-            if !agg_parallel_ok(aggs, pool) {
-                return Ok(None);
+            // workers<=1 stays on agg::run so cancel is checked between
+            // batches for UNION/join children, not only scan pipelines.
+            if !agg_parallel_ok(aggs, pool) || session.workers <= 1 {
+                return agg_serial(input, group, aggs, schema.clone(), session, pool);
             }
-            if let Some(pipe) = as_pipeline(input) {
-                return Ok(Some(parallel_agg(
-                    &pipe,
-                    group,
-                    aggs,
-                    schema.clone(),
-                    session,
-                    pool,
-                )?));
+            if let Some(pipe) = pipeline(input, session) {
+                return agg_pipeline(&pipe, group, aggs, schema.clone(), session, pool);
             }
-            if let Some(fused) = inner_join_under_project(input, group, aggs) {
+            if session.workers > 1
+                && let Some(fused) = inner_join_under_project(input, group, aggs)
+            {
                 let (l, r) = join_sides(
                     fused.left,
                     fused.right,
@@ -112,15 +77,9 @@ pub(super) fn try_parallel(
                     session,
                     pool,
                 )?;
-                return Ok(Some(join::run_then_agg(
-                    Box::new(Exec::Scan {
-                        batches: l,
-                        index: 0,
-                    }),
-                    Box::new(Exec::Scan {
-                        batches: r,
-                        index: 0,
-                    }),
+                return join::run_then_agg(
+                    l,
+                    r,
                     JoinSpec {
                         join_type: JoinType::Inner,
                         on: fused.on,
@@ -133,17 +92,10 @@ pub(super) fn try_parallel(
                     schema.clone(),
                     session,
                     pool,
-                )?));
+                );
             }
-            let child = plan_batches(input, session, pool)?;
-            Ok(Some(agg_from_batches(
-                child,
-                group,
-                aggs,
-                schema.clone(),
-                session,
-                pool,
-            )?))
+            let child = run(input, session, pool)?;
+            agg_from_batches(child, group, aggs, schema.clone(), session, pool)
         }
         LogicalPlan::Join {
             left,
@@ -153,15 +105,9 @@ pub(super) fn try_parallel(
             schema,
         } => {
             let (l, r) = join_sides(left, right, on.as_ref(), *join_type, session, pool)?;
-            Ok(Some(join::run(
-                Box::new(Exec::Scan {
-                    batches: l,
-                    index: 0,
-                }),
-                Box::new(Exec::Scan {
-                    batches: r,
-                    index: 0,
-                }),
+            join::run(
+                l,
+                r,
                 JoinSpec {
                     join_type: *join_type,
                     on: on.as_ref(),
@@ -173,13 +119,13 @@ pub(super) fn try_parallel(
                 pool,
                 &session.exec_token(),
                 session.workers,
-            )?))
+            )
         }
         other => {
-            if let Some(pipe) = as_pipeline(other) {
-                return Ok(Some(parallel_pipeline(&pipe, session)?));
+            if let Some(pipe) = pipeline(other, session) {
+                return parallel_pipeline(&pipe, session);
             }
-            Ok(None)
+            collect(physical(other, session, pool)?, &session.exec_token())
         }
     }
 }
@@ -394,10 +340,7 @@ fn plan_batches_filtered(
     pool: &MemoryPool,
 ) -> Result<Vec<Batch>> {
     if extra.is_empty() {
-        if let Some(out) = try_parallel(plan, session, pool)? {
-            return Ok(out);
-        }
-        return collect(physical(plan, session, pool)?, &session.exec_token());
+        return run(plan, session, pool);
     }
     match plan {
         LogicalPlan::Join {
@@ -409,14 +352,8 @@ fn plan_batches_filtered(
         } => {
             let (l, r) = join_sides(left, right, on.as_ref(), *join_type, session, pool)?;
             let batches = join::run(
-                Box::new(Exec::Scan {
-                    batches: l,
-                    index: 0,
-                }),
-                Box::new(Exec::Scan {
-                    batches: r,
-                    index: 0,
-                }),
+                l,
+                r,
                 JoinSpec {
                     join_type: *join_type,
                     on: on.as_ref(),
@@ -432,7 +369,7 @@ fn plan_batches_filtered(
             runtime_filter::filter_batches(batches, extra)
         }
         _ => {
-            if let Some(mut pipe) = as_pipeline(plan) {
+            if let Some(mut pipe) = pipeline(plan, session) {
                 push_runtime(&mut pipe, extra);
                 return parallel_pipeline(&pipe, session);
             }
@@ -452,19 +389,43 @@ fn join_sides(
     join_type: JoinType,
     session: &Session,
     pool: &MemoryPool,
-) -> Result<(Vec<Batch>, Vec<Batch>)> {
+) -> Result<(Box<dyn Operator>, Box<dyn Operator>)> {
     let left_ncols = left.schema().fields().len();
     let inner = join_type == JoinType::Inner;
-    let r = plan_batches_filtered(right, &[], session, pool)?;
-    let mut left_extra = Vec::new();
-    if session.runtime_join_filters
-        && inner
-        && let Some(rf) = runtime_filter::from_build(on, left_ncols, left.schema().as_ref(), &r)
-    {
-        left_extra.extend(rf.preds);
+    let right_op = child_op(right, &[], session, pool)?;
+    if session.runtime_join_filters && inner && !pool.has_limit() {
+        let r = collect(right_op, &session.exec_token())?;
+        let mut left_extra = Vec::new();
+        if let Some(rf) = runtime_filter::from_build(on, left_ncols, left.schema().as_ref(), &r) {
+            left_extra.extend(rf.preds);
+        }
+        let left_op = child_op(left, &left_extra, session, pool)?;
+        return Ok((
+            left_op,
+            Box::new(Exec::Scan {
+                batches: r,
+                index: 0,
+            }),
+        ));
     }
-    let l = plan_batches_filtered(left, &left_extra, session, pool)?;
-    Ok((l, r))
+    let left_op = child_op(left, &[], session, pool)?;
+    Ok((left_op, right_op))
+}
+
+fn child_op(
+    plan: &LogicalPlan,
+    extra: &[Expr],
+    session: &Session,
+    pool: &MemoryPool,
+) -> Result<Box<dyn Operator>> {
+    if let Some(mut pipe) = pipeline(plan, session) {
+        push_runtime(&mut pipe, extra);
+        return Ok(Box::new(pipe_source(pipe, session)?));
+    }
+    Ok(Box::new(Exec::Scan {
+        batches: plan_batches_filtered(plan, extra, session, pool)?,
+        index: 0,
+    }))
 }
 
 fn push_runtime(pipe: &mut Pipeline, runtime: &[Expr]) {
@@ -486,6 +447,7 @@ fn push_runtime(pipe: &mut Pipeline, runtime: &[Expr]) {
     pipe.extra_filters.extend(runtime.iter().cloned());
 }
 
+#[derive(Clone)]
 struct Pipeline {
     table: String,
     projection: Option<Vec<String>>,
@@ -493,6 +455,120 @@ struct Pipeline {
     extra_filters: Vec<Expr>,
     runtime_filters: Vec<Expr>,
     project: Option<(Vec<NamedExpr>, SchemaRef)>,
+}
+
+struct PipeSource {
+    pipe: Pipeline,
+    morsels: std::vec::IntoIter<Batch>,
+}
+
+impl Operator for PipeSource {
+    fn next_batch(&mut self, cancel: &super::CancelToken) -> Result<Option<Batch>> {
+        loop {
+            cancel.check()?;
+            let Some(batch) = self.morsels.next() else {
+                return Ok(None);
+            };
+            if let Some(out) = apply_pipe(&self.pipe, batch)? {
+                return Ok(Some(out));
+            }
+        }
+    }
+}
+
+fn pipe_source(pipe: Pipeline, session: &Session) -> Result<PipeSource> {
+    let morsels = session.table_morsels(&pipe.table)?;
+    Ok(PipeSource {
+        pipe,
+        morsels: morsels.into_iter(),
+    })
+}
+
+fn agg_serial(
+    input: &LogicalPlan,
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+    session: &Session,
+    pool: &MemoryPool,
+) -> Result<Vec<Batch>> {
+    let child: Box<dyn Operator> = if let Some(pipe) = pipeline(input, session) {
+        Box::new(pipe_source(pipe, session)?)
+    } else {
+        Box::new(Exec::Scan {
+            batches: run(input, session, pool)?,
+            index: 0,
+        })
+    };
+    super::agg::run(
+        child,
+        group,
+        aggs,
+        schema,
+        &session.policy,
+        pool,
+        &session.exec_token(),
+    )
+}
+
+fn agg_pipeline(
+    pipe: &Pipeline,
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+    session: &Session,
+    pool: &MemoryPool,
+) -> Result<Vec<Batch>> {
+    if pool.has_limit() || session.workers <= 1 {
+        return super::agg::run(
+            Box::new(pipe_source(pipe.clone(), session)?),
+            group,
+            aggs,
+            schema,
+            &session.policy,
+            pool,
+            &session.exec_token(),
+        );
+    }
+    parallel_agg(pipe, group, aggs, schema, session, pool)
+}
+
+fn sort_input(
+    input: &LogicalPlan,
+    order: &[mizuchi_plan::SortExpr],
+    skip: u64,
+    fetch: Option<u64>,
+    session: &Session,
+    pool: &MemoryPool,
+) -> Result<Vec<Batch>> {
+    if matches!(fetch, Some(0)) {
+        return Ok(Vec::new());
+    }
+    let child: Box<dyn Operator> = if let Some(pipe) = pipeline(input, session) {
+        Box::new(pipe_source(pipe, session)?)
+    } else {
+        Box::new(Exec::Scan {
+            batches: run(input, session, pool)?,
+            index: 0,
+        })
+    };
+    super::sort::ordered(
+        child,
+        input.schema().clone(),
+        order,
+        skip,
+        fetch,
+        &session.policy,
+        pool,
+        &session.exec_token(),
+    )
+}
+
+fn pipeline(plan: &LogicalPlan, session: &Session) -> Option<Pipeline> {
+    if !session.cpu_lowering() {
+        return None;
+    }
+    as_pipeline(plan)
 }
 
 fn as_pipeline(plan: &LogicalPlan) -> Option<Pipeline> {
@@ -537,6 +613,50 @@ fn as_pipeline(plan: &LogicalPlan) -> Option<Pipeline> {
 fn parallel_pipeline(pipe: &Pipeline, session: &Session) -> Result<Vec<Batch>> {
     let morsels = session.table_morsels(&pipe.table)?;
     map_morsels(session, morsels, |batch| apply_pipe(pipe, batch))
+}
+
+/// Unsorted LIMIT over a scan/filter/project pipeline stops after `skip` plus
+/// `fetch` rows so later morsels are not evaluated.
+fn limited_pipeline(
+    pipe: &Pipeline,
+    mut skip: u64,
+    mut fetch: Option<u64>,
+    session: &Session,
+) -> Result<Vec<Batch>> {
+    if matches!(fetch, Some(0)) {
+        return Ok(Vec::new());
+    }
+    let morsels = session.table_morsels(&pipe.table)?;
+    let mut out = Vec::new();
+    for batch in morsels {
+        session.exec_token().check()?;
+        if matches!(fetch, Some(0)) {
+            break;
+        }
+        let Some(batch) = apply_pipe(pipe, batch)? else {
+            continue;
+        };
+        let n = batch.num_rows() as u64;
+        if skip >= n {
+            skip -= n;
+            continue;
+        }
+        let start = skip as usize;
+        skip = 0;
+        let available = batch.num_rows() - start;
+        let take_n = match fetch {
+            None => available,
+            Some(f) => available.min(usize::try_from(f).unwrap_or(usize::MAX)),
+        };
+        if take_n == 0 {
+            break;
+        }
+        if let Some(f) = &mut fetch {
+            *f -= take_n as u64;
+        }
+        out.push(batch.slice(start, take_n)?);
+    }
+    Ok(out)
 }
 
 fn parallel_agg(

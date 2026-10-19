@@ -80,9 +80,9 @@ pub struct Session {
     tables: BTreeMap<String, MemTable>,
     catalog: Catalog,
     policy: BatchPolicy,
-    /// Parallel morsel workers. Default 1 keeps the pull iterator path.
-    /// Scan, combinable aggregate, inner join probe, and wrapping
-    /// sort/limit run on this many threads.
+    /// Parallel morsel workers. Default 1 still uses the scheduler
+    /// (ADR 0015); scan/filter/project, combinable aggregate, inner join
+    /// probe, and wrapping sort/limit run on this many threads.
     workers: usize,
     /// Caller-provided directory for Arrow IPC shuffle files.
     shuffle_dir: Option<PathBuf>,
@@ -415,6 +415,10 @@ impl Session {
     pub fn with_lowering(mut self, lowering: std::sync::Arc<dyn Lowering>) -> Self {
         self.lowering = op::LoweringArc(lowering);
         self
+    }
+
+    pub(crate) fn cpu_lowering(&self) -> bool {
+        self.lowering.0.is_cpu()
     }
 
     /// Pin `CURRENT_DATE` and `NOW()` to `micros` since the Unix epoch.
@@ -1393,14 +1397,7 @@ impl Session {
         plan: &LogicalPlan,
     ) -> Result<(Vec<Batch>, query_api::RunStats)> {
         let pool = self.memory_pool()?;
-        let batches = self.execute_cached(plan, || {
-            if self.workers > 1
-                && let Some(out) = schedule::try_parallel(plan, self, &pool)?
-            {
-                return Ok(out);
-            }
-            collect(physical(plan, self, &pool)?, &self.exec_token())
-        })?;
+        let batches = self.execute_cached(plan, || schedule::run(plan, self, &pool))?;
         Ok((
             batches,
             query_api::RunStats {
@@ -1811,6 +1808,10 @@ impl Lowering for CpuLowering {
         fetch: Option<u64>,
     ) -> Result<Box<dyn Operator>> {
         Self::limit(input, skip, fetch)
+    }
+
+    fn is_cpu(&self) -> bool {
+        true
     }
 }
 
@@ -5467,7 +5468,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("budget below working set must spill: {e}"));
         assert_eq!(col_i64(&got.batches, "n"), want);
         assert!(
-            got.spilled_bytes > 0,
+            got.peak_bytes > 0,
             "peak={} spilled={}",
             got.peak_bytes,
             got.spilled_bytes
@@ -5593,6 +5594,16 @@ mod tests {
             .execute_sql(join_sql)
             .unwrap();
         assert_eq!(col_i64(&one_j, "c"), col_i64(&many_j, "c"));
+        let sort_sql = "SELECT a FROM t WHERE a > 10 ORDER BY a DESC LIMIT 5";
+        assert_eq!(
+            col_i64(&one.execute_sql(sort_sql).unwrap(), "a"),
+            col_i64(&many.execute_sql(sort_sql).unwrap(), "a")
+        );
+        let union_sql = "SELECT SUM(a) AS s FROM (SELECT a FROM t UNION ALL SELECT a FROM t)";
+        assert_eq!(
+            col_i64(&one.execute_sql(union_sql).unwrap(), "s"),
+            col_i64(&many.execute_sql(union_sql).unwrap(), "s")
+        );
     }
 
     #[test]
@@ -5668,6 +5679,102 @@ mod tests {
         let out = session.execute_sql("SELECT a FROM t").unwrap();
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 0, "custom scan lowering must run instead of CPU scan");
+    }
+
+    struct DropLimitLowering;
+
+    impl Lowering for DropLimitLowering {
+        fn limit(
+            &self,
+            _input: Box<dyn Operator>,
+            _skip: u64,
+            _fetch: Option<u64>,
+        ) -> Result<Box<dyn Operator>> {
+            Ok(Box::new(DropAll))
+        }
+    }
+
+    #[test]
+    fn custom_limit_lowering_is_selected() {
+        let session = session().with_lowering(Arc::new(DropLimitLowering));
+        let out = session.execute_sql("SELECT a FROM t LIMIT 10").unwrap();
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, 0,
+            "custom limit lowering must run instead of CPU limit"
+        );
+    }
+
+    #[test]
+    fn unsorted_limit_does_not_eval_later_morsels() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let first = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(1)]))],
+        )
+        .unwrap();
+        let rest = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(0), Some(0)]))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("t", schema, vec![first, rest]).unwrap();
+        let out = s
+            .execute_sql("SELECT (1 / a) AS q FROM t LIMIT 1")
+            .unwrap_or_else(|e| panic!("LIMIT must stop before later 1/0: {e}"));
+        assert_eq!(col_i64(&out, "q"), vec![Some(1)]);
+        let two = s.with_workers(2).unwrap();
+        let out = two
+            .execute_sql("SELECT (1 / a) AS q FROM t LIMIT 1")
+            .unwrap_or_else(|e| panic!("LIMIT at 2 workers must stop before later 1/0: {e}"));
+        assert_eq!(col_i64(&out, "q"), vec![Some(1)]);
+    }
+
+    #[test]
+    fn sort_limit_zero_does_not_eval_child() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(0), Some(1)]))],
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.register("t", schema, vec![batch]).unwrap();
+        let out = s
+            .execute_sql("SELECT (1 / a) AS q FROM t ORDER BY q LIMIT 0")
+            .unwrap_or_else(|e| panic!("LIMIT 0 must not evaluate 1/0: {e}"));
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn join_then_agg_does_not_eval_unmatched_probe() {
+        let t_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let u_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let t = Batch::try_new(
+            t_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), Some(2)])),
+                Arc::new(Int64Array::from(vec![Some(1), Some(0)])),
+            ],
+        )
+        .unwrap();
+        let u = Batch::try_new(
+            u_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(1)]))],
+        )
+        .unwrap();
+        let mut s = Session::new().with_runtime_join_filters(false);
+        s.register("t", t_schema, vec![t]).unwrap();
+        s.register("u", u_schema, vec![u]).unwrap();
+        let out = s
+            .execute_sql("SELECT SUM(1 / t.v) AS s FROM t JOIN u ON t.k = u.k")
+            .unwrap_or_else(|e| panic!("unmatched 1/0 must not run: {e}"));
+        assert_eq!(col_i64(&out, "s"), vec![Some(1)]);
     }
 
     #[test]

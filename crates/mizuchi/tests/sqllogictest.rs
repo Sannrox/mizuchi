@@ -17,6 +17,15 @@ const ENGINE: &str = "mizuchi";
 
 #[test]
 fn slt_corpus() {
+    run_corpus(1);
+}
+
+#[test]
+fn slt_corpus_two_workers() {
+    run_corpus(2);
+}
+
+fn run_corpus(workers: usize) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/slt");
     let mut files: Vec<PathBuf> = fs::read_dir(&root)
         .unwrap_or_else(|e| panic!("read {}: {e}", root.display()))
@@ -26,14 +35,14 @@ fn slt_corpus() {
     files.sort();
     assert!(!files.is_empty(), "no .slt files under {}", root.display());
     for path in files {
-        run_file(&path);
+        run_file(&path, workers);
     }
 }
 
-fn run_file(path: &Path) {
+fn run_file(path: &Path, workers: usize) {
     let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let recs = parse_slt(&src);
-    let mut db = Db::new();
+    let mut db = Db::new(workers);
     for (i, rec) in recs.into_iter().enumerate() {
         rec.run(&mut db)
             .unwrap_or_else(|e| panic!("{} record {}: {e}", path.display(), i + 1));
@@ -42,18 +51,23 @@ fn run_file(path: &Path) {
 
 struct Db {
     tables: BTreeMap<String, (SchemaRef, Vec<Vec<Cell>>)>,
+    workers: usize,
 }
 
 impl Db {
-    fn new() -> Self {
+    fn new(workers: usize) -> Self {
         Self {
             tables: BTreeMap::new(),
+            workers,
         }
     }
 
     fn session(&self) -> Session {
         // 2020-01-01 00:00:00 UTC, matching datetime.slt CURRENT_DATE / NOW().
-        let mut s = Session::new().with_now_micros(1_577_836_800_000_000);
+        let mut s = Session::new()
+            .with_now_micros(1_577_836_800_000_000)
+            .with_workers(self.workers)
+            .expect("workers");
         for (name, (schema, rows)) in &self.tables {
             let batch = rows_to_batch(schema.clone(), rows);
             s.register(name, schema.clone(), vec![batch]).unwrap();

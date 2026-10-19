@@ -14,6 +14,7 @@ All notable changes to this project are documented here.
 
 ### Changed
 
+- `execute_sql` always uses the morsel scheduler (ADR 0015), including the default of one worker. Pipelines split at join build, aggregate, and sort. `try_parallel` is gone. Fused inner-join-plus-aggregate stays. The SQL logic tests and the tiny decision-support suite run at 1 and 2 workers with identical results. `EXPLAIN ANALYZE` still times the pull operator tree.
 - The library is a layered workspace (ADR 0013): `mizuchi-core`, `mizuchi-plan`, `mizuchi-io`, `mizuchi-postgres`, `mizuchi-exec`, and the `mizuchi` facade. Embedder crate-root re-exports are unchanged. `parse_sql` no longer re-exports `sqlparser::ast::Statement`. Query API JSON Schema lives in `crates/mizuchi-exec/schemas/query-api-v1.json`. Flight stays behind `--features flight` in `mizuchi-flight`.
 
 ### Added
