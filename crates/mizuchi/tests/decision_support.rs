@@ -10,6 +10,7 @@ mod ds_common;
 
 use std::time::Instant;
 
+use arrow::util::display::{ArrayFormatter, FormatOptions};
 use ds_common::{QUERIES, batch_bytes, load};
 
 struct QueryRow {
@@ -71,6 +72,44 @@ fn run_suite(scale: u32) -> SuiteReport {
         scale,
         input_bytes,
         queries,
+    }
+}
+
+fn result_text(session: &mizuchi::Session, sql: &str) -> String {
+    let out = session
+        .execute_sql(sql)
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let opts = FormatOptions::default();
+    let mut lines = Vec::new();
+    for batch in &out {
+        let rec = batch.as_arrow();
+        let fmts: Vec<ArrayFormatter<'_>> = rec
+            .columns()
+            .iter()
+            .map(|c| ArrayFormatter::try_new(c.as_ref(), &opts).expect("fmt"))
+            .collect();
+        for i in 0..rec.num_rows() {
+            let mut line = String::new();
+            for (j, fmt) in fmts.iter().enumerate() {
+                if j > 0 {
+                    line.push('\t');
+                }
+                line.push_str(&fmt.value(i).to_string());
+            }
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
+}
+
+#[test]
+fn tiny_suite_one_and_two_workers_match() {
+    let (one, _) = load(1);
+    let two = one.clone().with_workers(2).expect("workers");
+    for spec in QUERIES {
+        let a = result_text(&one, spec.sql);
+        let b = result_text(&two, spec.sql);
+        assert_eq!(a, b, "{}", spec.id);
     }
 }
 
