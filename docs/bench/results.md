@@ -1,10 +1,11 @@
 # Gigabyte-scale decision-support results
 
-Measured 2026-10-11 with the method in [methodology.md](methodology.md); SF1
-re-timed 2026-10-12 after unused-column prune and unique-key join fold
-(five trials, drop first, median of the rest). Times are milliseconds.
-Ratio is `reference_ms / mizuchi_ms`. Values below 1 mean the reference
-engine finished faster.
+Measured 2026-10-22 at tip with the method in [methodology.md](methodology.md),
+after the q1 grouped-aggregate fold and the shared join gather (#160). SF1 is
+five trials and SF10 three, dropping the first and taking the median of the
+rest. Times are milliseconds. Ratio is `reference_ms / mizuchi_ms`. Values
+below 1 mean the reference engine finished faster. The host was shared with
+other work (load about 7 to 12 on 10 threads), so expect run-to-run noise.
 
 mizuchi working set (sum of registered Arrow batch sizes): SF1 562_033_392
 bytes, SF10 5_617_403_368 bytes. Snappy Parquet on disk: SF1 130_575_375 bytes,
@@ -14,23 +15,26 @@ SF10 1_280_729_644 bytes.
 
 | query | mizuchi ms | DuckDB ms | DuckDB ratio | DataFusion ms | DataFusion ratio |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| tpch_q1 | 77.864 | 27.995 | 0.359 | 39.155 | 0.503 |
-| tpch_q3 | 46.580 | 31.384 | 0.674 | 35.495 | 0.762 |
-| tpch_q6 | 13.873 | 8.065 | 0.581 | 8.188 | 0.590 |
-| tpcds_store_sales | 32.766 | 16.303 | 0.497 | 45.607 | 1.392 |
+| tpch_q1 | 28.238 | 17.940 | 0.635 | 28.775 | 1.019 |
+| tpch_q3 | 53.511 | 19.028 | 0.356 | 22.746 | 0.425 |
+| tpch_q6 | 8.628 | 5.242 | 0.608 | 6.360 | 0.737 |
+| tpcds_store_sales | 36.816 | 12.413 | 0.337 | 27.631 | 0.751 |
 
 ## sf10 (60_000_000 `lineitem` rows)
 
 | query | mizuchi ms | DuckDB ms | DuckDB ratio | DataFusion ms | DataFusion ratio |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| tpch_q1 | 14906.694 | 180.610 | 0.012 | 263.299 | 0.018 |
-| tpch_q3 | 35233.877 | 233.308 | 0.007 | 281.838 | 0.008 |
-| tpch_q6 | 226.348 | 49.882 | 0.220 | 54.293 | 0.240 |
-| tpcds_store_sales | 7518.938 | 104.787 | 0.014 | 391.952 | 0.052 |
+| tpch_q1 | 332.464 | 258.536 | 0.778 | 380.353 | 1.144 |
+| tpch_q3 | 1616.202 | 333.992 | 0.207 | 394.766 | 0.244 |
+| tpch_q6 | 118.054 | 74.497 | 0.631 | 62.997 | 0.534 |
+| tpcds_store_sales | 458.219 | 185.731 | 0.405 | 511.083 | 1.115 |
 
-SF1 DuckDB ratios are at or above 0.33 on every query. `tpcds_store_sales`
-is faster than DataFusion at this scale. SF10 walls were not re-timed
-(`bench-data/` is not in the default checkout).
+SF1 DuckDB ratios are at or above 0.33 on every query. At SF10, q1 is faster
+than DataFusion, and q1, q6 and `tpcds_store_sales` are within 3x of DuckDB.
+`tpch_q3` at SF10 is the remaining limiter: its probe join and its
+million-group aggregate dominate, and its wall varies between runs (about 0.7
+to 1.6 s). It is tracked in [#168](https://github.com/Sannrox/mizuchi/issues/168)
+under #130.
 
 ## Parquet scan pushdown
 
@@ -56,23 +60,23 @@ predicate rather than the whole file.
 ## SF1 worker scaling
 
 Same SF1 Parquet and method (`gb_bench run --sf 1 --workers N --repeats 5`),
-median of three runs per width on a shared 10-thread host (load about 17,
-so the 8-worker column is the noisiest).
-Speedup is `ms_at_1 / ms_at_N`. Grouped aggregate (`tpch_q1`) is 2.81× at 4
-workers and 3.13× at 8. Scan-heavy ungrouped `tpch_q6`
-is 2.03× / 2.41× at those widths. The join queries no longer slow
-down with workers (#159): a streamed hash-join probe now spreads whole morsel
-groups across workers instead of spawning threads per morsel, and build sides
-under 131,072 rows stay one table. Runtime filters no longer cost single-worker
-time (#164). `tpch_q3` folds its join and float `SUM` on all workers (#165): 2.37×
-at 4 workers; at 8 it measured 1.78× here and 2.0 to 2.4× on a quieter host.
+median of three runs per width on the same shared 10-thread host. Speedup is
+`ms_at_1 / ms_at_N`. The grouped aggregate (`tpch_q1`) folds each aggregate
+column in one pass per batch, so its single-worker time is lower than before
+and the speedup ratio smaller: 2.41× at 4 workers and 2.87× at 8. Scan-heavy
+ungrouped `tpch_q6` is 2.41× / 3.17×. The join queries no longer slow down
+with workers (#159): a streamed hash-join probe spreads whole morsel groups
+across workers, and build sides under 131,072 rows stay one table. Runtime
+filters no longer cost single-worker time (#164). `tpch_q3` folds its join
+and float `SUM` on all workers (#165). `tpcds_store_sales` stays flat because
+its join builds are serial.
 
 | query | 1 worker ms | 2 ms (×) | 4 ms (×) | 8 ms (×) |
 | --- | ---: | ---: | ---: | ---: |
-| tpch_q1 | 597.368 | 337.977 (1.77) | 212.962 (2.81) | 190.848 (3.13) |
-| tpch_q6 | 32.373 | 25.259 (1.28) | 15.932 (2.03) | 13.435 (2.41) |
-| tpch_q3 | 124.447 | 64.904 (1.92) | 52.582 (2.37) | 70.036 (1.78) |
-| tpcds_store_sales | 51.267 | 53.365 (0.96) | 43.058 (1.19) | 45.580 (1.12) |
+| tpch_q1 | 90.377 | 62.194 (1.45) | 37.543 (2.41) | 31.531 (2.87) |
+| tpch_q6 | 31.593 | 22.937 (1.38) | 13.131 (2.41) | 9.959 (3.17) |
+| tpch_q3 | 104.370 | 56.709 (1.84) | 44.300 (2.36) | 47.807 (2.18) |
+| tpcds_store_sales | 34.940 | 40.673 (0.86) | 34.356 (1.02) | 33.726 (1.04) |
 
 ## Kernel micro-benchmarks
 

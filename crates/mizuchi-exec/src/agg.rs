@@ -1310,26 +1310,17 @@ impl PerfectAgg {
             return Ok(true);
         }
         let key_cols = eval_all(&self.group_exprs, batch)?;
-        let n = batch.num_rows();
-        let mut codes = vec![0usize; n];
-        for (row, code) in codes.iter_mut().enumerate() {
-            match encode_row(&self.spec, &key_cols, row) {
-                Some(c) => *code = c,
-                None => return Ok(false),
-            }
-        }
+        let Some(codes) = encode_rows(&self.spec, &key_cols, batch.num_rows()) else {
+            return Ok(false);
+        };
         self.apply_codes(batch, &key_cols, &codes)?;
         Ok(true)
     }
 
     fn update_encoded(&mut self, batch: &Batch, key_cols: &[ArrayRef]) -> Result<()> {
-        let n = batch.num_rows();
-        let mut codes = vec![0usize; n];
-        for (row, code) in codes.iter_mut().enumerate() {
-            *code = encode_row(&self.spec, key_cols, row).ok_or_else(|| {
-                Error::Eval("perfect-hash encode failed on the inferred batch".into())
-            })?;
-        }
+        let codes = encode_rows(&self.spec, key_cols, batch.num_rows()).ok_or_else(|| {
+            Error::Eval("perfect-hash encode failed on the inferred batch".into())
+        })?;
         self.apply_codes(batch, key_cols, &codes)
     }
 
@@ -1353,10 +1344,28 @@ impl PerfectAgg {
             });
         }
         bump_perfect_rows(codes.len());
-        for (row, &code) in codes.iter().enumerate() {
-            let dense = self.ensure_slot(code)?;
-            for (accum, arg) in self.accums[dense].iter_mut().zip(arg_cols.iter()) {
-                accum.update(arg.as_deref(), row)?;
+        let mut dense = Vec::with_capacity(codes.len());
+        for &code in codes {
+            dense.push(self.ensure_slot(code)? as u32);
+        }
+        let groups = self.accums.len();
+        let mut rows_for: Option<Vec<Vec<u32>>> = None;
+        for (ai, arg) in arg_cols.iter().enumerate() {
+            if fold_dense(&mut self.accums, ai, arg.as_deref(), &dense, groups) {
+                continue;
+            }
+            // Other accumulators run one loop per group over its rows.
+            let rows_for = rows_for.get_or_insert_with(|| {
+                let mut rows_for = vec![Vec::new(); groups];
+                for (row, &g) in dense.iter().enumerate() {
+                    rows_for[g as usize].push(row as u32);
+                }
+                rows_for
+            });
+            for (g, rows) in rows_for.iter().enumerate() {
+                if !rows.is_empty() {
+                    self.accums[g][ai].update_rows(arg.as_deref(), rows)?;
+                }
             }
         }
         Ok(())
@@ -1699,6 +1708,14 @@ fn scalar_as_u64(s: &Scalar) -> Option<u64> {
 }
 
 fn utf8_is_byte(array: &dyn Array) -> bool {
+    if let Some(strings) = array.as_string_opt::<i32>() {
+        // Every non-null value is one byte when its offsets step by one.
+        return strings
+            .offsets()
+            .windows(2)
+            .enumerate()
+            .all(|(i, w)| w[1] - w[0] == 1 || (strings.is_null(i) && w[1] == w[0]));
+    }
     for i in 0..array.len() {
         if array.is_null(i) {
             continue;
@@ -1720,21 +1737,117 @@ fn utf8_cell(array: &dyn Array, row: usize) -> Result<&str> {
     }
 }
 
-fn encode_row(spec: &PerfectSpec, cols: &[ArrayRef], row: usize) -> Option<usize> {
+/// Folds accumulator `ai` for a whole batch in one pass over the rows, with
+/// `dense[row]` naming the row's group. Covers COUNT and float SUM and AVG
+/// without nulls; returns false, untouched, for anything else.
+fn fold_dense(
+    accums: &mut [Vec<Accum>],
+    ai: usize,
+    arg: Option<&dyn Array>,
+    dense: &[u32],
+    groups: usize,
+) -> bool {
+    let Some(first) = accums.first() else {
+        return false;
+    };
+    let values = arg
+        .filter(|a| a.null_count() == 0)
+        .and_then(|a| a.as_primitive_opt::<Float64Type>())
+        .map(|a| a.values().as_ref());
+    match (&first[ai], arg, values) {
+        (Accum::Count(_), _, _) if arg.is_none_or(|a| a.null_count() == 0) => {
+            let mut counts = vec![0i64; groups];
+            for &g in dense {
+                counts[g as usize] += 1;
+            }
+            for (accum, n) in accums.iter_mut().zip(counts) {
+                if let Accum::Count(count) = &mut accum[ai] {
+                    *count += n;
+                }
+            }
+            true
+        }
+        (Accum::SumF64 { .. } | Accum::Avg { .. }, _, Some(values)) => {
+            let mut sums = vec![0.0f64; groups];
+            let mut counts = vec![0i64; groups];
+            for (&g, &v) in dense.iter().zip(values) {
+                sums[g as usize] += v;
+                counts[g as usize] += 1;
+            }
+            for ((accum, s), n) in accums.iter_mut().zip(sums).zip(counts) {
+                if n == 0 {
+                    continue;
+                }
+                match &mut accum[ai] {
+                    Accum::SumF64 { sum, seen } => {
+                        *sum += s;
+                        *seen = true;
+                    }
+                    Accum::Avg { sum, count } => {
+                        *sum += s;
+                        *count += n;
+                    }
+                    _ => {}
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Slot codes for `n` rows, one column at a time: each column is downcast
+/// once rather than per row. `None` when a row falls outside the domain.
+fn encode_rows(spec: &PerfectSpec, cols: &[ArrayRef], n: usize) -> Option<Vec<usize>> {
     if cols.len() != spec.dims.len() {
         return None;
     }
-    let mut idx = 0usize;
+    let mut codes = vec![0usize; n];
     let mut stride = 1usize;
     for (dim, col) in spec.dims.iter().zip(cols) {
-        let code = encode_dim(dim, col.as_ref(), row)?;
-        idx += code as usize * stride;
+        let array = col.as_ref();
+        match (&dim.kind, array.data_type()) {
+            (DimKind::Byte, DataType::Utf8) => {
+                let strings = array.as_string::<i32>();
+                for (row, code) in codes.iter_mut().enumerate() {
+                    let c = if strings.is_null(row) {
+                        0
+                    } else {
+                        match strings.value(row).as_bytes() {
+                            [byte] => usize::from(*byte) + 1,
+                            _ => return None,
+                        }
+                    };
+                    *code += c * stride;
+                }
+            }
+            (DimKind::Int { min }, DataType::Int64) => {
+                let ints = array.as_primitive::<Int64Type>();
+                for (row, code) in codes.iter_mut().enumerate() {
+                    let c = if ints.is_null(row) {
+                        0
+                    } else {
+                        let c = i128::from(ints.value(row)) - i128::from(*min) + 1;
+                        if c < 1 || c >= i128::from(dim.width) {
+                            return None;
+                        }
+                        c as usize
+                    };
+                    *code += c * stride;
+                }
+            }
+            _ => {
+                for (row, code) in codes.iter_mut().enumerate() {
+                    *code += encode_dim(dim, array, row)? as usize * stride;
+                }
+            }
+        }
         stride = stride.checked_mul(dim.width as usize)?;
     }
-    if idx >= spec.slots {
+    if codes.iter().any(|&code| code >= spec.slots) {
         return None;
     }
-    Some(idx)
+    Some(codes)
 }
 
 fn encode_dim(dim: &Dim, array: &dyn Array, row: usize) -> Option<u32> {
@@ -1943,10 +2056,16 @@ impl HashAgg {
         arg_cols: &[Option<ArrayRef>],
         n: usize,
     ) -> Result<()> {
-        let mut row_slot = vec![0usize; n];
-        for (row, slot) in row_slot.iter_mut().enumerate() {
-            *slot = self.ensure_group_row(key_cols, row)?;
-        }
+        let row_slot = match self.dictionary_slots(key_cols, n)? {
+            Some(row_slot) => row_slot,
+            None => {
+                let mut row_slot = vec![0usize; n];
+                for (row, slot) in row_slot.iter_mut().enumerate() {
+                    *slot = self.ensure_group_row(key_cols, row)?;
+                }
+                row_slot
+            }
+        };
         let n_groups = self.accums.len();
         let grow = self.grow;
         if n_groups > 64 || n < 32 {
@@ -1992,6 +2111,39 @@ impl HashAgg {
             self.charge_accums(0, old);
         }
         Ok(())
+    }
+
+    /// Group slots for a single string key, resolved once per distinct value
+    /// of the batch instead of hashing every row. `None` for other keys.
+    fn dictionary_slots(&mut self, key_cols: &[ArrayRef], n: usize) -> Result<Option<Vec<usize>>> {
+        let [key] = key_cols else {
+            return Ok(None);
+        };
+        if key.data_type() != &DataType::Utf8 || n < 32 {
+            return Ok(None);
+        }
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let encoded = compute::cast(key, &dict_type).map_err(|e| Error::Eval(e.to_string()))?;
+        let Some(dict) = encoded.as_dictionary_opt::<Int32Type>() else {
+            return Ok(None);
+        };
+        let values = [dict.values().clone()];
+        let mut value_slot = Vec::with_capacity(values[0].len());
+        for value in 0..values[0].len() {
+            value_slot.push(self.ensure_group_row(&values, value)?);
+        }
+        let mut null_slot = None;
+        let mut row_slot = Vec::with_capacity(n);
+        for (row, code) in dict.keys().iter().enumerate() {
+            row_slot.push(match code {
+                Some(code) => value_slot[code as usize],
+                None => match null_slot {
+                    Some(slot) => slot,
+                    None => *null_slot.insert(self.ensure_group_row(key_cols, row)?),
+                },
+            });
+        }
+        Ok(Some(row_slot))
     }
 
     fn ensure_group_row(&mut self, cols: &[ArrayRef], row: usize) -> Result<usize> {
@@ -2309,6 +2461,16 @@ impl Accum {
                 Ok(())
             }
             Self::Avg { sum, count } => {
+                if let Some(arr) = arg.and_then(|a| a.as_primitive_opt::<Float64Type>()) {
+                    for &row in rows {
+                        let i = row as usize;
+                        if !arr.is_null(i) {
+                            *sum += arr.value(i);
+                            *count += 1;
+                        }
+                    }
+                    return Ok(());
+                }
                 for &row in rows {
                     update_avg(sum, count, arg, row as usize)?;
                 }
@@ -3745,6 +3907,78 @@ mod tests {
         }
         let occupied = seen.iter().filter(|s| **s).count();
         assert!(occupied >= 4, "occupied {occupied} of 8");
+    }
+
+    #[test]
+    fn perfect_dense_folds_match_row_by_row_sums() {
+        // `price` has no nulls (one-pass fold); `disc` has nulls (per-group
+        // fallback). Integral floats keep the sums exact.
+        let flags = [Some("A"), Some("N"), None];
+        let n = 3_000usize;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("flag", DataType::Utf8, true),
+            Field::new("price", DataType::Float64, false),
+            Field::new("disc", DataType::Float64, true),
+        ]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    (0..n).map(|i| flags[i % 3]).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    (0..n).map(|i| i as f64).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    (0..n)
+                        .map(|i| (i % 5 != 0).then_some(1.0))
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut session = crate::Session::new().with_workers(2).unwrap();
+        session.register("t", schema, vec![batch]).unwrap();
+        let out = session
+            .execute_sql(
+                "SELECT flag, SUM(price) AS s, AVG(price) AS a, COUNT(*) AS c, \
+                 COUNT(disc) AS cd, SUM(disc) AS sd FROM t GROUP BY flag",
+            )
+            .unwrap();
+        let mut got = Vec::new();
+        for b in &out {
+            let flag = b.column(0).as_string::<i32>();
+            let col = |i: usize| b.column(i).as_primitive::<Float64Type>().clone();
+            let int = |i: usize| b.column(i).as_primitive::<Int64Type>().clone();
+            for row in 0..b.num_rows() {
+                got.push((
+                    flag.is_valid(row).then(|| flag.value(row).to_string()),
+                    col(1).value(row),
+                    col(2).value(row),
+                    int(3).value(row),
+                    int(4).value(row),
+                    col(5).value(row),
+                ));
+            }
+        }
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        let expected: Vec<_> = [None, Some("A"), Some("N")]
+            .into_iter()
+            .map(|flag| {
+                let rows: Vec<usize> = (0..n).filter(|i| flags[i % 3] == flag).collect();
+                let sum: f64 = rows.iter().map(|&i| i as f64).sum();
+                let with_disc = rows.iter().filter(|&&i| i % 5 != 0).count() as i64;
+                (
+                    flag.map(str::to_string),
+                    sum,
+                    sum / rows.len() as f64,
+                    rows.len() as i64,
+                    with_disc,
+                    with_disc as f64,
+                )
+            })
+            .collect();
+        assert_eq!(got, expected);
     }
 
     #[test]
