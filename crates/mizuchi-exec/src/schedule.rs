@@ -428,6 +428,8 @@ fn child_op(
     }))
 }
 
+/// Attach runtime join-key preds to a scan pipeline. Ranges only skip
+/// morsels; other preds filter rows (see `runtime_filter`).
 fn push_runtime(pipe: &mut Pipeline, runtime: &[Expr]) {
     if runtime.is_empty() {
         return;
@@ -438,13 +440,13 @@ fn push_runtime(pipe: &mut Pipeline, runtime: &[Expr]) {
             .map(|e| runtime_filter::rewrite_through_project(e, exprs))
             .collect::<Option<Vec<_>>>()
         {
-            pipe.extra_filters.extend(rewritten);
+            pipe.runtime_scan.extend(rewritten);
             return;
         }
         pipe.runtime_filters.extend(runtime.iter().cloned());
         return;
     }
-    pipe.extra_filters.extend(runtime.iter().cloned());
+    pipe.runtime_scan.extend(runtime.iter().cloned());
 }
 
 #[derive(Clone)]
@@ -453,6 +455,9 @@ struct Pipeline {
     projection: Option<Vec<String>>,
     scan_filters: Vec<Expr>,
     extra_filters: Vec<Expr>,
+    /// Runtime preds on the scan schema, applied with the extra filters.
+    runtime_scan: Vec<Expr>,
+    /// Runtime preds that only hold above `project`.
     runtime_filters: Vec<Expr>,
     project: Option<(Vec<NamedExpr>, SchemaRef)>,
 }
@@ -583,6 +588,7 @@ fn as_pipeline(plan: &LogicalPlan) -> Option<Pipeline> {
             projection: projection.clone(),
             scan_filters: filters.clone(),
             extra_filters: Vec::new(),
+            runtime_scan: Vec::new(),
             runtime_filters: Vec::new(),
             project: None,
         }),
@@ -867,6 +873,15 @@ fn map_morsels(
         .collect())
 }
 
+/// Runtime join-key preds: skip the morsel when they rule it out, and filter
+/// rows only by non-range preds.
+fn apply_runtime(batch: Batch, preds: &[Expr]) -> Result<Option<Batch>> {
+    if preds.is_empty() {
+        return Ok(Some(batch));
+    }
+    runtime_filter::apply_runtime_preds(batch, preds)
+}
+
 fn apply_filters(batch: Batch, filters: &[Expr]) -> Result<Option<Batch>> {
     runtime_filter::apply_preds(batch, filters)
 }
@@ -886,13 +901,16 @@ fn apply_pipe(pipe: &Pipeline, batch: Batch) -> Result<Option<Batch>> {
     if !project_first && let Some(names) = &pipe.projection {
         batch = super::project_named(batch, names)?;
     }
-    let Some(mut batch) = apply_filters(batch, &pipe.extra_filters)? else {
+    let Some(batch) = apply_filters(batch, &pipe.extra_filters)? else {
+        return Ok(None);
+    };
+    let Some(mut batch) = apply_runtime(batch, &pipe.runtime_scan)? else {
         return Ok(None);
     };
     if let Some((exprs, schema)) = &pipe.project {
         batch = project_batch(&batch, exprs, schema.clone())?;
     }
-    let Some(batch) = apply_filters(batch, &pipe.runtime_filters)? else {
+    let Some(batch) = apply_runtime(batch, &pipe.runtime_filters)? else {
         return Ok(None);
     };
     if batch.num_rows() == 0 {
