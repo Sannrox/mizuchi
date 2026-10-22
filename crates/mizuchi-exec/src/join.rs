@@ -377,30 +377,62 @@ fn fold_into_unique_slots(
         && matches!(aggs[0].1, AggCall::Sum(_))
         && out_schema.field(group.len()).data_type() == &DataType::Float64;
     if one_f64_sum {
-        let mut sums = agg::BuildF64Sums::new(out_schema.clone(), group.len(), n_build);
-        for probe in probe_batches {
-            session.exec_token().check()?;
-            if probe.num_rows() == 0 {
-                continue;
-            }
-            let probe_keys: Vec<ArrayRef> = probe_key_exprs
-                .iter()
-                .map(|e| e.eval(probe))
-                .collect::<Result<_>>()?;
-            let keys = probe_keys[0].as_primitive::<Int64Type>();
-            let arg = match &probe_aggs[0] {
-                AggCall::Sum(e) => e.eval(probe)?,
-                _ => unreachable!("one_f64_sum"),
-            };
-            let vals = arg.as_primitive::<Float64Type>();
-            for prow in 0..probe.num_rows() {
-                let Some(brow) = unique_i64_brow(min, slots, keys, prow) else {
+        // Each worker folds a contiguous run of probe morsels into its own
+        // per-build-row sums; merging in worker order keeps the result the
+        // same for a given worker count. Workers are capped so the partial
+        // arrays stay under F64_SUM_PARTIALS_MAX_BYTES.
+        let per_worker = n_build.saturating_mul(9).max(1);
+        let n = n.min((F64_SUM_PARTIALS_MAX_BYTES / per_worker).max(1));
+        let chunk = probe_batches.len().div_ceil(n).max(1);
+        let token = session.exec_token();
+        let fold = |batches: &[Batch]| -> Result<agg::BuildF64Sums> {
+            let mut sums = agg::BuildF64Sums::new(out_schema.clone(), group.len(), n_build);
+            for probe in batches {
+                token.check()?;
+                if probe.num_rows() == 0 {
                     continue;
+                }
+                let probe_keys: Vec<ArrayRef> = probe_key_exprs
+                    .iter()
+                    .map(|e| e.eval(probe))
+                    .collect::<Result<_>>()?;
+                let keys = probe_keys[0].as_primitive::<Int64Type>();
+                let arg = match &probe_aggs[0] {
+                    AggCall::Sum(e) => e.eval(probe)?,
+                    _ => unreachable!("one_f64_sum"),
                 };
-                if !vals.is_null(prow) {
-                    sums.add(brow as usize, vals.value(prow));
+                let vals = arg.as_primitive::<Float64Type>();
+                for prow in 0..probe.num_rows() {
+                    let Some(brow) = unique_i64_brow(min, slots, keys, prow) else {
+                        continue;
+                    };
+                    if !vals.is_null(prow) {
+                        sums.add(brow as usize, vals.value(prow));
+                    }
                 }
             }
+            Ok(sums)
+        };
+        let mut partials: Vec<agg::BuildF64Sums> = if n <= 1 {
+            vec![fold(probe_batches)?]
+        } else {
+            thread::scope(|scope| -> Result<Vec<agg::BuildF64Sums>> {
+                let handles: Vec<_> = probe_batches
+                    .chunks(chunk)
+                    .map(|batches| scope.spawn(move || fold(batches)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .map_err(|_| Error::Eval("worker panicked".into()))?
+                    })
+                    .collect()
+            })?
+        };
+        let mut sums = partials.remove(0);
+        for part in &partials {
+            sums.merge(part);
         }
         return Ok(Some(sums.finish(group_cols, &session.policy)?));
     }
@@ -937,6 +969,9 @@ struct PartTable {
     batch: Batch,
     table: BuildTable,
 }
+
+/// Upper bound on the per-worker partial sums of a parallel float-SUM fold.
+const F64_SUM_PARTIALS_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// Build sides below this many rows stay one table: partitioning a small
 /// build costs a scatter pass and gives up the dense unique-key index, and

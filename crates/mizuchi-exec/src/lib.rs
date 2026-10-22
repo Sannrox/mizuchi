@@ -3127,6 +3127,86 @@ mod tests {
     }
 
     #[test]
+    fn parallel_unique_key_fold_matches_one_worker() {
+        use arrow::array::AsArray;
+        // q3 shape: the build key is unique, grouping follows the build row,
+        // and one float SUM comes from many probe morsels.
+        let o_schema = Arc::new(Schema::new(vec![
+            Field::new("ok", DataType::Int64, true),
+            Field::new("od", DataType::Int64, true),
+        ]));
+        let orders = Batch::try_new(
+            o_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..1_000).map(Some).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(
+                    (0..1_000).map(|i| Some(i % 7)).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let l_schema = Arc::new(Schema::new(vec![
+            Field::new("lk", DataType::Int64, true),
+            Field::new("price", DataType::Float64, true),
+        ]));
+        let lines: Vec<Batch> = (0..20)
+            .map(|b| {
+                Batch::try_new(
+                    l_schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(
+                            (0..1_000)
+                                .map(|i| Some((i * 13 + b) % 1_200))
+                                .collect::<Vec<_>>(),
+                        )),
+                        Arc::new(arrow::array::Float64Array::from(
+                            (0..1_000)
+                                .map(|i| Some(f64::from(i % 5)))
+                                .collect::<Vec<_>>(),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let sql = "SELECT lk, od, SUM(price) AS revenue FROM orders JOIN lines ON lk = ok \
+                   GROUP BY lk, od ORDER BY lk";
+        let run = |workers: usize| {
+            let mut s = Session::new().with_workers(workers).unwrap();
+            s.register("orders", o_schema.clone(), vec![orders.clone()])
+                .unwrap();
+            s.register("lines", l_schema.clone(), lines.clone())
+                .unwrap();
+            s.execute_sql(sql).unwrap()
+        };
+        let rows = |batches: Vec<Batch>| -> Vec<(i64, i64, f64)> {
+            batches
+                .iter()
+                .flat_map(|b| {
+                    let lk = b
+                        .column(0)
+                        .as_primitive::<arrow::datatypes::Int64Type>()
+                        .clone();
+                    let od = b
+                        .column(1)
+                        .as_primitive::<arrow::datatypes::Int64Type>()
+                        .clone();
+                    let rev = b
+                        .column(2)
+                        .as_primitive::<arrow::datatypes::Float64Type>()
+                        .clone();
+                    (0..b.num_rows())
+                        .map(move |i| (lk.value(i), od.value(i), rev.value(i)))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let one = rows(run(1));
+        assert_eq!(one.len(), 1_000);
+        assert_eq!(rows(run(4)), one);
+    }
+
+    #[test]
     fn runtime_filter_int32_join_stays_correct() {
         let dim_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
         let dim = Batch::try_new(
