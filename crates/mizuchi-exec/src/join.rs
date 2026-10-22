@@ -2754,38 +2754,31 @@ fn take_or_null(batch: &Batch, indices: &[u32], pool: &MemoryPool) -> Result<Vec
             .map(|c| c.slice(offset, length))
             .collect());
     }
+    // The take index and the unmatched-row mask are built once and shared
+    // by every column.
+    let unmatched = indices.contains(&u32::MAX);
+    let take_idx =
+        UInt32Array::from_iter_values(indices.iter().map(|&i| if i == u32::MAX { 0 } else { i }));
+    let mask =
+        unmatched.then(|| BooleanArray::from_iter(indices.iter().map(|&i| Some(i != u32::MAX))));
     let mut out = Vec::with_capacity(batch.num_columns());
     for col in batch.as_arrow().columns() {
-        out.push(take_with_nulls(col, indices)?);
+        if col.is_empty() {
+            out.push(new_null_array(col.data_type(), indices.len()));
+            continue;
+        }
+        let taken = take(col.as_ref(), &take_idx, None).map_err(|e| Error::Eval(e.to_string()))?;
+        out.push(match &mask {
+            None => taken,
+            Some(mask) => {
+                let nulls = new_null_array(col.data_type(), indices.len());
+                zip(mask, &taken, &nulls).map_err(|e| Error::Eval(e.to_string()))?
+            }
+        });
     }
     let bytes: u64 = out.iter().map(|c| c.get_array_memory_size() as u64).sum();
     pool.record_copy(bytes);
     Ok(out)
-}
-
-fn take_with_nulls(col: &ArrayRef, indices: &[u32]) -> Result<ArrayRef> {
-    let mut builder_valid = Vec::with_capacity(indices.len());
-    let mut take_idx = Vec::with_capacity(indices.len());
-    for &i in indices {
-        if i == u32::MAX {
-            builder_valid.push(false);
-            take_idx.push(0);
-        } else {
-            builder_valid.push(true);
-            take_idx.push(i);
-        }
-    }
-    if col.is_empty() {
-        return Ok(new_null_array(col.data_type(), indices.len()));
-    }
-    let taken = take(col.as_ref(), &UInt32Array::from(take_idx), None)
-        .map_err(|e| Error::Eval(e.to_string()))?;
-    if builder_valid.iter().all(|v| *v) {
-        return Ok(taken);
-    }
-    let mask = BooleanArray::from(builder_valid);
-    let nulls = new_null_array(col.data_type(), indices.len());
-    zip(&mask, &taken, &nulls).map_err(|e| Error::Eval(e.to_string()))
 }
 
 fn take_left(left: &Batch, indices: &[u32], schema: SchemaRef, pool: &MemoryPool) -> Result<Batch> {
