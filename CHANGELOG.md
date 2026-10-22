@@ -6,6 +6,7 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- Join queries no longer slow down as workers increase (#159). A streamed hash-join probe spawned one thread per worker for every 4,096-row morsel and copied each thread's rows, so `tpch_q3` and `tpcds_store_sales` got slower at 2, 4 and 8 workers. The probe now gathers about 16,384 rows per worker and spreads whole morsels across workers without copying, and build sides under 131,072 rows stay one table with their dense key index. A morsel much larger than one worker's share is sliced zero-copy so it still spreads across workers. `scripts/check-worker-scaling.sh` compares a 1-worker and an N-worker run and fails any query that is more than 25% slower with more workers; the bench workflow runs it at SF1 with 4 workers.
 - Grouped aggregation uses a perfect hash when integer, boolean, or single-byte string key ranges fit a dense index, so those groups do not allocate `Scalar` keys or probe a hash table. Wider domains radix-partition by hash bits, flush small thread-local tables, and merge partitions in parallel.
 - Unbounded inner joins scatter build morsels into hash partitions on worker threads, finalise each partition without an insert lock, and probe left morsels as they arrive so the probe side is not collected first.
 - Memory-limited and spilled inner joins hash-partition both sides and join each partition once, so a hash table is not rebuilt for every left×right chunk pair.
