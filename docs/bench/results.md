@@ -55,17 +55,22 @@ predicate rather than the whole file.
 
 ## SF1 worker scaling
 
-Same SF1 Parquet and method (`gb_bench run --sf 1 --workers N --repeats 3`).
-Speedup is `ms_at_1 / ms_at_N`. Grouped aggregate (`tpch_q1`) is 3.75× at 4
-workers and 5.60× at 8 on a 10-thread host. Scan-heavy ungrouped `tpch_q6`
-is 2.73× / 3.67× at those widths.
+Same SF1 Parquet and method (`gb_bench run --sf 1 --workers N --repeats 5`).
+Speedup is `ms_at_1 / ms_at_N`. Grouped aggregate (`tpch_q1`) is 2.71× at 4
+workers and 3.56× at 8 on a 10-thread host. Scan-heavy ungrouped `tpch_q6`
+is 3.18× / 4.34× at those widths. The join queries no longer slow
+down with workers (#159): a streamed hash-join probe now spreads whole morsel
+groups across workers instead of spawning threads per morsel, and build sides
+under 131,072 rows stay one table. `tpch_q3` now scales flat (no slower with
+workers); before #150 it reached about 3× at 8 workers, so that gap is still
+open.
 
 | query | 1 worker ms | 2 ms (×) | 4 ms (×) | 8 ms (×) |
 | --- | ---: | ---: | ---: | ---: |
-| tpch_q1 | 758.427 | 388.075 (1.95) | 202.452 (3.75) | 135.533 (5.60) |
-| tpch_q6 | 58.245 | 37.215 (1.57) | 21.356 (2.73) | 15.853 (3.67) |
-| tpch_q3 | 404.547 | 339.732 (1.19) | 297.410 (1.36) | 282.073 (1.43) |
-| tpcds_store_sales | 184.210 | 123.158 (1.50) | 94.206 (1.96) | 92.131 (2.00) |
+| tpch_q1 | 541.364 | 329.520 (1.64) | 199.432 (2.71) | 152.086 (3.56) |
+| tpch_q6 | 87.506 | 49.434 (1.77) | 27.493 (3.18) | 20.159 (4.34) |
+| tpch_q3 | 183.047 | 180.122 (1.02) | 174.113 (1.05) | 182.513 (1.00) |
+| tpcds_store_sales | 76.097 | 74.141 (1.03) | 63.714 (1.19) | 62.998 (1.21) |
 
 ## Kernel micro-benchmarks
 

@@ -37,3 +37,29 @@ jobs:
             --datafusion "${BENCH_DATA:-bench-data}/tiny/datafusion.json" \
             --baseline docs/bench/baseline.json \
             --results-md docs/bench/results.md
+
+  worker-scaling-sf1:
+    name: SF1 worker scaling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Gate self-test
+        run: bash scripts/check-worker-scaling.test.sh
+      - name: Generate SF1
+        run: cargo run --release --example gb_bench -- generate --sf 1 --out bench-data
+      - name: Time the suite at 1 and 4 workers
+        run: |
+          for w in 1 4; do
+            cargo run --release --example gb_bench -- run --sf 1 --dir bench-data \
+              --repeats 3 --workers "$w" --json "bench-data/sf1/mizuchi-${w}w.json"
+          done
+      - name: Fail when a query is slower with more workers
+        run: |
+          bash scripts/check-worker-scaling.sh \
+            --one bench-data/sf1/mizuchi-1w.json --many bench-data/sf1/mizuchi-4w.json

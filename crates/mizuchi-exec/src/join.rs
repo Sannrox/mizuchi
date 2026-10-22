@@ -15,6 +15,7 @@
 
 use std::hash::Hash;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use arrow::array::{
@@ -937,12 +938,25 @@ struct PartTable {
     table: BuildTable,
 }
 
-fn build_partition_count(workers: usize) -> usize {
+/// Build sides below this many rows stay one table: partitioning a small
+/// build costs a scatter pass and gives up the dense unique-key index, and
+/// one table is already fast to build and to probe.
+const PARTITIONED_BUILD_MIN_ROWS: usize = 131_072;
+
+/// Probe rows gathered per worker before a probe group is split across
+/// workers, so a thread is spawned per group, never per morsel.
+const PROBE_ROWS_PER_WORKER: usize = 16_384;
+
+fn build_partition_count(workers: usize, build_rows: usize) -> usize {
+    if build_rows < PARTITIONED_BUILD_MIN_ROWS {
+        return 1;
+    }
     workers.max(1).next_power_of_two().clamp(1, 64)
 }
 
 /// Scatter build morsels into hash partitions on worker threads, then
 /// finalise each partition's table (one partition per task, no insert lock).
+/// Small build sides stay one table (`build_partition_count`).
 fn parallel_build(
     build_batches: &[Batch],
     key_exprs: &[Expr],
@@ -952,7 +966,32 @@ fn parallel_build(
     pool: &MemoryPool,
     cancel: &CancelToken,
 ) -> Result<Vec<Option<PartTable>>> {
-    let npart = build_partition_count(workers);
+    let n_rows: usize = build_batches.iter().map(Batch::num_rows).sum();
+    let npart = build_partition_count(workers, n_rows);
+    partitioned_build(
+        build_batches,
+        key_exprs,
+        schema,
+        probe_key_sample,
+        workers,
+        npart,
+        pool,
+        cancel,
+    )
+}
+
+/// Build `npart` hash partitions of the build side on up to `workers` threads.
+#[allow(clippy::too_many_arguments)]
+fn partitioned_build(
+    build_batches: &[Batch],
+    key_exprs: &[Expr],
+    schema: SchemaRef,
+    probe_key_sample: &[ArrayRef],
+    workers: usize,
+    npart: usize,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Vec<Option<PartTable>>> {
     let n_rows: usize = build_batches.iter().map(Batch::num_rows).sum();
     if npart == 1 || n_rows == 0 || build_batches.len() <= 1 && workers <= 1 {
         let build = concat_chunk(build_batches, schema, pool)?;
@@ -1149,12 +1188,13 @@ fn probe_parts(
     Ok(out)
 }
 
-/// Probe one morsel, splitting its rows across `workers` when the morsel is large.
+/// Probe a group of morsels, spreading them across up to `workers` threads.
+/// Morsels are probed zero-copy and the output keeps their order.
 #[allow(clippy::too_many_arguments)]
-fn probe_parts_parallel(
+fn probe_group_parallel(
     parts: &[Option<PartTable>],
     npart: usize,
-    probe: &Batch,
+    group: &[Batch],
     probe_key_exprs: &[Expr],
     residual: Option<&Expr>,
     build_left: bool,
@@ -1164,52 +1204,64 @@ fn probe_parts_parallel(
     pool: &MemoryPool,
     cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
-    let n = workers.max(1).min(probe.num_rows().max(1));
-    if n <= 1 {
-        return probe_parts(
+    let probe_one = |probe: &Batch| {
+        probe_parts(
             parts,
             npart,
             probe,
             probe_key_exprs,
             residual,
             build_left,
-            schema,
+            schema.clone(),
             policy,
             pool,
-        );
-    }
-    let chunk = probe.num_rows().div_ceil(n);
-    let out_parts = Mutex::new(Vec::new());
-    thread::scope(|scope| -> Result<()> {
-        let mut handles = Vec::new();
-        for t in 0..n {
-            let start = t * chunk;
-            let end = (start + chunk).min(probe.num_rows());
-            if start >= end {
-                continue;
+        )
+    };
+    // A morsel much larger than one worker's share is sliced (zero-copy), so
+    // a few large batches still spread across workers.
+    let mut sliced = Vec::new();
+    for probe in group {
+        let rows = probe.num_rows();
+        if workers > 1 && rows > 2 * PROBE_ROWS_PER_WORKER {
+            let mut offset = 0;
+            while offset < rows {
+                let len = PROBE_ROWS_PER_WORKER.min(rows - offset);
+                sliced.push(probe.slice(offset, len)?);
+                offset += len;
             }
-            let out_parts = &out_parts;
-            let schema = schema.clone();
+        } else {
+            sliced.push(probe.clone());
+        }
+    }
+    let group = &sliced[..];
+    let n = workers.max(1).min(group.len());
+    if n <= 1 {
+        let mut out = Vec::new();
+        for probe in group {
+            cancel.check()?;
+            out.extend(probe_one(probe)?);
+        }
+        return Ok(out);
+    }
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new(Vec::<(usize, Vec<Batch>)>::with_capacity(group.len()));
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (next, results, probe_one) = (&next, &results, &probe_one);
             handles.push(scope.spawn(move || -> Result<()> {
-                cancel.check()?;
-                let idx: Vec<u32> = (start..end).map(|i| i as u32).collect();
-                let slice = take_left(probe, &idx, probe.schema(), pool)?;
-                let batches = probe_parts(
-                    parts,
-                    npart,
-                    &slice,
-                    probe_key_exprs,
-                    residual,
-                    build_left,
-                    schema.clone(),
-                    policy,
-                    pool,
-                )?;
-                out_parts
-                    .lock()
-                    .map_err(|_| Error::Eval("join probe lock poisoned".into()))?
-                    .push((start, batches));
-                Ok(())
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(probe) = group.get(index) else {
+                        return Ok(());
+                    };
+                    cancel.check()?;
+                    let batches = probe_one(probe)?;
+                    results
+                        .lock()
+                        .map_err(|_| Error::Eval("join probe lock poisoned".into()))?
+                        .push((index, batches));
+                }
             }));
         }
         for h in handles {
@@ -1218,11 +1270,11 @@ fn probe_parts_parallel(
         }
         Ok(())
     })?;
-    let mut out_parts = out_parts
+    let mut results = results
         .into_inner()
         .map_err(|_| Error::Eval("join probe lock poisoned".into()))?;
-    out_parts.sort_by_key(|(start, _)| *start);
-    Ok(out_parts.into_iter().flat_map(|(_, b)| b).collect())
+    results.sort_by_key(|(index, _)| *index);
+    Ok(results.into_iter().flat_map(|(_, b)| b).collect())
 }
 
 fn key_sample(schema: SchemaRef, keys: &[Expr]) -> Result<Vec<ArrayRef>> {
@@ -1288,23 +1340,37 @@ fn hash_join_stream_probe(
     let npart = parts.len();
     let residual = split.residual.as_ref();
     let mut out = Vec::new();
-    while let Some(probe) = left.next_batch(cancel)? {
-        cancel.check()?;
-        out.extend(probe_parts_parallel(
-            &parts,
-            npart,
-            &probe,
-            &left_keys,
-            residual,
-            false,
-            spec.schema.clone(),
-            policy,
-            workers,
-            pool,
-            cancel,
-        )?);
+    let group_rows = workers.max(1) * PROBE_ROWS_PER_WORKER;
+    let mut group = Vec::new();
+    let mut gathered = 0;
+    loop {
+        let probe = left.next_batch(cancel)?;
+        let done = probe.is_none();
+        if let Some(probe) = probe {
+            gathered += probe.num_rows();
+            group.push(probe);
+        }
+        if !group.is_empty() && (done || gathered >= group_rows) {
+            out.extend(probe_group_parallel(
+                &parts,
+                npart,
+                &group,
+                &left_keys,
+                residual,
+                false,
+                spec.schema.clone(),
+                policy,
+                workers,
+                pool,
+                cancel,
+            )?);
+            group.clear();
+            gathered = 0;
+        }
+        if done {
+            return Ok(out);
+        }
     }
-    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3475,6 +3541,85 @@ mod tests {
     }
 
     #[test]
+    fn one_large_probe_batch_is_sliced_across_workers_in_order() {
+        use std::sync::Arc;
+
+        use arrow::datatypes::{Field, Schema};
+
+        let build_schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, true)]));
+        let probe_schema = Arc::new(Schema::new(vec![Field::new("p", DataType::Int64, true)]));
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("p", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let build = Batch::try_new(
+            build_schema.clone(),
+            vec![Arc::new(Int64Array::from((0..100).collect::<Vec<i64>>()))],
+        )
+        .unwrap();
+        let probe = Batch::try_new(
+            probe_schema.clone(),
+            vec![Arc::new(Int64Array::from(
+                (0..70_000).map(|i| i % 200).collect::<Vec<i64>>(),
+            ))],
+        )
+        .unwrap();
+        let pool = MemoryPool::new(None, None).unwrap();
+        let keys = [Expr::nth(0)];
+        let sample = key_sample(probe_schema, &keys).unwrap();
+        let parts = parallel_build(
+            &[build],
+            &keys,
+            build_schema,
+            &sample,
+            1,
+            &pool,
+            &CancelToken::new(),
+        )
+        .unwrap();
+        let probe_with = |workers| {
+            probe_group_parallel(
+                &parts,
+                parts.len(),
+                std::slice::from_ref(&probe),
+                &keys,
+                None,
+                false,
+                out_schema.clone(),
+                &BatchPolicy::default(),
+                workers,
+                &pool,
+                &CancelToken::new(),
+            )
+            .unwrap()
+        };
+        let probe_values = |batches: Vec<Batch>| -> Vec<i64> {
+            batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect()
+        };
+        let serial = probe_values(probe_with(1));
+        assert_eq!(serial.len(), 35_000);
+        assert_eq!(probe_values(probe_with(4)), serial);
+    }
+
+    #[test]
+    fn small_build_sides_stay_one_table() {
+        assert_eq!(build_partition_count(8, PARTITIONED_BUILD_MIN_ROWS - 1), 1);
+        assert_eq!(build_partition_count(8, PARTITIONED_BUILD_MIN_ROWS), 8);
+        assert_eq!(build_partition_count(6, PARTITIONED_BUILD_MIN_ROWS), 8);
+        assert_eq!(build_partition_count(1, 10 * PARTITIONED_BUILD_MIN_ROWS), 1);
+    }
+
+    #[test]
     fn parallel_partition_build_does_not_keep_sparse_unique_slots() {
         use std::sync::Arc;
 
@@ -3490,11 +3635,13 @@ mod tests {
             .collect();
         let pool = MemoryPool::new(None, None).unwrap();
         let sample = key_sample(schema.clone(), &keys).unwrap();
-        let parts = parallel_build(
+        // Force two partitions: this build is small enough to stay one table.
+        let parts = partitioned_build(
             &batches,
             &keys,
             schema,
             &sample,
+            2,
             2,
             &pool,
             &CancelToken::new(),
