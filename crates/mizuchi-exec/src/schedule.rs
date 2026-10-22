@@ -69,11 +69,13 @@ pub(super) fn run(plan: &LogicalPlan, session: &Session, pool: &MemoryPool) -> R
             if session.workers > 1
                 && let Some(fused) = inner_join_under_project(input, group, aggs)
             {
+                // run_then_agg collects the probe side, so collect it in parallel.
                 let (l, r) = join_sides(
                     fused.left,
                     fused.right,
                     fused.on,
                     JoinType::Inner,
+                    true,
                     session,
                     pool,
                 )?;
@@ -104,7 +106,7 @@ pub(super) fn run(plan: &LogicalPlan, session: &Session, pool: &MemoryPool) -> R
             on,
             schema,
         } => {
-            let (l, r) = join_sides(left, right, on.as_ref(), *join_type, session, pool)?;
+            let (l, r) = join_sides(left, right, on.as_ref(), *join_type, false, session, pool)?;
             join::run(
                 l,
                 r,
@@ -350,7 +352,7 @@ fn plan_batches_filtered(
             on,
             schema,
         } => {
-            let (l, r) = join_sides(left, right, on.as_ref(), *join_type, session, pool)?;
+            let (l, r) = join_sides(left, right, on.as_ref(), *join_type, false, session, pool)?;
             let batches = join::run(
                 l,
                 r,
@@ -381,15 +383,33 @@ fn plan_batches_filtered(
 
 /// Build the right (build) side first so inner-join keys can filter the probe.
 /// Parent runtime preds stay above this join; a fallible parent key may only
-/// be safe after this join removes rows that would fail.
+/// be safe after this join removes rows that would fail. With `collect_probe`
+/// and no memory limit, a scan-pipeline probe side is collected on all
+/// workers, for callers that collect the probe side anyway; otherwise it
+/// streams, so a memory-limited caller can reserve and spill as it collects.
 fn join_sides(
     left: &LogicalPlan,
     right: &LogicalPlan,
     on: Option<&Expr>,
     join_type: JoinType,
+    collect_probe: bool,
     session: &Session,
     pool: &MemoryPool,
 ) -> Result<(Box<dyn Operator>, Box<dyn Operator>)> {
+    let probe_op = |extra: &[Expr]| -> Result<Box<dyn Operator>> {
+        if collect_probe
+            && session.workers > 1
+            && !pool.has_limit()
+            && let Some(mut pipe) = pipeline(left, session)
+        {
+            push_runtime(&mut pipe, extra);
+            return Ok(Box::new(Exec::Scan {
+                batches: parallel_pipeline(&pipe, session)?,
+                index: 0,
+            }));
+        }
+        child_op(left, extra, session, pool)
+    };
     let left_ncols = left.schema().fields().len();
     let inner = join_type == JoinType::Inner;
     let right_op = child_op(right, &[], session, pool)?;
@@ -399,7 +419,7 @@ fn join_sides(
         if let Some(rf) = runtime_filter::from_build(on, left_ncols, left.schema().as_ref(), &r) {
             left_extra.extend(rf.preds);
         }
-        let left_op = child_op(left, &left_extra, session, pool)?;
+        let left_op = probe_op(&left_extra)?;
         return Ok((
             left_op,
             Box::new(Exec::Scan {
@@ -408,7 +428,7 @@ fn join_sides(
             }),
         ));
     }
-    let left_op = child_op(left, &[], session, pool)?;
+    let left_op = probe_op(&[])?;
     Ok((left_op, right_op))
 }
 

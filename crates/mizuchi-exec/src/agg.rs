@@ -674,6 +674,16 @@ impl BuildF64Sums {
         self.hits[brow] = 1;
     }
 
+    /// Fold another worker's partial sums over the same build rows into this.
+    pub(super) fn merge(&mut self, other: &Self) {
+        for (sum, add) in self.sums.iter_mut().zip(&other.sums) {
+            *sum += add;
+        }
+        for (hit, other_hit) in self.hits.iter_mut().zip(&other.hits) {
+            *hit |= other_hit;
+        }
+    }
+
     pub(super) fn finish(
         self,
         group_cols: &[ArrayRef],
@@ -689,21 +699,41 @@ impl BuildF64Sums {
             return Ok(Vec::new());
         }
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
-        for (g, field) in self.schema.fields().iter().enumerate().take(self.group_n) {
-            let values: Vec<Scalar> = hits
-                .iter()
-                .map(|&i| scalar_at(group_cols[g].as_ref(), i))
-                .collect::<Result<_>>()?;
-            columns.push(build_array(&values, field.data_type())?);
-        }
-        let sums: Vec<Scalar> = hits
+        let indices = arrow::array::UInt32Array::from(
+            hits.iter()
+                .map(|&i| u32::try_from(i).map_err(|_| Error::Eval("too many build rows".into())))
+                .collect::<Result<Vec<u32>>>()?,
+        );
+        for (col, field) in group_cols
             .iter()
-            .map(|&i| Scalar::F64(self.sums[i].to_bits()))
-            .collect();
-        columns.push(build_array(
-            &sums,
-            self.schema.field(self.group_n).data_type(),
-        )?);
+            .zip(self.schema.fields())
+            .take(self.group_n)
+        {
+            let taken = arrow::compute::take(col.as_ref(), &indices, None)
+                .map_err(|e| Error::Eval(e.to_string()))?;
+            // Match the planned output type, as building from scalars did.
+            let taken = if taken.data_type() == field.data_type() {
+                taken
+            } else {
+                arrow::compute::cast(&taken, field.data_type())
+                    .map_err(|e| Error::Eval(e.to_string()))?
+            };
+            columns.push(taken);
+        }
+        if self.schema.field(self.group_n).data_type() == &DataType::Float64 {
+            columns.push(Arc::new(arrow::array::Float64Array::from(
+                hits.iter().map(|&i| self.sums[i]).collect::<Vec<f64>>(),
+            )));
+        } else {
+            let sums: Vec<Scalar> = hits
+                .iter()
+                .map(|&i| Scalar::F64(self.sums[i].to_bits()))
+                .collect();
+            columns.push(build_array(
+                &sums,
+                self.schema.field(self.group_n).data_type(),
+            )?);
+        }
         let full = Batch::try_new(self.schema, columns)?;
         Ok(full
             .split_by_policy(policy)
@@ -3188,6 +3218,44 @@ fn downcast_uint<T>(v: &Scalar, f: impl Fn(u64) -> Option<T>) -> Result<Option<T
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn build_f64_sums_finish_casts_groups_to_the_output_type() {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("g", DataType::Utf8, true),
+            arrow::datatypes::Field::new("s", DataType::Float64, true),
+        ]));
+        let mut sums = BuildF64Sums::new(schema, 1, 2);
+        sums.add(0, 1.5);
+        let dict: arrow::array::DictionaryArray<arrow::datatypes::Int32Type> =
+            vec!["a", "b"].into_iter().collect();
+        let groups: Vec<ArrayRef> = vec![Arc::new(dict)];
+        let out = sums.finish(&groups, &BatchPolicy::default()).unwrap();
+        assert_eq!(out[0].column(0).data_type(), &DataType::Utf8);
+        assert_eq!(out[0].column(0).as_string::<i32>().value(0), "a");
+    }
+
+    #[test]
+    fn build_f64_sums_merge_and_finish_by_build_row() {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("g", DataType::Int64, true),
+            arrow::datatypes::Field::new("s", DataType::Float64, true),
+        ]));
+        let mut a = BuildF64Sums::new(schema.clone(), 1, 4);
+        let mut b = BuildF64Sums::new(schema, 1, 4);
+        a.add(1, 2.0);
+        b.add(1, 3.0);
+        b.add(3, 4.0);
+        a.merge(&b);
+        let groups: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![10, 11, 12, 13]))];
+        let out = a.finish(&groups, &BatchPolicy::default()).unwrap();
+        assert_eq!(out.len(), 1);
+        let g = out[0].column(0).as_primitive::<Int64Type>();
+        let s = out[0].column(1).as_primitive::<Float64Type>();
+        assert_eq!(g.values().to_vec(), vec![11, 13]);
+        assert_eq!(s.values().to_vec(), vec![5.0, 4.0]);
+    }
+
     use super::*;
     use arrow::array::{DictionaryArray, Float64Array, Int32Array, Int64Array};
     use arrow::datatypes::{Field, Schema};
