@@ -1989,13 +1989,19 @@ fn build_physical_filtered(
                 if !project_first && let Some(names) = projection {
                     batch = project_named(batch, names)?;
                 }
-                if !runtime.is_empty() {
-                    match runtime_filter::apply_preds(batch, runtime)? {
-                        Some(kept) => batch = kept,
-                        None => continue,
+                if runtime.is_empty() {
+                    morsels.extend(batch.split_by_policy(&session.policy));
+                } else if runtime.iter().all(runtime_filter::is_range) {
+                    // Ranges only skip, so check each morsel: whole morsels drop out.
+                    for morsel in batch.split_by_policy(&session.policy) {
+                        if let Some(kept) = runtime_filter::apply_runtime_preds(morsel, runtime)? {
+                            morsels.push(kept);
+                        }
                     }
+                } else if let Some(kept) = runtime_filter::apply_runtime_preds(batch, runtime)? {
+                    // Row filters first, so the surviving rows form full morsels.
+                    morsels.extend(kept.split_by_policy(&session.policy));
                 }
-                morsels.extend(batch.split_by_policy(&session.policy));
             }
             let (op, mut node) =
                 metrics::finish("Scan", lowering.scan(morsels)?, Vec::new(), analyze, pool);
@@ -2553,6 +2559,11 @@ pub(crate) fn filter_batch(batch: &Batch, predicate: &Expr) -> Result<Option<Bat
         .ok_or_else(|| Error::Eval("filter predicate is not boolean".into()))?;
     let not_null = is_not_null(bools).map_err(|e| Error::Eval(e.to_string()))?;
     let keep = and(bools, &not_null).map_err(|e| Error::Eval(e.to_string()))?;
+    // Every row kept: share the batch instead of copying each column.
+    let kept = keep.true_count();
+    if kept == batch.num_rows() {
+        return Ok((kept > 0).then(|| batch.clone()));
+    }
     let filtered =
         filter_record_batch(batch.as_arrow(), &keep).map_err(|e| Error::Eval(e.to_string()))?;
     if filtered.num_rows() == 0 {

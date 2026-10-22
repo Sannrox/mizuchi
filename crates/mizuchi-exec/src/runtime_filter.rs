@@ -1,8 +1,10 @@
 //! Runtime join-key filters for the probe-side scan.
 //!
 //! After an inner hash-join build, integer equality keys become a min/max
-//! range or a small IN-list. The probe scan may skip morsels and rows. A scan
-//! that ignores the filter is still correct.
+//! range or a small IN-list. A small IN-list filters probe rows. A range only
+//! skips morsels it rules out by their min/max: filtering rows by a range
+//! copies most of the probe side and costs more than the join probe it saves
+//! (#164). A scan that ignores the filter is still correct.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -107,6 +109,44 @@ pub(crate) fn batch_cannot_match(batch: &Batch, preds: &[Expr]) -> bool {
     preds.iter().any(|p| pred_cannot_match(batch, p))
 }
 
+/// Whether a runtime pred is a min/max range on one key column
+/// (`key >= min AND key <= max`, as `from_build` writes it).
+pub(crate) fn is_range(pred: &Expr) -> bool {
+    let Expr::Binary(BinaryOp::And, low, high) = pred else {
+        return false;
+    };
+    let (
+        Expr::Binary(BinaryOp::GtEq, low_key, low_lit),
+        Expr::Binary(BinaryOp::LtEq, high_key, high_lit),
+    ) = (low.as_ref(), high.as_ref())
+    else {
+        return false;
+    };
+    let same_key = match (low_key.as_ref(), high_key.as_ref()) {
+        (Expr::Nth(a), Expr::Nth(b)) => a == b,
+        (Expr::Column(a), Expr::Column(b)) => a == b,
+        _ => false,
+    };
+    same_key && int_lit(low_lit).is_some() && int_lit(high_lit).is_some()
+}
+
+/// Apply runtime join-key preds: any pred may skip the whole batch, but only
+/// non-range preds filter rows. A runtime filter is optional, so keeping rows
+/// a range would drop is correct; the join drops them. Never use this for
+/// query predicates, which must filter every row: use `apply_preds`.
+pub(crate) fn apply_runtime_preds(mut batch: Batch, preds: &[Expr]) -> Result<Option<Batch>> {
+    if batch_cannot_match(&batch, preds) {
+        return Ok(None);
+    }
+    for pred in preds.iter().filter(|p| !is_range(p)) {
+        match filter_batch(&batch, pred)? {
+            Some(kept) => batch = kept,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(batch))
+}
+
 /// Apply `preds` as a conjunction, dropping empty results.
 pub(crate) fn apply_preds(mut batch: Batch, preds: &[Expr]) -> Result<Option<Batch>> {
     if batch_cannot_match(&batch, preds) {
@@ -129,7 +169,7 @@ pub(crate) fn filter_batches(batches: Vec<Batch>, preds: &[Expr]) -> Result<Vec<
     }
     let mut out = Vec::new();
     for batch in batches {
-        if let Some(kept) = apply_preds(batch, preds)?
+        if let Some(kept) = apply_runtime_preds(batch, preds)?
             && kept.num_rows() > 0
         {
             out.push(kept);
@@ -412,6 +452,21 @@ fn int_lit(expr: &Expr) -> Option<i64> {
 }
 
 fn pred_cannot_match(batch: &Batch, pred: &Expr) -> bool {
+    cannot_match(batch, pred, &mut Vec::new())
+}
+
+/// A plain key column: by position or by name, never confused.
+#[derive(PartialEq)]
+enum KeyColumn {
+    Nth(usize),
+    Named(String),
+}
+
+/// Key ranges already computed for one batch, by column, so a range's two
+/// bounds and an IN-list's equalities read the key column once.
+type KeyRanges = Vec<(KeyColumn, Option<(i64, i64)>)>;
+
+fn cannot_match(batch: &Batch, pred: &Expr, ranges: &mut KeyRanges) -> bool {
     match pred {
         Expr::Literal(arr) => {
             if let Some(b) = arr.as_any().downcast_ref::<BooleanArray>() {
@@ -421,16 +476,16 @@ fn pred_cannot_match(batch: &Batch, pred: &Expr) -> bool {
             }
         }
         Expr::Binary(BinaryOp::And, l, r) => {
-            pred_cannot_match(batch, l) || pred_cannot_match(batch, r)
+            cannot_match(batch, l, ranges) || cannot_match(batch, r, ranges)
         }
         Expr::Binary(BinaryOp::Or, l, r) => {
-            pred_cannot_match(batch, l) && pred_cannot_match(batch, r)
+            cannot_match(batch, l, ranges) && cannot_match(batch, r, ranges)
         }
         Expr::Binary(op, l, r) => {
             let Some(v) = int_lit(r) else {
                 return false;
             };
-            let Some((lo, hi)) = expr_int_range(batch, l) else {
+            let Some((lo, hi)) = key_range(batch, l, ranges) else {
                 return false;
             };
             match op {
@@ -446,21 +501,42 @@ fn pred_cannot_match(batch: &Batch, pred: &Expr) -> bool {
     }
 }
 
-fn expr_int_range(batch: &Batch, expr: &Expr) -> Option<(i64, i64)> {
-    let arr = expr.eval(batch).ok()?;
-    let mut min = i64::MAX;
-    let mut max = i64::MIN;
-    let mut n = 0usize;
-    for i in 0..arr.len() {
-        if arr.is_null(i) {
-            continue;
-        }
-        let v = int_at(arr.as_ref(), i)?;
-        n += 1;
-        min = min.min(v);
-        max = max.max(v);
+fn key_range(batch: &Batch, expr: &Expr, ranges: &mut KeyRanges) -> Option<(i64, i64)> {
+    let key = match expr {
+        Expr::Nth(i) => KeyColumn::Nth(*i),
+        Expr::Column(name) => KeyColumn::Named(name.clone()),
+        _ => return expr_int_range(batch, expr),
+    };
+    if let Some((_, range)) = ranges.iter().find(|(k, _)| *k == key) {
+        return *range;
     }
-    if n == 0 { None } else { Some((min, max)) }
+    let range = expr_int_range(batch, expr);
+    ranges.push((key, range));
+    range
+}
+
+/// The non-null min and max of an integer expression over `batch`, with the
+/// vectorised kernels (one typed pass, no per-row dispatch).
+fn expr_int_range(batch: &Batch, expr: &Expr) -> Option<(i64, i64)> {
+    use arrow::compute::{max, min};
+    let arr = expr.eval(batch).ok()?;
+    macro_rules! range {
+        ($t:ty) => {{
+            let a = arr.as_primitive::<$t>();
+            Some((i64::try_from(min(a)?).ok()?, i64::try_from(max(a)?).ok()?))
+        }};
+    }
+    match arr.data_type() {
+        DataType::Int8 => range!(Int8Type),
+        DataType::Int16 => range!(Int16Type),
+        DataType::Int32 => range!(Int32Type),
+        DataType::Int64 => range!(Int64Type),
+        DataType::UInt8 => range!(UInt8Type),
+        DataType::UInt16 => range!(UInt16Type),
+        DataType::UInt32 => range!(UInt32Type),
+        DataType::UInt64 => range!(UInt64Type),
+        _ => None,
+    }
 }
 
 fn map_leaves(expr: &Expr, leaf: &impl Fn(&Expr) -> Option<Expr>) -> Option<Expr> {
@@ -545,6 +621,91 @@ mod tests {
             schema.as_ref(),
             std::slice::from_ref(&build),
         )
+    }
+
+    #[test]
+    fn a_range_skips_morsels_it_rules_out_and_never_filters_rows() {
+        let build = i64_batch("id", (100..200).map(Some).collect());
+        let rf = derive(build).expect("filter");
+        assert!(is_range(&rf.preds[0]), "{}", rf.summary);
+        // Overlapping morsel: every row is kept, even those outside the range.
+        let overlap = i64_batch("k", vec![Some(1), Some(150), None, Some(999)]);
+        let kept = apply_runtime_preds(overlap, &rf.preds)
+            .unwrap()
+            .expect("kept");
+        assert_eq!(kept.num_rows(), 4);
+        // Morsel entirely outside the range is skipped.
+        let outside = i64_batch("k", vec![Some(500), None, Some(600)]);
+        assert!(apply_runtime_preds(outside, &rf.preds).unwrap().is_none());
+    }
+
+    #[test]
+    fn query_predicates_shaped_like_a_range_still_filter_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, true),
+            Field::new("y", DataType::Int64, true),
+        ]));
+        let batch = Batch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), Some(7), Some(20)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(1), Some(7), Some(20)])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let between = |low: usize, high: usize| {
+            Expr::Binary(
+                BinaryOp::And,
+                Box::new(Expr::Binary(
+                    BinaryOp::GtEq,
+                    Box::new(Expr::nth(low)),
+                    Box::new(Expr::lit_i64(5)),
+                )),
+                Box::new(Expr::Binary(
+                    BinaryOp::LtEq,
+                    Box::new(Expr::nth(high)),
+                    Box::new(Expr::lit_i64(10)),
+                )),
+            )
+        };
+        // A WHERE x >= 5 AND x <= 10 filters every row through apply_preds.
+        let kept = apply_preds(batch.clone(), &[between(0, 0)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.num_rows(), 1);
+        // Different columns are never a runtime range.
+        assert!(!is_range(&between(0, 1)));
+        assert!(is_range(&between(0, 0)));
+    }
+
+    #[test]
+    fn an_in_list_still_filters_rows() {
+        let build = i64_batch("id", vec![Some(10), Some(20)]);
+        let rf = derive(build).expect("filter");
+        assert!(!is_range(&rf.preds[0]));
+        let probe = i64_batch("k", vec![Some(10), Some(11), Some(20), None]);
+        let kept = apply_runtime_preds(probe, &rf.preds)
+            .unwrap()
+            .expect("kept");
+        assert_eq!(kept.num_rows(), 2);
+    }
+
+    #[test]
+    fn key_ranges_ignore_nulls_and_read_unsigned_keys() {
+        let batch = i64_batch("k", vec![None, Some(-5), Some(42), None]);
+        assert_eq!(expr_int_range(&batch, &Expr::nth(0)), Some((-5, 42)));
+        let nulls = i64_batch("k", vec![None, None]);
+        assert_eq!(expr_int_range(&nulls, &Expr::nth(0)), None);
+        let schema = Arc::new(Schema::new(vec![Field::new("u", DataType::UInt32, true)]));
+        let unsigned = Batch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::UInt32Array::from(vec![
+                Some(7),
+                Some(3),
+            ]))],
+        )
+        .unwrap();
+        assert_eq!(expr_int_range(&unsigned, &Expr::nth(0)), Some((3, 7)));
     }
 
     #[test]

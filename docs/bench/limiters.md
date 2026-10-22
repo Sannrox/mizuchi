@@ -85,8 +85,11 @@ compact range map; unique i64 keys probe with a direct index. Inner joins
 build the smaller estimated side (right). After that build, integer join
 keys become a min/max or small IN-list runtime filter on the probe-side
 scan. `EXPLAIN ANALYZE` prints `runtime_filter=[...]` on the scan and the
-scan's `rows=` count is the rows that survive the filter. In-memory scans
-skip morsels that cannot match; Parquet footer prune treats IN-list as OR.
+scan's `rows=` count is the rows that survive the filter. An IN-list filters
+rows; a min/max range only skips morsels whose key range cannot match, since
+filtering rows by a wide range copies most of the probe side for little gain
+(#164). In-memory scans check one vectorised min/max per morsel and key;
+Parquet footer prune treats IN-list as OR.
 Null keys never match. Inner probe ranges run on worker threads.
 
 ### Copies
