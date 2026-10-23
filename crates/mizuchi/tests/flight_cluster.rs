@@ -281,3 +281,91 @@ fn a_standby_takes_over_and_the_old_leaders_work_is_refused() {
     assert!(status.lease_age.is_some());
     let _ = std::fs::remove_dir_all(lease);
 }
+
+/// #162: the leader dies between stages; the standby resumes the batch query
+/// from the committed stage without re-running it, and a committed stage whose
+/// output is damaged fails the query instead of yielding a wrong result.
+#[test]
+fn a_standby_resumes_a_batch_query_from_its_last_committed_stage() {
+    use mizuchi::{DirLeaseStore, Leadership, Stage};
+
+    let lease = lease_dir();
+    let spill = lease.join("spill");
+    std::fs::create_dir_all(&spill).unwrap();
+    let (a1, _h1) = spawn_worker(true, Some(spill.clone()), Some(lease.clone())).unwrap();
+    let (a2, _h2) = spawn_worker(true, Some(spill.clone()), Some(lease.clone())).unwrap();
+    let addrs = vec![a1.to_string(), a2.to_string()];
+    let ttl = Duration::from_millis(200);
+    let leadership = |holder: &str| {
+        Arc::new(Leadership::new(
+            Box::new(DirLeaseStore::new(&lease).unwrap()),
+            holder,
+            ttl,
+        ))
+    };
+    let stages = [
+        Stage {
+            sql: "SELECT a FROM t WHERE a >= 5".into(),
+            output: "big".into(),
+        },
+        Stage {
+            sql: "SELECT SUM(a) AS s FROM big".into(),
+            output: "total".into(),
+        },
+    ];
+
+    let first = leadership("first");
+    first.try_lead().unwrap().unwrap();
+    let leader = RemoteCluster::connect(addrs.clone(), true, Some(spill.clone()))
+        .unwrap()
+        .with_leadership(first);
+    let (schema, batches) = numbered(10);
+    leader.register("t", schema, batches).unwrap();
+    // A stage with no rows still hands its columns to the next one.
+    let empty = [
+        Stage {
+            sql: "SELECT a FROM t WHERE a > 100".into(),
+            output: "none".into(),
+        },
+        Stage {
+            sql: "SELECT COUNT(a) AS c FROM none".into(),
+            output: "count".into(),
+        },
+    ];
+    assert_eq!(col(&leader.run_staged("q0", &empty).unwrap()), [0]);
+    // Stage one commits; then the leader dies before stage two.
+    assert_eq!(
+        col(&leader.run_staged("q1", &stages[..1]).unwrap()),
+        [5, 6, 7, 8, 9]
+    );
+    drop(leader);
+
+    let standby = leadership("standby");
+    standby.lead(Duration::from_millis(20)).unwrap();
+    let successor = RemoteCluster::connect(addrs.clone(), true, Some(spill.clone()))
+        .unwrap()
+        .with_leadership(standby.clone());
+    // The successor never registers `t`: re-running stage one would fail, so
+    // the right total proves the committed stage was reused.
+    assert_eq!(col(&successor.run_staged("q1", &stages).unwrap()), [35]);
+
+    // Damage the committed output of stage one.
+    let outputs = spill.join("queries").join("q1");
+    for entry in std::fs::read_dir(&outputs).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "arrow")
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("stage-0."))
+        {
+            std::fs::write(&path, b"partial").unwrap();
+        }
+    }
+    let damaged = successor.run_staged("q1", &stages);
+    assert!(
+        matches!(&damaged, Err(mizuchi::Error::Io(message)) if message.contains("cannot resume")),
+        "{damaged:?}"
+    );
+    let _ = std::fs::remove_dir_all(lease);
+}
