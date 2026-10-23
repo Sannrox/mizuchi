@@ -1,11 +1,12 @@
-# Kubernetes layout for a coordinator and Flight worker replicas.
+# Kubernetes layout for coordinator and Flight worker replicas.
 # TCP is opened only when MIZUCHI_ALLOW_NETWORK is set.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mizuchi-coordinator
 spec:
-  replicas: 1
+  # A leader and a standby; the lease keeps one in charge (ADR 0016).
+  replicas: 2
   selector:
     matchLabels:
       app: mizuchi-coordinator
@@ -23,6 +24,8 @@ spec:
               value: "1"
             - name: MIZUCHI_WORKERS
               value: "mizuchi-worker:8815"
+            - name: MIZUCHI_LEASE_DIR
+              value: /lease
           resources:
             limits:
               cpu: "1"
@@ -30,9 +33,15 @@ spec:
           volumeMounts:
             - name: spill
               mountPath: /spill
+            - name: lease
+              mountPath: /lease
       volumes:
         - name: spill
           emptyDir: {}
+        # Shared by every coordinator replica.
+        - name: lease
+          persistentVolumeClaim:
+            claimName: mizuchi-coordinator-lease
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -57,6 +66,9 @@ spec:
               value: "1"
             - name: MIZUCHI_SPILL
               value: /spill
+            # Workers check fencing tokens against the coordinators' lease.
+            - name: MIZUCHI_LEASE_DIR
+              value: /lease
           resources:
             limits:
               cpu: "1"
@@ -64,6 +76,21 @@ spec:
           volumeMounts:
             - name: spill
               mountPath: /spill
+            - name: lease
+              mountPath: /lease
       volumes:
         - name: spill
           emptyDir: {}
+        - name: lease
+          persistentVolumeClaim:
+            claimName: mizuchi-coordinator-lease
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mizuchi-coordinator-lease
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 16Mi

@@ -48,9 +48,9 @@ fn spill() -> std::path::PathBuf {
 #[test]
 fn three_workers_execute_and_shuffle() {
     let dir = spill();
-    let (a1, _h1) = spawn_worker(true, Some(dir.clone())).unwrap();
-    let (a2, _h2) = spawn_worker(true, Some(dir.clone())).unwrap();
-    let (a3, _h3) = spawn_worker(true, Some(dir.clone())).unwrap();
+    let (a1, _h1) = spawn_worker(true, Some(dir.clone()), None).unwrap();
+    let (a2, _h2) = spawn_worker(true, Some(dir.clone()), None).unwrap();
+    let (a3, _h3) = spawn_worker(true, Some(dir.clone()), None).unwrap();
     let cluster = RemoteCluster::connect(
         vec![a1.to_string(), a2.to_string(), a3.to_string()],
         true,
@@ -71,8 +71,8 @@ fn three_workers_execute_and_shuffle() {
 
 #[test]
 fn shuffle_without_spill_uses_flight() {
-    let (a1, _h1) = spawn_worker(true, None).unwrap();
-    let (a2, _h2) = spawn_worker(true, None).unwrap();
+    let (a1, _h1) = spawn_worker(true, None, None).unwrap();
+    let (a2, _h2) = spawn_worker(true, None, None).unwrap();
     let cluster = RemoteCluster::connect(vec![a1.to_string(), a2.to_string()], true, None).unwrap();
     let (_schema, batches) = numbered(3);
     let shuffled = cluster.shuffle_round_trip(0, 1, "part1", &batches).unwrap();
@@ -171,4 +171,113 @@ fn three_workers_kill_mid_query_decision_support() {
         let _ = kid.kill();
         let _ = kid.wait();
     }
+}
+
+fn lease_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "mizuchi-lease-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
+/// #161: the leader dies mid-query, the standby takes the lease with a higher
+/// fencing token, and nothing the old leader started lands afterwards.
+#[test]
+fn a_standby_takes_over_and_the_old_leaders_work_is_refused() {
+    use mizuchi::{DirLeaseStore, Error, Leadership, MemoryLeaseStore};
+
+    let lease = lease_dir();
+    let (a1, _h1) = spawn_worker(true, None, Some(lease.clone())).unwrap();
+    let (a2, _h2) = spawn_worker(true, None, None).unwrap();
+    let addrs = vec![a1.to_string(), a2.to_string()];
+    let ttl = Duration::from_millis(200);
+    let leadership = |holder: &str| {
+        Arc::new(Leadership::new(
+            Box::new(DirLeaseStore::new(&lease).unwrap()),
+            holder,
+            ttl,
+        ))
+    };
+    let first = leadership("first");
+    let standby = leadership("standby");
+    assert_eq!(first.try_lead().unwrap(), Some(1));
+    assert_eq!(standby.try_lead().unwrap(), None);
+
+    let leader = RemoteCluster::connect(addrs.clone(), true, None)
+        .unwrap()
+        .with_leadership(first.clone());
+    let (schema, batches) = numbered(10);
+    leader
+        .register("t", schema.clone(), batches.clone())
+        .unwrap();
+    // Stage one completes under the first lease.
+    assert_eq!(
+        col(&leader.execute_sql("SELECT a FROM t WHERE a < 3").unwrap()),
+        [0, 1, 2]
+    );
+
+    // Stage two is admitted under token 1, then the leader stops renewing
+    // (it is killed), and the standby takes over while the stage runs.
+    let stage = {
+        let leader = leader.clone();
+        thread::spawn(move || leader.execute_sql_slow("SELECT SUM(a) AS s FROM t"))
+    };
+    let token = standby.lead(Duration::from_millis(20)).unwrap();
+    assert!(token > 1);
+    // The live successor keeps its lease; the killed leader renews nothing.
+    let _alive = standby.keep_alive(ttl / 4);
+    let successor = RemoteCluster::connect(addrs.clone(), true, None)
+        .unwrap()
+        .with_leadership(standby.clone());
+    successor
+        .register("t", schema.clone(), batches.clone())
+        .unwrap();
+
+    // The old leader's in-flight stage fails cleanly instead of landing.
+    let stale = stage.join().unwrap();
+    assert!(matches!(stale, Err(Error::Fenced(_))), "{stale:?}");
+    // Its next assignment is refused before it reaches a worker.
+    let next = leader.execute_sql("SELECT a FROM t");
+    assert!(matches!(next, Err(Error::Fenced(_))), "{next:?}");
+    assert!(!first.status().leader);
+
+    // A coordinator that still believes it holds token 1 (a partitioned
+    // leader with its own view of the lease) is refused by the workers.
+    let partitioned = RemoteCluster::connect(addrs.clone(), true, None)
+        .unwrap()
+        .with_leadership(Arc::new(Leadership::new(
+            Box::new(MemoryLeaseStore::default()),
+            "partitioned",
+            ttl,
+        )));
+    let refused = partitioned.execute_sql("SELECT a FROM t");
+    assert!(matches!(refused, Err(Error::Fenced(_))), "{refused:?}");
+
+    // A worker restarted after the takeover has no high-water mark, but it
+    // mounts the lease directory and refuses token 1 all the same.
+    let (restarted, _h3) = spawn_worker(true, None, Some(lease.clone())).unwrap();
+    let late = RemoteCluster::connect(vec![restarted.to_string(), a2.to_string()], true, None)
+        .unwrap()
+        .with_leadership(Arc::new(Leadership::new(
+            Box::new(MemoryLeaseStore::default()),
+            "late",
+            ttl,
+        )));
+    let refused = late.register("late", schema.clone(), batches.clone());
+    assert!(matches!(refused, Err(Error::Fenced(_))), "{refused:?}");
+
+    // The successor runs the query, and reports its leadership.
+    assert_eq!(
+        col(&successor.execute_sql("SELECT SUM(a) AS s FROM t").unwrap()),
+        [45]
+    );
+    let status = successor.leader_status().unwrap();
+    assert!(status.leader);
+    assert_eq!(status.token, token);
+    assert!(status.lease_age.is_some());
+    let _ = std::fs::remove_dir_all(lease);
 }

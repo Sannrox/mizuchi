@@ -23,6 +23,9 @@ pub enum Error {
     Memory(String),
     /// The caller cancelled the query.
     Cancelled,
+    /// This coordinator's lease was lost or superseded, so the query was
+    /// stopped. Workers refuse its assignments.
+    Fenced(String),
 }
 
 impl std::fmt::Display for Error {
@@ -38,6 +41,7 @@ impl std::fmt::Display for Error {
             Error::Io(reason) => write!(f, "io: {reason}"),
             Error::Memory(reason) => write!(f, "memory: {reason}"),
             Error::Cancelled => write!(f, "cancelled"),
+            Error::Fenced(reason) => write!(f, "fenced: {reason}"),
         }
     }
 }
