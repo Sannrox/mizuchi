@@ -51,3 +51,9 @@ native-tls = { version = "0.2.14" }
 arrow-flight = { version = "60.0.0", default-features = false }
 tonic = { version = "0.14.1", default-features = false, features = ["transport", "codegen", "router"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
+
+# Dependencies build without debug info in dev and test builds: backtraces
+# and debuggers keep full detail for workspace crates, and build directories
+# stay a fraction of the size.
+[profile.dev.package."*"]
+debug = false
