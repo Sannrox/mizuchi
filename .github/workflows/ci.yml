@@ -84,12 +84,12 @@ jobs:
         working-directory: python
         run: |
           python -m pip install --upgrade pip
-          python -m pip install maturin
+          python -m pip install maturin==1.15.0
           maturin build --release --locked -o dist
           python -m pip install dist/*.whl
       - name: Run examples
         run: |
-          python -m pip install pyarrow
+          python -m pip install pyarrow==26.0.0
           python python/examples/lazy_df.py
           python python/examples/udf_arrow.py
 
@@ -103,7 +103,7 @@ jobs:
         with:
           workspaces: fuzz
       - name: Install cargo-fuzz
-        run: cargo +nightly install cargo-fuzz --locked
+        run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
       - name: Run fuzz targets
         run: |
           cargo +nightly fuzz run parse -- -max_total_time=15 -len_control=0
