@@ -47,8 +47,19 @@ long pause.
   overwrite the current one's shuffle data, and a table it registers late
   is invisible to its successor. Heartbeats are not assignments and carry
   no fence.
-- A new leader registers its own inputs: queries are not resumed across a
-  takeover (#145 tracks recovery).
+- A new leader registers its own inputs. A batch query run as stages
+  (`RemoteCluster::run_staged`) commits each stage's output to the shared
+  spill directory with a digest, per leadership generation. The first time a
+  generation opens a query it claims the next seal in one numbered sequence,
+  adopting what the previous sealing generation had committed by then, so a
+  new leader reuses those stages and re-runs only the rest, while a commit a
+  superseded leader publishes after the seal is never adopted. A generation
+  older than the last seal is fenced. A stage with no rows keeps its columns.
+  Each commit records its stage's definition, so a changed stage is never
+  reused, and a coordinator runs one staged query at a time because their
+  intermediate tables share the workers' namespace. The spill directory must
+  already exist. A committed output that is missing or altered
+  fails the query instead of resuming it (#162).
 - A coordinator checks its lease again after every response, so a result
   that arrives after it lost the lease is not exposed. One that lost the
   lease stops its query with the typed `Error::Fenced` and does not retry

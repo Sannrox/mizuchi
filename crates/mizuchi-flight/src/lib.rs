@@ -37,7 +37,7 @@ use tonic::{Request, Response, Status, Streaming};
 use mizuchi_core::batch::Batch;
 use mizuchi_core::error::{Error, Result};
 use mizuchi_exec::memory::{read_spill, write_spill};
-use mizuchi_exec::{DirLeaseStore, Fence, LeaderStatus, Leadership, Session};
+use mizuchi_exec::{DirLeaseStore, Fence, LeaderStatus, Leadership, Session, StageCommits};
 
 const HEARTBEAT_STALE: Duration = Duration::from_secs(2);
 
@@ -424,7 +424,17 @@ fn execute_sql(
     token: Option<u64>,
 ) -> std::result::Result<Vec<u8>, Status> {
     let sql = std::str::from_utf8(body).map_err(|_| Status::invalid_argument("sql"))?;
-    let out = state.with_session(token, |session| session.execute_sql(sql))?;
+    // A query with no rows still answers with its columns, as one empty batch,
+    // so a later stage can read its output as a table.
+    let out = state.with_session(token, |session| -> Result<Vec<Batch>> {
+        let out = session.execute_sql(sql)?;
+        if out.is_empty() {
+            return Ok(vec![Batch::empty(
+                session.logical_plan(sql)?.schema().clone(),
+            )?]);
+        }
+        Ok(out)
+    })?;
     // Fenced first: a superseded generation's query reports the fence, not
     // whatever went wrong after its session was retired.
     state.fence.still_current(token).map_err(fenced)?;
@@ -513,12 +523,22 @@ struct Peer {
     dead: Mutex<bool>,
 }
 
+/// One stage of a resumable batch query: SQL over the tables registered
+/// so far, whose output is registered as `output` for the stages after it.
+#[derive(Clone, Debug)]
+pub struct Stage {
+    pub sql: String,
+    pub output: String,
+}
+
 /// Coordinator that talks to Flight workers.
 #[derive(Clone)]
 pub struct RemoteCluster {
     peers: Vec<Arc<Peer>>,
     spill_dir: Option<PathBuf>,
     leadership: Option<Arc<Leadership>>,
+    /// Staged queries share the workers' table namespace, so one runs at a time.
+    staged: Arc<Mutex<()>>,
 }
 
 impl RemoteCluster {
@@ -552,6 +572,7 @@ impl RemoteCluster {
                 .collect(),
             spill_dir,
             leadership: None,
+            staged: Arc::new(Mutex::new(())),
         })
     }
 
@@ -661,6 +682,51 @@ impl RemoteCluster {
             }
         }
         Err(last)
+    }
+
+    /// Runs `stages` as the batch query `query_id` and returns the last
+    /// stage's output. Each stage's output is committed to the shared spill
+    /// directory while this coordinator holds its lease; a coordinator that
+    /// takes over runs the same id and reuses every committed stage instead
+    /// of re-running it (#162). A committed stage whose output is missing or
+    /// altered fails the query cleanly, never with a wrong result.
+    pub fn run_staged(&self, query_id: &str, stages: &[Stage]) -> Result<Vec<Batch>> {
+        let spill = self
+            .spill_dir
+            .as_ref()
+            .ok_or_else(|| Error::Plan("staged queries need a shared spill directory".into()))?;
+        // Intermediate tables live in the workers' shared namespace; a second
+        // staged query must not replace one between this query's stages.
+        let _one_at_a_time = self.staged.lock().unwrap_or_else(|e| e.into_inner());
+        // Each leadership generation commits to its own records and adopts
+        // only what earlier generations committed before it sealed the query.
+        let generation = self.token()?.unwrap_or(0);
+        let commits = StageCommits::open(spill, query_id, generation)?;
+        let mut output = Vec::new();
+        for (index, stage) in stages.iter().enumerate() {
+            // What the stage computes; a changed stage is never reused.
+            let definition = format!("{}\n{}", stage.output, stage.sql);
+            output = match commits.committed(index, &definition)? {
+                Some(committed) => committed,
+                None => {
+                    let ran = self.execute_sql(&stage.sql)?;
+                    commits.commit(index, &definition, &ran)?;
+                    // This generation's first commit of the stage counts.
+                    commits.committed(index, &definition)?.ok_or_else(|| {
+                        Error::Io(format!("stage {index} of {query_id} did not commit"))
+                    })?
+                }
+            };
+            if index + 1 < stages.len()
+                && let Some(first) = output.first()
+            {
+                self.register(&stage.output, first.schema(), output.clone())?;
+            }
+        }
+        // A result is exposed only to a coordinator that still holds the lease,
+        // also when every stage was already committed.
+        self.token()?;
+        Ok(output)
     }
 
     /// Store shuffle batches on `owner` and fetch them over Flight from `reader`.

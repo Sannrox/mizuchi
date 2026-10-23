@@ -42,11 +42,11 @@ pub use mizuchi_exec::{
     JwtVerifier, LeaderStatus, Leadership, Lease, LeaseStore, MemoryLeaseStore, MergeStats,
     MicroBatchAgg, OperatorMetrics, OutputWrite, PolicyContext, QUERY_API_CONTRACT,
     QUERY_API_SCHEMA, QueryApiConfig, QueryApiServer, QueryLog, QueryRecord, QueryReport,
-    QueryResult, QueryRetention, QueryStatus, RunningQuery, Session, SessionConfig, StreamOutput,
-    StreamQuery, StreamQueryConfig, StreamTrigger, TokenIdentity, WorkerResources,
+    QueryResult, QueryRetention, QueryStatus, RunningQuery, Session, SessionConfig, StageCommits,
+    StreamOutput, StreamQuery, StreamQueryConfig, StreamTrigger, TokenIdentity, WorkerResources,
 };
 #[cfg(feature = "flight")]
-pub use mizuchi_flight::{FENCING_HEADER, RemoteCluster, serve_worker, spawn_worker};
+pub use mizuchi_flight::{FENCING_HEADER, RemoteCluster, Stage, serve_worker, spawn_worker};
 pub use mizuchi_io::{
     AvroReadOptions, ColumnRange, CsvReadOptions, Dek, EncryptionSession, FloatRange,
     JsonReadOptions, KeyError, KeyId, KeyProvider, KeyPurpose, LakeSnapshot, MemoryKeyProvider,

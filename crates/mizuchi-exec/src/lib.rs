@@ -27,6 +27,7 @@ mod schedule;
 mod setop;
 mod sort;
 mod stage;
+mod stage_commit;
 mod stream;
 mod window;
 
@@ -72,6 +73,7 @@ pub use query_api::{
     QueryRetention, QueryStatus, RunningQuery,
 };
 pub use report::{ColumnLabels, InputScan, OutputWrite, QueryReport, QueryResult};
+pub use stage_commit::StageCommits;
 pub use stream::{EventWindow, StreamOutput, StreamQuery, StreamQueryConfig, StreamTrigger};
 
 thread_local! {
