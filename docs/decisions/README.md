@@ -19,5 +19,6 @@ Decisions that must outlive a single PR.
 | [0013](0013-workspace-crate-graph.md) | Layered workspace crate graph | Accepted |
 | [0014](0014-serve-console-at-ui.md) | Query API may serve a caller-provided console at `/ui/` | Accepted |
 | [0015](0015-morsel-pipeline-scheduler.md) | In-process morsel-driven pipeline scheduler | Accepted |
+| [0016](0016-fenced-coordinator-lease.md) | Coordinator leadership is a fenced lease | Accepted |
 
 Template: short context, decision, consequences, rejected alternatives.

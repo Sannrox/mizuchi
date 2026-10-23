@@ -1,4 +1,5 @@
-# Three Flight workers plus a coordinator. The engine binds TCP only when
+# Three Flight workers plus a coordinator and a standby that takes over
+# through the fenced lease in /spill/lease (ADR 0016). The engine binds TCP only when
 # MIZUCHI_ALLOW_NETWORK is set.
 services:
   worker1:
@@ -9,6 +10,7 @@ services:
     environment:
       MIZUCHI_ALLOW_NETWORK: "1"
       MIZUCHI_SPILL: /spill
+      MIZUCHI_LEASE_DIR: /spill/lease
     volumes:
       - spill:/spill
     expose:
@@ -21,6 +23,7 @@ services:
     environment:
       MIZUCHI_ALLOW_NETWORK: "1"
       MIZUCHI_SPILL: /spill
+      MIZUCHI_LEASE_DIR: /spill/lease
     volumes:
       - spill:/spill
     expose:
@@ -33,6 +36,7 @@ services:
     environment:
       MIZUCHI_ALLOW_NETWORK: "1"
       MIZUCHI_SPILL: /spill
+      MIZUCHI_LEASE_DIR: /spill/lease
     volumes:
       - spill:/spill
     expose:
@@ -52,6 +56,32 @@ services:
     environment:
       MIZUCHI_ALLOW_NETWORK: "1"
       MIZUCHI_SPILL: /spill
+      # Leader and standby share the lease directory (ADR 0016).
+      MIZUCHI_LEASE_DIR: /spill/lease
+      MIZUCHI_HOLDER: coordinator
+    volumes:
+      - spill:/spill
+    depends_on:
+      - worker1
+      - worker2
+      - worker3
+  coordinator-standby:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command:
+      [
+        "coordinator",
+        "--workers",
+        "worker1:8815,worker2:8815,worker3:8815",
+        "--sql",
+        "SELECT SUM(a) AS s FROM t",
+      ]
+    environment:
+      MIZUCHI_ALLOW_NETWORK: "1"
+      MIZUCHI_SPILL: /spill
+      MIZUCHI_LEASE_DIR: /spill/lease
+      MIZUCHI_HOLDER: coordinator-standby
     volumes:
       - spill:/spill
     depends_on:

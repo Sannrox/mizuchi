@@ -11,6 +11,7 @@ mod incremental;
 mod join;
 mod jwt;
 mod key;
+mod lease;
 mod markings;
 pub mod memory;
 mod merge;
@@ -58,6 +59,9 @@ pub use config::SessionConfig;
 pub use engine::Engine;
 pub use incremental::MicroBatchAgg;
 pub use jwt::{JwtVerifier, TokenIdentity};
+pub use lease::{
+    DirLeaseStore, Fence, LeaderStatus, Leadership, Lease, LeaseStore, MemoryLeaseStore, now_ms,
+};
 pub use merge::MergeStats;
 pub use metrics::OperatorMetrics;
 pub use mizuchi_core::CancelToken;
