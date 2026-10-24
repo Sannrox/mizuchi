@@ -18,8 +18,6 @@ use mizuchi::Batch;
 use ds_common::{QUERIES, load, tables};
 
 struct EngineRun {
-    #[allow(dead_code)]
-    engine: &'static str,
     source: &'static str,
     elapsed_ms: f64,
     rows: Vec<Vec<String>>,
@@ -145,7 +143,6 @@ fn run_mizuchi() -> Vec<EngineRun> {
                 .execute_sql(q.sql)
                 .unwrap_or_else(|e| panic!("{}: {e}", q.id));
             EngineRun {
-                engine: "mizuchi",
                 source: "live",
                 elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
                 rows: format_batches(&out),
@@ -234,7 +231,6 @@ fn run_duckdb(dir: &Path) -> Option<Vec<EngineRun>> {
     for q in QUERIES {
         let text = fs::read_to_string(dir.join(format!("duckdb-{}.csv", q.id))).ok()?;
         out.push(EngineRun {
-            engine: "duckdb",
             source: "live",
             elapsed_ms: per,
             rows: parse_csv_rows(&text),
@@ -292,7 +288,6 @@ fn run_datafusion(dir: &Path) -> Option<Vec<EngineRun>> {
             .iter()
             .zip(blocks)
             .map(|(_q, rows)| EngineRun {
-                engine: "datafusion",
                 source: "live",
                 elapsed_ms: per,
                 rows,
@@ -367,7 +362,6 @@ fn reference_for(engine: &'static str, live: Option<Vec<EngineRun>>) -> Vec<Engi
     QUERIES
         .iter()
         .map(|q| EngineRun {
-            engine,
             source: "golden",
             elapsed_ms: 0.0,
             rows: load_golden(engine, q.id).unwrap_or_else(|| {

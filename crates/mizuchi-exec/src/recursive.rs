@@ -3,7 +3,6 @@
 
 use super::memory::{self, MemoryPool, batch_bytes};
 use super::{Session, collect};
-use arrow::datatypes::SchemaRef;
 use mizuchi_core::batch::Batch;
 use mizuchi_core::error::{Error, Result};
 use mizuchi_plan::LogicalPlan;
@@ -15,7 +14,6 @@ pub(super) fn run(
     name: &str,
     anchors: &[LogicalPlan],
     step: &LogicalPlan,
-    _schema: &SchemaRef,
     session: &Session,
     pool: &MemoryPool,
     analyze: bool,
