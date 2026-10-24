@@ -2078,7 +2078,7 @@ fn execute_physical(
             name,
             anchors,
             step,
-            schema,
+            schema: _,
         } => {
             let t0 = Instant::now();
             let copied0 = ctx.pool.copied();
@@ -2086,7 +2086,6 @@ fn execute_physical(
                 name,
                 anchors,
                 step.as_ref(),
-                schema,
                 &ctx.session,
                 ctx.pool.as_ref(),
                 false,

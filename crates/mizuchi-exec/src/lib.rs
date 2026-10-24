@@ -61,7 +61,7 @@ pub use engine::Engine;
 pub use incremental::MicroBatchAgg;
 pub use jwt::{JwtVerifier, TokenIdentity};
 pub use lease::{
-    DirLeaseStore, Fence, LeaderStatus, Leadership, Lease, LeaseStore, MemoryLeaseStore, now_ms,
+    DirLeaseStore, Fence, LeaderStatus, Leadership, Lease, LeaseStore, MemoryLeaseStore,
 };
 pub use merge::MergeStats;
 pub use metrics::OperatorMetrics;
@@ -2385,11 +2385,11 @@ fn build_physical_filtered(
             name,
             anchors,
             step,
-            schema,
+            schema: _,
         } => {
             let t0 = Instant::now();
             let copied0 = pool.copied();
-            let batches = recursive::run(name, anchors, step, schema, session, pool, analyze)?;
+            let batches = recursive::run(name, anchors, step, session, pool, analyze)?;
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let mut children: Vec<metrics::PhysNode> =
                 anchors.iter().map(metrics::physical_shape).collect();

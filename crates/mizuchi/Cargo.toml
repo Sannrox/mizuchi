@@ -19,8 +19,6 @@ mizuchi-flight = { path = "../mizuchi-flight", version = "0.1.0", optional = tru
 mizuchi-io = { workspace = true }
 mizuchi-plan = { workspace = true }
 mizuchi-postgres = { workspace = true }
-object_store = { workspace = true }
-sqlparser = { workspace = true }
 
 [features]
 default = []
@@ -42,6 +40,7 @@ required-features = ["flight"]
 [dev-dependencies]
 arrow = { workspace = true }
 futures = { workspace = true }
+object_store = { workspace = true }
 parquet = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time"] }
 
