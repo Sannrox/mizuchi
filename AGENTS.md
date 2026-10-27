@@ -256,8 +256,8 @@ implications. `.agents/skills/` is tracked; do not treat it as gitignored.
 Pull requests do not edit `CHANGELOG.md`; it is release-owned. The Pull
 Request title (Conventional Commit type) and body carry the change note, which
 the squash merge keeps on `main`. Add a `Breaking: <note>` or `Upgrade: <note>`
-line to the body and the `risk:breaking` or `risk:migration` label when callers
-or operators must act. Release prep drafts the version section with
+line (or a `## Breaking` / `## Upgrade` section) to the body and the
+`risk:breaking` or `risk:migration` label when callers or operators must act. Release prep drafts the version section with
 `scripts/changelog-draft.sh <version>`.
 
 ### Public hygiene
