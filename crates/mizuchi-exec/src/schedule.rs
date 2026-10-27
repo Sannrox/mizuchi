@@ -16,7 +16,7 @@ use arrow::datatypes::SchemaRef;
 use super::join::{self, JoinSpec};
 use super::memory::MemoryPool;
 use super::runtime_filter;
-use super::{Exec, Operator, Session, collect, physical, project_batch};
+use super::{CancelToken, Exec, Operator, Session, collect, physical, project_batch};
 use mizuchi_core::batch::Batch;
 use mizuchi_core::error::{Error, Result};
 use mizuchi_core::expr::Expr;
@@ -440,7 +440,7 @@ fn child_op(
 ) -> Result<Box<dyn Operator>> {
     if let Some(mut pipe) = pipeline(plan, session) {
         push_runtime(&mut pipe, extra);
-        return Ok(Box::new(pipe_source(pipe, session)?));
+        return Ok(Box::new(pipe_source(pipe, session, pool)?));
     }
     Ok(Box::new(Exec::Scan {
         batches: plan_batches_filtered(plan, extra, session, pool)?,
@@ -482,30 +482,53 @@ struct Pipeline {
     project: Option<(Vec<NamedExpr>, SchemaRef)>,
 }
 
+/// Morsels a [`PipeSource`] filters per worker in one parallel refill.
+const PIPE_MORSELS_PER_WORKER: usize = 8;
+
+/// Streams a scan pipeline's output in morsel order. Each refill applies the
+/// pipeline to the next few morsels per worker on all workers, so a consumer
+/// that pulls batch by batch (a join probe or build) does not filter the
+/// whole table on one thread. The buffer stays bounded at one refill, and a
+/// memory-limited query refills one morsel at a time.
 struct PipeSource {
     pipe: Pipeline,
     morsels: std::vec::IntoIter<Batch>,
+    ready: std::collections::VecDeque<Batch>,
+    workers: usize,
+    /// Morsels per refill: one under a memory limit, since `ready` holds no
+    /// pool reservation; `workers * PIPE_MORSELS_PER_WORKER` otherwise.
+    refill: usize,
 }
 
 impl Operator for PipeSource {
-    fn next_batch(&mut self, cancel: &super::CancelToken) -> Result<Option<Batch>> {
+    fn next_batch(&mut self, cancel: &CancelToken) -> Result<Option<Batch>> {
         loop {
             cancel.check()?;
-            let Some(batch) = self.morsels.next() else {
-                return Ok(None);
-            };
-            if let Some(out) = apply_pipe(&self.pipe, batch)? {
-                return Ok(Some(out));
+            if let Some(batch) = self.ready.pop_front() {
+                return Ok(Some(batch));
             }
+            let refill: Vec<Batch> = self.morsels.by_ref().take(self.refill).collect();
+            if refill.is_empty() {
+                return Ok(None);
+            }
+            let pipe = &self.pipe;
+            self.ready = map_morsels(self.workers, cancel, refill, |b| apply_pipe(pipe, b))?.into();
         }
     }
 }
 
-fn pipe_source(pipe: Pipeline, session: &Session) -> Result<PipeSource> {
+fn pipe_source(pipe: Pipeline, session: &Session, pool: &MemoryPool) -> Result<PipeSource> {
     let morsels = session.table_morsels(&pipe.table)?;
     Ok(PipeSource {
         pipe,
         morsels: morsels.into_iter(),
+        ready: std::collections::VecDeque::new(),
+        workers: session.workers,
+        refill: if pool.has_limit() {
+            1
+        } else {
+            session.workers.max(1) * PIPE_MORSELS_PER_WORKER
+        },
     })
 }
 
@@ -518,7 +541,7 @@ fn agg_serial(
     pool: &MemoryPool,
 ) -> Result<Vec<Batch>> {
     let child: Box<dyn Operator> = if let Some(pipe) = pipeline(input, session) {
-        Box::new(pipe_source(pipe, session)?)
+        Box::new(pipe_source(pipe, session, pool)?)
     } else {
         Box::new(Exec::Scan {
             batches: run(input, session, pool)?,
@@ -546,7 +569,7 @@ fn agg_pipeline(
 ) -> Result<Vec<Batch>> {
     if pool.has_limit() || session.workers <= 1 {
         return super::agg::run(
-            Box::new(pipe_source(pipe.clone(), session)?),
+            Box::new(pipe_source(pipe.clone(), session, pool)?),
             group,
             aggs,
             schema,
@@ -570,7 +593,7 @@ fn sort_input(
         return Ok(Vec::new());
     }
     let child: Box<dyn Operator> = if let Some(pipe) = pipeline(input, session) {
-        Box::new(pipe_source(pipe, session)?)
+        Box::new(pipe_source(pipe, session, pool)?)
     } else {
         Box::new(Exec::Scan {
             batches: run(input, session, pool)?,
@@ -638,7 +661,9 @@ fn as_pipeline(plan: &LogicalPlan) -> Option<Pipeline> {
 
 fn parallel_pipeline(pipe: &Pipeline, session: &Session) -> Result<Vec<Batch>> {
     let morsels = session.table_morsels(&pipe.table)?;
-    map_morsels(session, morsels, |batch| apply_pipe(pipe, batch))
+    map_morsels(session.workers, &session.exec_token(), morsels, |batch| {
+        apply_pipe(pipe, batch)
+    })
 }
 
 /// Unsorted LIMIT over a scan/filter/project pipeline stops after `skip` plus
@@ -817,18 +842,19 @@ fn agg_from_batches(
 }
 
 fn map_morsels(
-    session: &Session,
+    workers: usize,
+    token: &CancelToken,
     morsels: Vec<Batch>,
     f: impl Fn(Batch) -> Result<Option<Batch>> + Sync,
 ) -> Result<Vec<Batch>> {
     if morsels.is_empty() {
         return Ok(Vec::new());
     }
-    let n = session.workers.max(1).min(morsels.len());
+    let n = workers.max(1).min(morsels.len());
     if n == 1 {
         let mut out = Vec::new();
         for batch in morsels {
-            session.exec_token().check()?;
+            token.check()?;
             if let Some(batch) = f(batch)? {
                 out.push(batch);
             }
@@ -844,17 +870,16 @@ fn map_morsels(
     let collected = Mutex::new(Vec::new());
     thread::scope(|scope| -> Result<()> {
         let mut handles = Vec::new();
-        let token = session.exec_token();
         for _ in 0..n {
             let queue = &queue;
             let collected = &collected;
             let f = &f;
             let token = token.clone();
             handles.push(scope.spawn(move || -> Result<()> {
-                let prev = Session::push_cancel(token);
+                let prev = Session::push_cancel(token.clone());
                 let result = (|| {
                     loop {
-                        session.exec_token().check()?;
+                        token.check()?;
                         let item = {
                             let mut g = queue
                                 .lock()
@@ -937,4 +962,50 @@ fn apply_pipe(pipe: &Pipeline, batch: Batch) -> Result<Option<Batch>> {
         return Ok(None);
     }
     Ok(Some(batch))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use super::*;
+
+    #[test]
+    fn limited_pipe_source_retains_one_morsel_at_a_time() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..64 * 4096))],
+        )
+        .unwrap();
+        let mut session = Session::new().with_workers(4).unwrap();
+        session.register("t", schema, vec![batch]).unwrap();
+        let pipe = Pipeline {
+            table: "t".into(),
+            projection: None,
+            scan_filters: Vec::new(),
+            extra_filters: Vec::new(),
+            runtime_scan: Vec::new(),
+            runtime_filters: Vec::new(),
+            project: None,
+        };
+        let first_pull = |pool: &MemoryPool| {
+            let mut src = pipe_source(pipe.clone(), &session, pool).unwrap();
+            assert!(src.next_batch(&CancelToken::new()).unwrap().is_some());
+            src.ready.len()
+        };
+        // Under a limit nothing is buffered beyond the batch handed out.
+        assert_eq!(
+            first_pull(&MemoryPool::new(Some(1 << 20), None).unwrap()),
+            0
+        );
+        // Unlimited queries filter a refill on all workers ahead of the consumer.
+        assert_eq!(
+            first_pull(&MemoryPool::new(None, None).unwrap()),
+            4 * PIPE_MORSELS_PER_WORKER - 1
+        );
+    }
 }

@@ -4,14 +4,17 @@
 //! collected side, or the right side when the probe operator is streamed
 //! (optimizer places the smaller estimated input on the right). Workers scatter
 //! build morsels into hash partitions and finalise each partition's table with
-//! no insert lock. A single integer column uses a compact range map when keys
-//! sit in a tight span, otherwise a cheap hash map. Unique i64 keys probe
-//! with a direct index. Other join types probe left and build right. Inner
-//! probe ranges run on `Session::workers` threads. Null keys never match.
-//! Non-equality conjuncts are a residual filter on candidate pairs. Joins
-//! without an equality key (including CROSS) use a nested loop. LEFT SEMI /
-//! ANTI emit the left schema only. Under a memory limit, inner equi-joins
-//! hash-partition both sides and join each partition once.
+//! no insert lock; a single integer key in a dense span skips partitioning
+//! and builds one direct index. A single integer column uses a compact range
+//! map when keys sit in a tight span, otherwise a cheap hash map. Unique i64
+//! keys probe with a direct index. Probe batches are never rewritten: only
+//! matched rows are gathered. Other join types probe left and build right.
+//! Inner probe ranges run on `Session::workers` threads. Null keys never
+//! match. Non-equality conjuncts are a residual filter on candidate pairs.
+//! Joins without an equality key (including CROSS) use a nested loop. LEFT
+//! SEMI / ANTI emit the left schema only. Under a memory limit, an inner
+//! equi-join whose build side stays in memory streams the probe side; when
+//! the build spills, both sides hash-partition and each partition joins once.
 
 use std::hash::Hash;
 use std::sync::Mutex;
@@ -58,8 +61,35 @@ pub(super) fn run(
     cancel: &CancelToken,
     workers: usize,
 ) -> Result<Vec<Batch>> {
-    if !pool.has_limit() && spec.join_type == JoinType::Inner {
-        return hash_join_stream_probe(left, right, &spec, policy, workers, pool, cancel);
+    if spec.join_type == JoinType::Inner {
+        if !pool.has_limit() {
+            return hash_join_stream_probe(left, right, &spec, policy, workers, pool, cancel);
+        }
+        // Under a limit, collect the build (right) side first. When it stays
+        // in memory, stream the probe side through it rather than collecting
+        // and concatenating the whole probe input.
+        let right_chunks = collect_chunks(&mut right, spec.right_schema.clone(), pool, cancel)?;
+        let split = match spec.on {
+            Some(pred) => split_equi(pred, spec.left_schema.fields().len())?,
+            None => EquiSplit {
+                keys: Vec::new(),
+                residual: None,
+            },
+        };
+        if !split.keys.is_empty() && !chunks_on_disk(&right_chunks) {
+            let build = take_batches(right_chunks, spec.right_schema.clone(), pool)?;
+            return stream_probe(left, &build, &split, &spec, policy, workers, pool, cancel);
+        }
+        let left_chunks = collect_chunks(&mut left, spec.left_schema.clone(), pool, cancel)?;
+        return inner_chunks(
+            left_chunks,
+            right_chunks,
+            &spec,
+            policy,
+            workers,
+            pool,
+            cancel,
+        );
     }
     let left_chunks = collect_chunks(&mut left, spec.left_schema.clone(), pool, cancel)?;
     let right_chunks = collect_chunks(&mut right, spec.right_schema.clone(), pool, cancel)?;
@@ -78,25 +108,6 @@ pub(super) fn run(
     ) {
         return semi_anti_chunks(&left_chunks, &right_chunks, &spec, policy, pool);
     }
-    if spec.join_type == JoinType::Inner {
-        if spilled {
-            return partitioned_inner_join(
-                left_chunks,
-                right_chunks,
-                &spec,
-                policy,
-                workers,
-                pool,
-                cancel,
-            );
-        }
-        let left = take_batches(left_chunks, spec.left_schema.clone(), pool)?;
-        let right = take_batches(right_chunks, spec.right_schema.clone(), pool)?;
-        if left.len() == 1 && right.len() == 1 {
-            return join_pair(&left[0], &right[0], &spec, policy, workers, pool, cancel);
-        }
-        return hash_join_streamed(&left, &right, &spec, policy, workers, pool, cancel);
-    }
     // Unmatched rows for LEFT/RIGHT/FULL are relative to the whole opposite
     // side. Concatenate once, then emit unmatched rows a single time.
     let left = concat_chunk(
@@ -110,6 +121,37 @@ pub(super) fn run(
         pool,
     )?;
     join_pair(&left, &right, &spec, policy, workers, pool, cancel)
+}
+
+/// Inner join over both collected sides: hash partitions when either side
+/// spilled, otherwise one in-memory build.
+#[allow(clippy::too_many_arguments)]
+fn inner_chunks(
+    left_chunks: Vec<Chunk>,
+    right_chunks: Vec<Chunk>,
+    spec: &JoinSpec<'_>,
+    policy: &BatchPolicy,
+    workers: usize,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Vec<Batch>> {
+    if chunks_on_disk(&left_chunks) || chunks_on_disk(&right_chunks) {
+        return partitioned_inner_join(
+            left_chunks,
+            right_chunks,
+            spec,
+            policy,
+            workers,
+            pool,
+            cancel,
+        );
+    }
+    let left = take_batches(left_chunks, spec.left_schema.clone(), pool)?;
+    let right = take_batches(right_chunks, spec.right_schema.clone(), pool)?;
+    if left.len() == 1 && right.len() == 1 {
+        return join_pair(&left[0], &right[0], spec, policy, workers, pool, cancel);
+    }
+    hash_join_streamed(&left, &right, spec, policy, workers, pool, cancel)
 }
 
 /// Inner join whose output is aggregated immediately so the wide join
@@ -970,6 +1012,13 @@ struct PartTable {
     table: BuildTable,
 }
 
+#[cfg(test)]
+impl Drop for PartTable {
+    fn drop(&mut self) {
+        JOIN_EVENTS.with(|e| e.borrow_mut().push("drop_build"));
+    }
+}
+
 /// Upper bound on the per-worker partial sums of a parallel float-SUM fold.
 const F64_SUM_PARTIALS_MAX_BYTES: usize = 256 * 1024 * 1024;
 
@@ -1002,7 +1051,10 @@ fn parallel_build(
     cancel: &CancelToken,
 ) -> Result<Vec<Option<PartTable>>> {
     let n_rows: usize = build_batches.iter().map(Batch::num_rows).sum();
-    let npart = build_partition_count(workers, n_rows);
+    let mut npart = build_partition_count(workers, n_rows);
+    if npart > 1 && dense_int_build(build_batches, key_exprs, probe_key_sample)? {
+        npart = 1;
+    }
     partitioned_build(
         build_batches,
         key_exprs,
@@ -1013,6 +1065,51 @@ fn parallel_build(
         pool,
         cancel,
     )
+}
+
+/// A single integer build key whose span is dense enough for a direct
+/// index (`dense_len`). One such table builds in one pass and probes by array
+/// index, which beats hash partitions however large the build side is.
+fn dense_int_build(
+    build_batches: &[Batch],
+    key_exprs: &[Expr],
+    probe_key_sample: &[ArrayRef],
+) -> Result<bool> {
+    let ([key], [probe]) = (key_exprs, probe_key_sample) else {
+        return Ok(false);
+    };
+    let mut span: Option<(i128, i128)> = None;
+    let mut count = 0usize;
+    for batch in build_batches {
+        let col = key.eval(batch)?;
+        if col.data_type() != probe.data_type() {
+            return Ok(false);
+        }
+        let bounds = match col.data_type() {
+            DataType::Int64 => int_bounds::<Int64Type>(col.as_primitive()),
+            DataType::Int32 => int_bounds::<Int32Type>(col.as_primitive()),
+            DataType::UInt64 => int_bounds::<UInt64Type>(col.as_primitive()),
+            DataType::UInt32 => int_bounds::<UInt32Type>(col.as_primitive()),
+            _ => return Ok(false),
+        };
+        count += col.len() - col.null_count();
+        if let Some((lo, hi)) = bounds {
+            span = Some(match span {
+                Some((min, max)) => (min.min(lo), max.max(hi)),
+                None => (lo, hi),
+            });
+        }
+    }
+    Ok(span.is_some_and(|(min, max)| dense_len(min, max, count, false).is_some()))
+}
+
+fn int_bounds<T: ArrowPrimitiveType>(arr: &PrimitiveArray<T>) -> Option<(i128, i128)>
+where
+    T::Native: IntKey,
+{
+    let min = arrow::compute::min(arr)?.as_i128();
+    let max = arrow::compute::max(arr)?.as_i128();
+    Some((min, max))
 }
 
 /// Build `npart` hash partitions of the build side on up to `workers` threads.
@@ -1187,38 +1284,72 @@ fn probe_parts(
             pool,
         );
     }
+    // Probe each row against its partition's table in place and keep the
+    // matches as (probe row, build row) pairs per partition. The probe batch
+    // is never scattered; only matched rows are gathered, once, for output.
+    // Output stays grouped by partition, probe order within a partition.
     let probe_keys: Vec<ArrayRef> = probe_key_exprs
         .iter()
         .map(|e| e.eval(probe))
         .collect::<Result<_>>()?;
-    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); npart];
+    let mut matches: Vec<(Vec<u32>, Vec<u32>)> = vec![(Vec::new(), Vec::new()); npart];
     for row in 0..probe.num_rows() {
         if row_has_null(&probe_keys, row) {
             continue;
         }
-        let h = hash_row(&probe_keys, row)?;
-        buckets[partition_bucket(h, npart, 0)].push(row as u32);
-    }
-    let mut out = Vec::new();
-    for (i, idx) in buckets.into_iter().enumerate() {
-        if idx.is_empty() {
-            continue;
-        }
-        let Some(part) = parts[i].as_ref() else {
+        let p = partition_bucket(hash_row(&probe_keys, row)?, npart, 0);
+        let Some(part) = parts[p].as_ref() else {
             continue;
         };
-        let probe_part = take_left(probe, &idx, probe.schema(), pool)?;
-        out.extend(probe_inner_batch(
-            &part.table,
-            &part.batch,
-            &probe_part,
-            &key_refs,
-            residual,
-            build_left,
-            schema.clone(),
-            policy,
-            pool,
-        )?);
+        let (probe_rows, build_rows) = &mut matches[p];
+        part.table.for_matches(&probe_keys, row, |brow| {
+            let keep = match residual {
+                None => true,
+                Some(_) if build_left => {
+                    residual_ok(&part.batch, probe, brow as usize, row, residual, pool)?
+                }
+                Some(_) => residual_ok(probe, &part.batch, row, brow as usize, residual, pool)?,
+            };
+            if keep {
+                probe_rows.push(row as u32);
+                build_rows.push(brow);
+            }
+            Ok(true)
+        })?;
+    }
+    let mut out = Vec::new();
+    for (p, (probe_rows, build_rows)) in matches.into_iter().enumerate() {
+        if probe_rows.is_empty() {
+            continue;
+        }
+        let Some(part) = parts[p].as_ref() else {
+            continue;
+        };
+        let joined = if build_left {
+            hconcat_take(
+                &part.batch,
+                probe,
+                &build_rows,
+                &probe_rows,
+                schema.clone(),
+                pool,
+            )?
+        } else {
+            hconcat_take(
+                probe,
+                &part.batch,
+                &probe_rows,
+                &build_rows,
+                schema.clone(),
+                pool,
+            )?
+        };
+        out.extend(
+            joined
+                .split_by_policy(policy)
+                .into_iter()
+                .filter(|b| b.num_rows() > 0),
+        );
     }
     Ok(out)
 }
@@ -1360,11 +1491,63 @@ fn hash_join_stream_probe(
     }
     let right_chunks = collect_chunks(&mut right, spec.right_schema.clone(), pool, cancel)?;
     let build_batches = take_batches(right_chunks, spec.right_schema.clone(), pool)?;
+    stream_probe(
+        left,
+        &build_batches,
+        &split,
+        spec,
+        policy,
+        workers,
+        pool,
+        cancel,
+    )
+}
+
+/// Build one table set from the collected right side, then probe left
+/// morsels in groups as the left operator yields them. The probe side is
+/// never collected or concatenated; only matched rows are gathered.
+///
+/// Under a memory limit the build side and every retained probe batch hold
+/// pool reservations. A group is probed early when the next batch does not
+/// fit, which releases its reservations. When a batch still does not fit,
+/// the rest of the probe side takes the collected path ([`collect_chunks`]),
+/// which spills or refuses an oversized batch.
+#[allow(clippy::too_many_arguments)]
+fn stream_probe(
+    mut left: Box<dyn Operator>,
+    build_batches: &[Batch],
+    split: &EquiSplit,
+    spec: &JoinSpec<'_>,
+    policy: &BatchPolicy,
+    workers: usize,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Vec<Batch>> {
+    let limited = pool.has_limit();
+    let build_held = if limited {
+        match pool.try_reserve(build_batches.iter().map(batch_bytes).sum()) {
+            Ok(r) => Some(r),
+            Err(_) => {
+                return collected_probe(
+                    left,
+                    None,
+                    build_batches,
+                    spec,
+                    policy,
+                    workers,
+                    pool,
+                    cancel,
+                );
+            }
+        }
+    } else {
+        None
+    };
     let right_keys: Vec<Expr> = split.keys.iter().map(|(_, r)| r.clone()).collect();
     let left_keys: Vec<Expr> = split.keys.iter().map(|(l, _)| l.clone()).collect();
     let probe_sample = key_sample(spec.left_schema.clone(), &left_keys)?;
     let parts = parallel_build(
-        &build_batches,
+        build_batches,
         &right_keys,
         spec.right_schema.clone(),
         &probe_sample,
@@ -1374,36 +1557,121 @@ fn hash_join_stream_probe(
     )?;
     let npart = parts.len();
     let residual = split.residual.as_ref();
+    let probe_group = |group: &[Batch]| {
+        probe_group_parallel(
+            &parts,
+            npart,
+            group,
+            &left_keys,
+            residual,
+            false,
+            spec.schema.clone(),
+            policy,
+            workers,
+            pool,
+            cancel,
+        )
+    };
     let mut out = Vec::new();
     let group_rows = workers.max(1) * PROBE_ROWS_PER_WORKER;
     let mut group = Vec::new();
+    let mut held: Vec<super::memory::Reservation<'_>> = Vec::new();
     let mut gathered = 0;
-    loop {
+    // A probe batch that does not fit beside the build ends the streamed
+    // probe; it and the rest of `left` take the collected path below.
+    let pending = loop {
         let probe = left.next_batch(cancel)?;
         let done = probe.is_none();
         if let Some(probe) = probe {
+            if limited {
+                let sz = batch_bytes(&probe);
+                let r = match pool.try_reserve(sz) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        if !group.is_empty() {
+                            out.extend(probe_group(&group)?);
+                            group.clear();
+                            held.clear();
+                            gathered = 0;
+                        }
+                        match pool.try_reserve(sz) {
+                            Ok(r) => r,
+                            Err(_) => break probe,
+                        }
+                    }
+                };
+                held.push(r);
+            }
             gathered += probe.num_rows();
             group.push(probe);
         }
         if !group.is_empty() && (done || gathered >= group_rows) {
-            out.extend(probe_group_parallel(
-                &parts,
-                npart,
-                &group,
-                &left_keys,
-                residual,
-                false,
-                spec.schema.clone(),
-                policy,
-                workers,
-                pool,
-                cancel,
-            )?);
+            out.extend(probe_group(&group)?);
             group.clear();
+            held.clear();
             gathered = 0;
         }
         if done {
             return Ok(out);
+        }
+    };
+    // Release this table set before the collected path builds its own.
+    drop(parts);
+    drop(build_held);
+    out.extend(collected_probe(
+        left,
+        Some(pending),
+        build_batches,
+        spec,
+        policy,
+        workers,
+        pool,
+        cancel,
+    )?);
+    Ok(out)
+}
+
+/// Finish a memory-limited inner join on the collected path: `first` and the
+/// rest of `left` are collected (spilling or refusing as [`collect_chunks`]
+/// does) and joined against the build side.
+#[allow(clippy::too_many_arguments)]
+fn collected_probe(
+    left: Box<dyn Operator>,
+    first: Option<Batch>,
+    build_batches: &[Batch],
+    spec: &JoinSpec<'_>,
+    policy: &BatchPolicy,
+    workers: usize,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Vec<Batch>> {
+    #[cfg(test)]
+    JOIN_EVENTS.with(|e| e.borrow_mut().push("collected_probe"));
+    let mut rest = Prepend { first, rest: left };
+    let left_chunks = collect_chunks(&mut rest, spec.left_schema.clone(), pool, cancel)?;
+    let right_chunks = build_batches.iter().cloned().map(Chunk::Mem).collect();
+    inner_chunks(
+        left_chunks,
+        right_chunks,
+        spec,
+        policy,
+        workers,
+        pool,
+        cancel,
+    )
+}
+
+/// Yields `first`, then every batch of `rest`.
+struct Prepend {
+    first: Option<Batch>,
+    rest: Box<dyn Operator>,
+}
+
+impl Operator for Prepend {
+    fn next_batch(&mut self, cancel: &CancelToken) -> Result<Option<Batch>> {
+        match self.first.take() {
+            Some(batch) => Ok(Some(batch)),
+            None => self.rest.next_batch(cancel),
         }
     }
 }
@@ -3687,5 +3955,231 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn one_i64_batch(name: &str, values: impl IntoIterator<Item = i64>) -> Batch {
+        use std::sync::Arc;
+
+        use arrow::datatypes::{Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, true)]));
+        Batch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(values))]).unwrap()
+    }
+
+    fn pair_rows(batches: &[Batch]) -> Vec<(i64, i64)> {
+        let mut rows: Vec<(i64, i64)> = batches
+            .iter()
+            .flat_map(|b| {
+                let l = b.column(0).as_primitive::<Int64Type>().clone();
+                let r = b.column(1).as_primitive::<Int64Type>().clone();
+                (0..b.num_rows()).map(move |i| (l.value(i), r.value(i)))
+            })
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    #[test]
+    fn partitioned_probe_gathers_matches_without_copying_the_probe() {
+        use std::sync::Arc;
+
+        use arrow::datatypes::{Field, Schema};
+
+        let build = one_i64_batch("b", (0..64).map(|i| i * 1_000));
+        let probe = one_i64_batch("p", 0..64_000);
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("p", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let keys = [Expr::nth(0)];
+        let sample = key_sample(probe.schema(), &keys).unwrap();
+        // Residual `b >= 32000` keeps the upper half of the matches.
+        let residual = Expr::Binary(
+            BinaryOp::GtEq,
+            Box::new(Expr::nth(1)),
+            Box::new(Expr::Literal(Arc::new(Int64Array::from(vec![32_000])))),
+        );
+        let probe_with = |npart: usize, residual: Option<&Expr>| {
+            let pool = MemoryPool::new(None, None).unwrap();
+            let parts = partitioned_build(
+                std::slice::from_ref(&build),
+                &keys,
+                build.schema(),
+                &sample,
+                2,
+                npart,
+                &pool,
+                &CancelToken::new(),
+            )
+            .unwrap();
+            let out = probe_parts(
+                &parts,
+                npart,
+                &probe,
+                &keys,
+                residual,
+                false,
+                out_schema.clone(),
+                &BatchPolicy::default(),
+                &pool,
+            )
+            .unwrap();
+            (pair_rows(&out), pool.copied())
+        };
+        let expected: Vec<(i64, i64)> = (0..64).map(|i| (i * 1_000, i * 1_000)).collect();
+        let (one, _) = probe_with(1, None);
+        assert_eq!(one, expected);
+        let (split, copied) = probe_with(4, None);
+        assert_eq!(split, expected);
+        let (filtered, _) = probe_with(4, Some(&residual));
+        assert_eq!(filtered, expected[32..]);
+        // Scattering the build and gathering 64 matched rows copy far less
+        // than the 64,000-row probe batch would.
+        assert!(copied < batch_bytes(&probe) / 4, "copied {copied} bytes");
+    }
+
+    #[test]
+    fn dense_integer_builds_skip_hash_partitions() {
+        let rows = PARTITIONED_BUILD_MIN_ROWS as i64;
+        let keys = [Expr::nth(0)];
+        let parts_for = |values: Vec<i64>| {
+            let build = one_i64_batch("k", values);
+            let sample = key_sample(build.schema(), &keys).unwrap();
+            let pool = MemoryPool::new(None, None).unwrap();
+            parallel_build(
+                std::slice::from_ref(&build),
+                &keys,
+                build.schema(),
+                &sample,
+                8,
+                &pool,
+                &CancelToken::new(),
+            )
+            .unwrap()
+        };
+        // Every fourth key of a span: one direct-index table.
+        let dense = parts_for((0..rows).map(|i| i * 4).collect());
+        assert_eq!(dense.len(), 1);
+        assert!(
+            dense[0]
+                .as_ref()
+                .unwrap()
+                .table
+                .unique_i64_slots()
+                .is_some()
+        );
+        // Keys 1,000 apart are too sparse for a direct index: hash partitions.
+        let sparse = parts_for((0..rows).map(|i| i * 1_000).collect());
+        assert_eq!(sparse.len(), 8);
+    }
+
+    /// Inner-join `probe` against keys 0..16 under `cap` bytes, with a spill
+    /// directory when `spill`. Returns the result and the pool's peak and
+    /// spilled bytes.
+    fn limited_join(
+        probe: Vec<Batch>,
+        cap_extra: u64,
+        spill: bool,
+    ) -> (Result<Vec<Batch>>, u64, u64, u64) {
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use arrow::datatypes::{Field, Schema};
+
+        let build = one_i64_batch("b", 0..16);
+        let join_schema = Arc::new(Schema::new(vec![
+            Field::new("p", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let cap = batch_bytes(&build) + cap_extra;
+        let root = std::env::temp_dir().join(format!(
+            "mizuchi-join-stream-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = MemoryPool::new(Some(cap), spill.then(|| root.clone())).unwrap();
+        let on = Expr::Binary(BinaryOp::Eq, Box::new(Expr::nth(0)), Box::new(Expr::nth(1)));
+        let left_schema = probe[0].schema();
+        let joined = run(
+            Box::new(Exec::Scan {
+                batches: probe,
+                index: 0,
+            }),
+            Box::new(Exec::Scan {
+                batches: vec![build.clone()],
+                index: 0,
+            }),
+            JoinSpec {
+                join_type: JoinType::Inner,
+                on: Some(&on),
+                left_schema,
+                right_schema: build.schema(),
+                schema: join_schema,
+            },
+            &BatchPolicy::default(),
+            &pool,
+            &CancelToken::new(),
+            2,
+        );
+        let (peak, spilled) = (pool.peak(), pool.spilled());
+        drop(pool);
+        let _ = std::fs::remove_dir_all(&root);
+        (joined, cap, peak, spilled)
+    }
+
+    #[test]
+    fn memory_limited_inner_join_streams_probe_groups_within_the_cap() {
+        let probe: Vec<Batch> = (0..8)
+            .map(|i| one_i64_batch("p", i * 1_000..(i + 1) * 1_000))
+            .collect();
+        // Room for the build side and two probe batches, not all eight.
+        let (joined, cap, peak, spilled) =
+            limited_join(probe.clone(), 2 * batch_bytes(&probe[0]), true);
+        assert_eq!(
+            pair_rows(&joined.unwrap()),
+            (0..16).map(|k| (k, k)).collect::<Vec<_>>()
+        );
+        assert_eq!(spilled, 0, "the probe side was collected and spilled");
+        assert!(peak <= cap, "peak {peak} over cap {cap}");
+        assert!(
+            peak >= batch_bytes(&probe[0]) * 2,
+            "probe batches were not reserved: peak {peak}"
+        );
+    }
+
+    #[test]
+    fn memory_limited_inner_join_refuses_an_oversized_probe_batch() {
+        let probe = vec![one_i64_batch("p", 0..10_000)];
+        let small = batch_bytes(&probe[0]) / 4;
+        for spill in [true, false] {
+            let (joined, cap, peak, _) = limited_join(probe.clone(), small, spill);
+            match joined {
+                Err(Error::Memory(msg)) => {
+                    if spill {
+                        assert!(msg.contains("single join batch"), "{msg}");
+                    }
+                }
+                other => panic!("expected a memory error, got {:?}", other.map(|b| b.len())),
+            }
+            assert!(peak <= cap, "peak {peak} over cap {cap}");
+        }
+    }
+
+    #[test]
+    fn collected_fallback_drops_the_streamed_build_first() {
+        let probe = vec![one_i64_batch("p", 0..10_000)];
+        let small = batch_bytes(&probe[0]) / 4;
+        JOIN_EVENTS.with(|e| e.borrow_mut().clear());
+        let (joined, _, _, _) = limited_join(probe, small, true);
+        assert!(matches!(joined, Err(Error::Memory(_))));
+        let events = JOIN_EVENTS.with(|e| e.borrow().clone());
+        let pos = |name| events.iter().position(|e| *e == name);
+        let fallback = pos("collected_probe").expect("collected path ran");
+        let dropped = pos("drop_build").expect("streamed build dropped");
+        assert!(dropped < fallback, "both table sets were alive: {events:?}");
     }
 }
