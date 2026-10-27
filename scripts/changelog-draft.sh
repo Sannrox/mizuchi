@@ -9,9 +9,9 @@
 #
 # Added = feat, Fixed = fix, Changed = refactor and perf. Other types appear
 # only under Breaking. A change is breaking for a `type!:` subject, a
-# `BREAKING CHANGE:` or `Breaking:` body line, or the risk:breaking label; it
-# needs an upgrade note for an `Upgrade:` body line or the risk:migration
-# label. Labels are read with gh.
+# `BREAKING CHANGE:` or `Breaking:` body line, a `Breaking` heading, or the
+# risk:breaking label; it needs an upgrade note for an `Upgrade:` body line,
+# an `Upgrade` heading, or the risk:migration label. Labels are read with gh.
 set -euo pipefail
 
 version="${1:?usage: scripts/changelog-draft.sh VERSION [SINCE]}"
@@ -42,16 +42,19 @@ for sha in $(git log --first-parent --reverse --format=%H "${since}..origin/main
   line="- ${subject}"$'\n'
 
   # A body note replaces the subject line in Breaking or Upgrade.
-  note="$(sed -nE 's/^(BREAKING CHANGE|Breaking): *(.+)$/\2/p' <<<"${body}" | head -n 1)"
+  # A `## Breaking` / `## Upgrade` heading lists the subject line.
+  note="$(sed -nE 's/^(BREAKING[ -]CHANGE|Breaking): *(.+)$/\2/p' <<<"${body}" | head -n 1)"
   if [[ -n "${note}" ]]; then
     breaking+="- ${note}${pr:+ (#${pr})}"$'\n'
-  elif [[ -n "${bang}" || (-n "${pr}" && "${breaking_prs}" == *" ${pr} "*) ]]; then
+  elif [[ -n "${bang}" || (-n "${pr}" && "${breaking_prs}" == *" ${pr} "*) ]] ||
+    grep -qE '^#+ *Breaking' <<<"${body}"; then
     breaking+="${line}"
   fi
   note="$(sed -nE 's/^Upgrade: *(.+)$/\1/p' <<<"${body}" | head -n 1)"
   if [[ -n "${note}" ]]; then
     upgrade+="- ${note}${pr:+ (#${pr})}"$'\n'
-  elif [[ -n "${pr}" && "${migration_prs}" == *" ${pr} "* ]]; then
+  elif [[ -n "${pr}" && "${migration_prs}" == *" ${pr} "* ]] ||
+    grep -qE '^#+ *Upgrade' <<<"${body}"; then
     upgrade+="${line}"
   fi
 
