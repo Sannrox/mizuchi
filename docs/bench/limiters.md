@@ -94,7 +94,10 @@ rows; a min/max range only skips morsels whose key range cannot match, since
 filtering rows by a wide range copies most of the probe side for little gain
 (#164). In-memory scans check one vectorised min/max per morsel and key;
 Parquet footer prune treats IN-list as OR.
-Null keys never match. Inner probe ranges run on worker threads.
+Null keys never match. Inner probe ranges run on worker threads. A large
+build side on one integer key whose span is dense enough for a direct index
+builds that one index instead of hash partitions, and a scan pipeline that
+feeds a build or a streamed probe filters its morsels on all workers (#168).
 
 ### Copies
 
@@ -107,6 +110,15 @@ concatenated on the unbounded path, so a multi-morsel probe paid a full
 rewrite. Grouping keys still allocate `Scalar` on insert. Spill reload
 clones again. Filter/project emit new batches from Arrow compute; those
 copies are smaller than a full probe rewrite on q3/store_sales.
+A partitioned probe looks each row up in its partition in place and
+gathers only matched rows; it no longer scatters the probe batch first.
+Under a memory limit, an inner join whose build side stays in memory
+streams the probe side, reserving each retained probe batch, instead of
+collecting and concatenating it. A memory-limited ORDER BY ... LIMIT keeps
+a running top-k: each input batch is charged only while it is merged, and
+the kept rows are copied out of it. The q3 SF10 profile peak, which was a
+top-10 sort holding every slice of its 1M-group input and charging each for
+the whole parent, drops from 7.84 GB to 127 MB (#168).
 
 ### Scheduling
 
