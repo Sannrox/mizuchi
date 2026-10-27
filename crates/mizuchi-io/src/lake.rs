@@ -976,6 +976,11 @@ fn write_iceberg_io(
         Some(c) if mode == WriteMode::Append => c.schema.clone(),
         _ => schema,
     };
+    // Reject unsupported types before writing anything, so a refused write
+    // leaves no manifest for the next write's snapshot id to collide with.
+    for f in schema.fields() {
+        iceberg_type(f.data_type())?;
+    }
     let data_rel = unique_data_rel(next_ver, "data/");
     let size = io.write_parquet(&data_rel, batches, &schema, &physical)?;
     let mut files = match (mode, &current) {
@@ -2024,6 +2029,10 @@ mod tests {
         assert!(matches!(err, Error::UnsupportedType(_)), "{err:?}");
         let err = write_iceberg(&dest, &[batch], WriteMode::Overwrite).unwrap_err();
         assert!(matches!(err, Error::UnsupportedType(_)), "{err:?}");
+        assert!(
+            !dest.join("metadata").exists() && !dest.join("data").exists(),
+            "a rejected Iceberg write must not leave files"
+        );
         let i8_schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int8, true)]));
         let i8_batch = Batch::try_new(
             i8_schema,
