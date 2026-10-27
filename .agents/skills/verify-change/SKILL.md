@@ -26,7 +26,7 @@ Run the narrowest useful checks first, then expand according to change risk.
    | dependency pins (arrow, parquet, sqlparser) | `Cargo.lock` diff reviewed; the pinned tag exists upstream; upstream release notes read |
    | runtime image / Python packages | image builds; package set matches the documented policy |
    | configuration | parsing/default tests and the docs that describe the setting |
-   | docs/templates/Skills | links and commands where practical; `bash scripts/validate-workflow-skills.sh` |
+   | docs/templates/Skills | links and commands where practical; `bash scripts/validate-workflow-skills.sh`; `python3 scripts/adr-index.py --check` for decision records |
 
 3. Before ship-level handoff, run the same gates as CI
    (`.github/workflows/ci.yml`) unless the user explicitly requested a
@@ -38,6 +38,7 @@ Run the narrowest useful checks first, then expand according to change risk.
    cargo clippy --locked --workspace --all-targets --exclude mizuchi-flight -- -D warnings
    cargo test --locked --workspace --exclude mizuchi-flight
    bash scripts/validate-workflow-skills.sh
+   python3 scripts/adr-index.py --check
    ```
 
    CI is the source of truth for the command set; if it changes, follow it and
