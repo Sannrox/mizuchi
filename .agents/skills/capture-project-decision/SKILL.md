@@ -27,7 +27,8 @@ Promote the durable result, not the conversation that produced it.
    the same rule is not maintained in multiple prose locations.
 4. For an ADR, follow the template in `docs/decisions/README.md` (context,
    decision, consequences, rejected alternatives), allocate the next number,
-   include the source links, and update the index in `docs/decisions/README.md`. Supersede by
+   include the source links, and regenerate the index with
+   `python3 scripts/adr-index.py` (never edit it by hand). Supersede by
    adding a new ADR and cross-linking both; retain historical text. Complete
    when status and relationships are explicit.
 5. Check links, examples, Skill metadata, and affected indexes. Complete when a

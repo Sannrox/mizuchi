@@ -51,12 +51,15 @@ cargo build --locked --workspace --all-targets --exclude mizuchi-flight
 cargo clippy --locked --workspace --all-targets --exclude mizuchi-flight -- -D warnings
 cargo test --locked --workspace --exclude mizuchi-flight
 bash scripts/validate-workflow-skills.sh
+python3 scripts/adr-index.py --check
 ```
 
 - `cargo fmt --all` formats before review.
 - `cargo clippy ... -D warnings` is required for ship-level local gates.
 - `scripts/validate-workflow-skills.sh` checks that the delivery Skills and
   this file stay linked.
+- `scripts/adr-index.py --check` fails when the decision index in
+  `docs/decisions/README.md` is stale; without `--check` it rewrites it.
 
 There is no Makefile yet. When one is added, its targets become the source of
 truth for these commands and this section must point to them.
