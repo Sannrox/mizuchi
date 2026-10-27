@@ -32,7 +32,9 @@ GitHub state unless the maintainer explicitly authorizes that action.
    security checks when access is available; when CI cannot run, say so and
    rely on recorded local evidence for the target commit. Complete when
    evidence is current for the target commit.
-5. Draft concise user-facing release notes and update `CHANGELOG.md`. Put upgrade and consumer actions before internal
+5. Run `scripts/changelog-draft.sh <version>` for the pull requests merged since
+   the last tag, edit it into concise user-facing notes, and commit it as the
+   version section of `CHANGELOG.md` (pull requests never edit it). Put upgrade and consumer actions before internal
    implementation detail. Release notes describe versions and behavior, never
    hostnames, FQDNs, IP addresses, home directories, absolute worktree paths,
    LAN or employer network names, deployment or environment state, image or

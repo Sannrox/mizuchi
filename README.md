@@ -110,7 +110,8 @@ dry-run job are [ADR 0007](docs/decisions/0007-api-stability-and-releases.md).
 The `mizuchi` crate is packagable (`publish = true`); the Python cdylib
 stays `publish = false` and ships as a wheel.
 
-1. Move `CHANGELOG.md` Unreleased notes into a versioned section.
+1. Run `scripts/changelog-draft.sh <version>`, edit the section it prints
+   from the merged pull requests, and commit it to `CHANGELOG.md`.
 2. Tag `v<version>` on `main` (0.1 is experimental).
 3. Wait for `.github/workflows/release.yml` on that tag (or
    `workflow_dispatch`): `cargo publish --locked --dry-run -p mizuchi`

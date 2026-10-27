@@ -45,7 +45,8 @@ in the next 0.y.
 
 ### Releases
 
-1. Move `CHANGELOG.md` Unreleased notes into a versioned section.
+1. Commit the version section to `CHANGELOG.md`, drafted from the
+   merged pull requests (see the amendment below).
 2. Tag `v<version>` on `main`.
 3. CI on that tag (and `workflow_dispatch`) packages every published
    workspace crate and dry-runs `cargo publish` for `mizuchi-core` (no
@@ -62,6 +63,16 @@ The `mizuchi` crate may be packaged (`publish = true`) with license,
 readme, repository, and keywords. The Python cdylib crate stays
 `publish = false`; it ships as a wheel. Tag `v0.1.0` only after the
 dry-run job on that tag is green; 0.1 is experimental.
+
+### Amendment (2026-10-27): release-owned changelog
+
+Pull requests no longer edit `CHANGELOG.md`; concurrent lanes kept
+conflicting on it. The squash commit (pull request title and body)
+carries the change note, with `Breaking:` / `Upgrade:` body lines and
+the `risk:breaking` / `risk:migration` labels for breaks and upgrades.
+Release prep runs `scripts/changelog-draft.sh <version>`, which groups
+the pull requests merged since the last `v*` tag, and commits the
+section. SemVer and the rest of this decision are unchanged.
 
 ## Consequences
 
