@@ -56,19 +56,91 @@ python3 scripts/adr-index.py --check
 
 - `cargo fmt --all` formats before review.
 - `cargo clippy ... -D warnings` is required for ship-level local gates.
-- `scripts/validate-workflow-skills.sh` checks that the delivery Skills and
-  this file stay linked.
+- `scripts/validate-workflow-skills.sh` checks the shared Skill stubs and the
+  contract headings of this file against agent-kit `main`.
 - `python3 scripts/adr-index.py --check` fails when the decision index in
-  `docs/decisions/README.md` is stale; without `--check` it rewrites it.
+  `docs/decisions/README.md` is stale; without `--check` it rewrites it. Never
+  edit the index by hand.
 
 There is no Makefile yet. When one is added, its targets become the source of
 truth for these commands and this section must point to them.
 
-GitHub Issues are the planning source of truth. Project-specific Skills live
-under `.agents/skills/`. Read `README.md` and accepted ADRs under
-`docs/decisions/` before changing system boundaries; record new boundaries,
-trust-model changes, and public contracts as ADRs with the
+GitHub Issues are the planning source of truth. Read `README.md` and accepted
+ADRs under `docs/decisions/` before changing system boundaries; record new
+boundaries, trust-model changes, and public contracts as ADRs with the
 `capture-project-decision` Skill.
+
+## Shared agent skills
+
+The workflow Skills (`advance-issue-frontier`, `assess-change-impact`,
+`capture-project-decision`, `deliver-ready-issue`, `prepare-release`,
+`refactor-docs`, `shape-work-item`, `technical-documentation`, `verify-change`)
+and the opt-in `sekai-ontology` Skill are canonical in
+[Sannrox/agent-kit](https://github.com/Sannrox/agent-kit). There is no pin:
+this repository always uses the latest `main`. `.agents/skills/<name>/` holds
+only a generated stub that points to the shared skill; read the installed
+skill under `~/.agents/agent-kit/` (or `$AGENT_KIT_HOME`). Run
+`bash scripts/validate-workflow-skills.sh` to clone or update it.
+
+- Repository-specific facts the shared Skills need come from this file: the
+  ownership, structure, build, parallel-lane and testing sections, plus
+  `## Agent skill profile` below for anything they do not already say. Edit
+  this file, not the stubs.
+- Never edit the stubs or the vendored `scripts/validate-workflow-skills.sh`
+  here; change them upstream in agent-kit, then run
+  `bash scripts/validate-workflow-skills.sh --render` here when CI reports
+  drift.
+- Repository-only Skills live next to the stubs as full folders and stay local.
+
+## Agent skill profile
+
+Facts the shared agent-kit skills read that the sections above do not already
+state.
+
+Feature: a new observable operator or integration outcome.
+
+### Compatibility and failure obligations
+
+- embedding runner and Arrow version pins;
+- partial runs: a crash after output is written but before it is reported, or
+  an adapter losing its claim mid-run;
+- retries owned by the source, not the engine;
+- cleanup of scratch space, processes, memory reservations, and spill files.
+
+### Additional impact boundaries
+
+- the public engine API (SQL entry point, logical plan, DataFrame) and the SQL
+  dialect it accepts;
+- Arrow compatibility: input and output batches stay standard Arrow, and no
+  private memory layout leaks across the API;
+- resource behavior: memory accounting, spill to disk, thread usage, and
+  cancellation, which embedding runners rely on to enforce limits;
+- correctness against reference engines (sqllogictest, benchmark suite);
+- pinned upstream versions: arrow, parquet, sqlparser.
+
+### Verification matrix
+
+Rows beyond `## Testing Guidelines`:
+
+| Surface | Required evidence |
+| --- | --- |
+| SQL, planner, optimizer | sqllogictest and plan snapshot tests; results match a reference engine on the affected queries |
+| staging, hashing, cleanup | deterministic tests: identical inputs give identical hashes; scratch removed on success, failure, and timeout |
+| execution, memory, spill | operator unit tests including spill paths and memory-limit hits; no unbounded allocation |
+| dependency pins (arrow, parquet, sqlparser) | `Cargo.lock` diff reviewed; the pinned tag exists upstream; upstream release notes read |
+| runtime image / Python packages | image builds; package set matches the documented policy |
+| docs, templates, Skills | `bash scripts/validate-workflow-skills.sh`; `python3 scripts/adr-index.py --check` for decision records |
+
+### Release audit
+
+- the version source is the workspace `Cargo.toml`; check it against the
+  lockfile;
+- pinned Arrow, Parquet, and parser versions, and their release notes;
+- public API, SQL dialect, and plan format changes;
+- runtime image contents and the Python package set;
+- release notes: draft with `scripts/changelog-draft.sh <version>` from the
+  Pull Requests merged since the last tag, edit them into user-facing notes,
+  and commit them as the version section of `CHANGELOG.md`.
 
 ## Agent delivery closeout (required)
 
@@ -140,7 +212,7 @@ confirmation, unless the lead of the same parallel run owns the stalled lane.
 
 A lane claims before it implements, under Publish or Land authority or with an
 explicit claim authorization under Implement, using
-`bash .agents/skills/deliver-ready-issue/scripts/issue-lane.sh claim <issue>`:
+`bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh claim <issue>`:
 
 - the branch `<type>/<issue>` is created on GitHub from the default branch by
   an atomic ref creation, so when two machines race exactly one claim
@@ -200,22 +272,23 @@ ancestor of its head; it refreshes onto `main` only for a conflict, a failing
 gate, an explicit request, or a sibling landing on a shared surface, not
 merely because `main` advanced.
 
-Landing is sequential. After each merge, fetch, recompute the frontier, and let
-the remaining lanes recheck `mergeable` against the new `main`. A failed or
-timed-out merge response may still have merged; reconcile the remote state
-before retrying.
+Each lane lands its own reviewed head with `issue-lane.sh land`; lanes may
+watch concurrently, and a lane that conflicts with a sibling's landing stops
+instead of merging. After each merge, fetch, recompute the frontier, and let
+the remaining lanes recheck `mergeable` against the new `main`.
 
 The lead of a parallel run keeps a ledger per lane: Issue, branch, base SHA,
 owner, state, Pull Request, evidence, blockers, and cleanup. Keep hostnames
 and absolute checkout paths in the session with the maintainer, never on
 GitHub. Report verified outcomes, not launched work. The executable lead
-procedure is `.agents/skills/deliver-ready-issue/references/parallel-delivery.md`.
+procedure is `skills/deliver-ready-issue/references/parallel-delivery.md` in
+the installed agent-kit.
 
 ## Ontology Policy
 
 For work involving portable ontology definitions, classes, relations,
 provenance, validation, import, export, or structural queries, always use the
-project-local `sekai-ontology` Skill in `.agents/skills/sekai-ontology/`.
+shared `sekai-ontology` Skill (stub in `.agents/skills/sekai-ontology/`).
 
 Select the ontology database explicitly with `--db <path>` or `SEKAI_DB` when
 the resolved default is not the intended file, then run `sekai --json validate`
@@ -272,30 +345,26 @@ than an environment name, a digest, or a hold).
 
 ### Verified commits on GitHub
 
-Prefer publishing PR branch tips with GitHub-signed commits so GitHub shows
-**Verified**:
+Lane branches are published with GitHub-verified commits and landed through
+the shared lane tool, never with a plain `git push` or a hand-run merge:
 
 1. Implement and commit locally as usual (`commit.gpgsign` may still apply).
-2. Publish the branch tip with `bash scripts/gh-verified-push.sh` instead of a
-   plain `git push` when you want the hosted commit Verified (GraphQL
-   `createCommitOnBranch`). That path creates one server-side commit with the
-   local `HEAD` tree; committer is typically **GitHub**.
-3. New branch:
-   `bash scripts/gh-verified-push.sh --create-branch-from origin/main --branch <topic> --sync-local`
-4. Existing PR branch:
-   `bash scripts/gh-verified-push.sh --branch <topic> --sync-local`
-   (uses the current remote tip as `expectedHeadOid`).
-5. Never pass `--no-gpg-sign` for local commits; if GPG fails, stop and fix it.
-6. After publish, confirm `verification.verified=true` (the script prints this).
+   Never pass `--no-gpg-sign`; if GPG fails, stop and fix it.
+2. Publish from the lane worktree:
+   `bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh push <issue>`.
+   It creates the Verified commit through GraphQL `createCommitOnBranch` and
+   resets the worktree to it, so local `HEAD` is the Pull Request head.
+   Confirm it reports `verification.verified=true`.
+3. Land with
+   `bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh land <issue> --pr <pr>`.
+   It squash-merges with the reviewed head as the precondition, so the land
+   commit on `main` is Verified and history stays linear.
 
-When merging PRs, prefer **squash** (`gh pr merge --squash --delete-branch`) so
-the land commit on `main` is also GitHub-signed/Verified and history stays
-linear. Use `gh pr merge --merge` only when multi-commit history must be kept
-(original SHAs preserved). Avoid GitHub **rebase** merges when Verified history
-matters: rebase-merge rewrites commits and drops signatures. Do not rewrite
-protected `main` after merging unless the user explicitly approves; if
-protection is temporarily relaxed, restore force-push and status-check settings
-immediately after the correction.
+Never queue GitHub auto-merge and avoid GitHub **rebase** merges: rebase-merge
+rewrites commits and drops signatures. Do not rewrite protected `main` after
+merging unless the user explicitly approves; if protection is temporarily
+relaxed, restore force-push and status-check settings immediately after the
+correction.
 
 ## Security & Configuration Tips
 
