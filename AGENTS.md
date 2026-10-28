@@ -58,7 +58,7 @@ python3 scripts/adr-index.py --check
 - `cargo clippy ... -D warnings` is required for ship-level local gates.
 - `scripts/validate-workflow-skills.sh` checks that the delivery Skills and
   this file stay linked.
-- `scripts/adr-index.py --check` fails when the decision index in
+- `python3 scripts/adr-index.py --check` fails when the decision index in
   `docs/decisions/README.md` is stale; without `--check` it rewrites it.
 
 There is no Makefile yet. When one is added, its targets become the source of
