@@ -244,9 +244,9 @@ Local isolation protects lanes that share a machine; it is not a claim.
 - A worktree serves exactly one Issue. Finished lanes are removed; a worktree is
   never reused for a different Issue or renamed to hide its origin.
 - Shared Git state is mutated in short, serialized slots: `git fetch --prune`,
-  worktree creation and removal, local branch deletion, and merging belong to
-  the lead of a parallel run or happen one lane at a time on a shared machine.
-  A lane commits and publishes its own branch from its own worktree; that is
+  worktree creation and removal, and local branch deletion belong to the lead
+  of a parallel run or happen one lane at a time on a shared machine. A lane
+  commits, publishes, and lands its own branch from its own worktree; that is
   not a shared mutation. Nobody holds a slot across implementation, test runs,
   or a remote wait.
 
