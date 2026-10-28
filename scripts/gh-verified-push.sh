@@ -22,14 +22,20 @@
 #   pass --create-branch-from <sha> (usually origin/main) to create the ref first,
 #   then publish the delta from that sha to HEAD.
 #
+# File modes: createCommitOnBranch cannot carry them, so every pushed file lands
+#   as 100644. The script prints one warning per pushed file whose HEAD mode is
+#   100755. Convention: run scripts through their interpreter (sh, bash, python3)
+#   and never make a check require the executable bit.
+#
 # Requires: git, gh, jq, base64
 set -euo pipefail
 
-# Ported from Sannrox/shikigami@331897846885e4a55697b0f1006d03b4f2a7495e scripts/gh-verified-push.sh (verbatim).
-# Compare against the source to detect drift.
+# Canonical source: Sannrox/agent-kit scripts/gh-verified-push.sh. Derived from Sannrox/shikigami@331897846885e4a55697b0f1006d03b4f2a7495e.
+# Optional. Consumers that still want GitHub-signed commits copy it; the
+# consumer check does not require it.
 
 usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-2}"
 }
 
@@ -134,7 +140,12 @@ if [ -z "$body" ]; then
   body=$(git log -1 --format=%b HEAD)
 fi
 
-remote_tip=$(git ls-remote "https://github.com/${repo}.git" "refs/heads/${branch}" 2>/dev/null | awk '{print $1}' || true)
+# The remote tip is only needed to refuse an existing branch or to default
+# --expected-oid; skip the network call otherwise.
+remote_tip=""
+if [ -n "$create_branch_from" ] || [ -z "$expected_oid" ]; then
+  remote_tip=$(git ls-remote "https://github.com/${repo}.git" "refs/heads/${branch}" 2>/dev/null | awk '{print $1}' || true)
+fi
 
 if [ -n "$create_branch_from" ]; then
   create_branch_from=$(git rev-parse "${create_branch_from}^{commit}")
@@ -186,6 +197,18 @@ if [ -n "$merge_commit" ]; then
   echo "GraphQL push cannot preserve merge ancestry; squash or rebase first." >&2
   exit 1
 fi
+
+# Print the pushed paths (added or modified between $1 and $2) whose mode at $2
+# is 100755. createCommitOnBranch publishes them as 100644.
+executable_paths() {
+  local meta fpath new_mode
+  # --raw -z emits ":<old mode> <new mode> <old oid> <new oid> <status>" NUL path NUL.
+  while IFS= read -r -d '' meta && IFS= read -r -d '' fpath; do
+    new_mode=${meta#* }
+    new_mode=${new_mode%% *}
+    if [ "$new_mode" = "100755" ]; then printf '%s\n' "$fpath"; fi
+  done < <(git diff --raw --no-renames -z --diff-filter=AM "$1" "$2")
+}
 
 build_additions() {
   local added_files first fpath tree_entry file_mode file_type file_oid blob_size b64
@@ -260,6 +283,11 @@ echo "  local HEAD:    $head_sha" >&2
 echo "  local tree:    $head_tree" >&2
 echo "  files changed: $changed_count" >&2
 echo "  message:       $message" >&2
+
+while IFS= read -r fpath; do
+  [ -n "$fpath" ] || continue
+  echo "Warning: $fpath is 100755 locally; the remote copy will be 100644. Run it through its interpreter." >&2
+done < <(executable_paths "$base_oid" HEAD)
 
 if [ "$dry_run" = true ]; then
   echo "Dry run only; no remote mutation." >&2
@@ -340,8 +368,8 @@ if [ -n "$new_url" ] && [ "$new_url" != "null" ]; then
 fi
 
 # Confirm hosted blob contents match local HEAD. createCommitOnBranch does not
-# preserve executable mode (100755 becomes 100644), so full tree SHAs can differ
-# even when file contents are identical.
+# preserve executable mode (warned above), so full tree SHAs can differ even
+# when file contents are identical.
 verify_json=$(gh api "repos/${repo}/git/commits/${new_oid}")
 remote_tree=$(printf '%s' "$verify_json" | jq -r .tree.sha)
 if [ "$remote_tree" = "$head_tree" ]; then
@@ -357,12 +385,6 @@ else
     diff -u <(printf '%s\n' "$local_blobs") <(printf '%s\n' "$remote_blobs") >&2 || true
     git update-ref -d refs/gh-verified-push/remote-tip 2>/dev/null || true
     exit 1
-  fi
-  local_modes=$(git ls-tree -r HEAD | awk '{print $1 "\t" $4}' | sort)
-  remote_modes=$(git ls-tree -r refs/gh-verified-push/remote-tip | awk '{print $1 "\t" $4}' | sort)
-  if [ "$local_modes" != "$remote_modes" ]; then
-    echo "Warning: file modes differ (GraphQL createCommitOnBranch stores blobs as 100644)." >&2
-    diff -u <(printf '%s\n' "$local_modes") <(printf '%s\n' "$remote_modes") >&2 || true
   fi
   git update-ref -d refs/gh-verified-push/remote-tip 2>/dev/null || true
   echo "Hosted blob contents match local HEAD." >&2
