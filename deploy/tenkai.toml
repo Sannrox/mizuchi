@@ -1,0 +1,32 @@
+# tenkai product manifest for mizuchi.
+#
+# Deploys a Flight worker from the tagged image. Commands are self-contained
+# (no repo checkout), so this manifest can be published straight from a git
+# tag. The release workflow pushes ghcr.io/sannrox/mizuchi:<version> on v*.
+
+[product]
+name = "mizuchi"
+version = "0.1.0"
+description = "Arrow-native query engine (Flight worker)"
+
+[deploy]
+workdir = "."
+install = """
+set -e
+IMG=ghcr.io/sannrox/mizuchi:0.1.0
+docker pull "$IMG"
+docker rm -f mizuchi-worker >/dev/null 2>&1 || true
+docker run -d --name mizuchi-worker -e MIZUCHI_ALLOW_NETWORK=1 -p 8815:8815 "$IMG" worker --bind 0.0.0.0:8815
+"""
+uninstall = "docker rm -f mizuchi-worker"
+health = """
+for i in $(seq 1 15); do
+  docker inspect -f '{{.State.Running}}' mizuchi-worker 2>/dev/null | grep -qx true && exit 0
+  sleep 1
+done
+exit 1
+"""
+
+[delivery]
+has_migration = false
+changes_identity_config = false

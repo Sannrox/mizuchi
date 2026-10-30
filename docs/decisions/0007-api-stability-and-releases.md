@@ -45,24 +45,29 @@ in the next 0.y.
 
 ### Releases
 
-1. Commit the version section to `CHANGELOG.md`, drafted from the
-   merged pull requests (see the amendment below).
+1. Commit the version section to `CHANGELOG.md` as `## [<version>]`,
+   drafted from the merged pull requests (see the amendment below).
 2. Tag `v<version>` on `main`.
-3. CI on that tag (and `workflow_dispatch`) packages every published
-   workspace crate and dry-runs `cargo publish` for `mizuchi-core` (no
-   unpublished path deps), then builds Python wheels on Linux, macOS,
-   and Windows. A maintainer publishes `mizuchi-core`, `mizuchi-plan`,
-   `mizuchi-io`, `mizuchi-postgres`, `mizuchi-exec`, and `mizuchi` in
-   that order (ADR 0013). `mizuchi-flight` publishes with the Flight
-   feature set.
-4. A maintainer publishes to crates.io and PyPI only after that job is
-   green, using tokens stored as GitHub secrets. The workflow does not
-   upload by default.
+3. CI on that tag packages every published workspace crate, dry-runs
+   `cargo publish` for `mizuchi-core` (no unpublished path deps), and
+   builds Python wheels on Linux, macOS, and Windows. The same workflow
+   writes `SHA256SUMS`, attests those files, and creates a GitHub
+   Release with the crate packages, wheels, checksums, and (on Linux)
+   the Flight container image archive. `workflow_dispatch` packages the
+   same crate and wheel files and does not attest or upload.
+4. The tag also pushes `ghcr.io/sannrox/mizuchi:<version>` (never
+   `latest`). `deploy/tenkai.toml` is the Tenkai product entry for that
+   version.
+5. crates.io and PyPI stay unpublished while any workspace crate pins a
+   git dependency (`sekai-keys` today). A maintainer may publish
+   `mizuchi-core`, then `mizuchi-plan`, `mizuchi-io`, `mizuchi-postgres`,
+   `mizuchi-exec`, and `mizuchi` in that order (ADR 0013) only after
+   those pins are registry crates. `mizuchi-flight` publishes with the
+   Flight feature set. The workflow never uploads to those registries.
 
 The `mizuchi` crate may be packaged (`publish = true`) with license,
 readme, repository, and keywords. The Python cdylib crate stays
-`publish = false`; it ships as a wheel. Tag `v0.1.0` only after the
-dry-run job on that tag is green; 0.1 is experimental.
+`publish = false`; it ships as a wheel. 0.1 is experimental.
 
 ### Amendment (2026-10-27): release-owned changelog
 
@@ -78,7 +83,8 @@ section. SemVer and the rest of this decision are unchanged.
 
 - Callers pin `mizuchi = "0.1"` and expect breaks at 0.2.
 - Default `cargo test` stays offline; the release job is tag/dispatch
-  only.
+  only. A `v*` tag is what produces the GitHub Release; cutting the tag
+  is a maintainer action.
 - #19 can treat the crate-root API as the embedder contract.
 
 ## Rejected alternatives
@@ -87,4 +93,8 @@ section. SemVer and the rest of this decision are unchanged.
 - **Guarantee 1.0 stability now.** The surface is still growing (catalog,
   embedder API, SQL families).
 - **Upload to crates.io/PyPI from every tag without a dry-run.** A bad
-  tag would publish an unbuildable artifact.
+  tag would publish an unbuildable artifact. Git-pinned `sekai-keys`
+  also makes a registry crate unpublishable until that pin is a
+  registry crate.
+- **Keep the tag job as a pack dry-run only.** A `v*` tag would not
+  produce a GitHub Release or a Tenkai-deliverable image.

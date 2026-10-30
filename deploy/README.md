@@ -7,7 +7,9 @@ only when the embedder sets `MIZUCHI_ALLOW_NETWORK` (ADR 0008, ADR 0011).
   coordinator. Shuffle files share the `/spill` volume; a reader that
   cannot fetch a Flight stream falls back to that file.
 - Kubernetes: `deploy/kubernetes.yaml` is a Deployment pair a continuous
-  delivery tool can apply.
+  delivery tool can apply. Tagged releases push
+  `ghcr.io/sannrox/mizuchi:<version>`; `deploy/tenkai.toml` pins that
+  tag for Tenkai.
 - Coordinator failover: both layouts run a leader and a standby that share
   a lease directory (`MIZUCHI_LEASE_DIR`; a shared volume in compose, a
   `ReadWriteMany` claim in Kubernetes). The standby takes over when the
