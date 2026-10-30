@@ -31,8 +31,14 @@ Build our own engine, mizuchi, as a side project:
   and data.
 - **It must not block the main plan.** kako keeps using existing engines
   until mizuchi passes a defined bar (correctness, performance and resource
-  behavior), documented in kako's engine requirements. mizuchi then plugs in
-  behind kako's job contract as one more engine, not as a mandated replacement.
+  behavior), documented in kako's engine requirements. kako may then add
+  mizuchi behind its job contract as one more engine, not as a mandated
+  replacement.
+- **Adapters belong in the consuming app.** mizuchi exposes a generic,
+  embeddable API (SQL or plan in, Arrow in/out, cancellation, resource limits
+  as config) and engine-neutral read/write reports. Runner-specific adapters,
+  job contracts and lineage/receipt mapping live in the runner (for kako:
+  Sannrox/kako#13 and Sannrox/kako#14), never in this repository.
 
 ## Consequences
 
