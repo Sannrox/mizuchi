@@ -1,7 +1,8 @@
-name: Release dry-run
+name: Release
 
 # Tagged and manual only. Never on pull requests. Default cargo test stays
-# offline and does not publish.
+# offline. A v* tag publishes the GitHub Release; workflow_dispatch packages
+# the same files and does not attest or upload.
 on:
   push:
     tags: ["v*"]
@@ -9,6 +10,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
 
 jobs:
   crate:
@@ -24,11 +28,14 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Package workspace crates
         run: |
-          for p in mizuchi-core mizuchi-plan mizuchi-io mizuchi-postgres mizuchi-exec mizuchi; do
+          mkdir -p dist
+          for p in mizuchi-core mizuchi-plan mizuchi-io mizuchi-postgres mizuchi-exec mizuchi mizuchi-flight; do
             echo "::group::$p"
             cargo package --list --locked -p "$p"
+            cargo package --locked -p "$p"
             echo "::endgroup::"
           done
+          cp target/package/*.crate dist/
       - name: Dry-run crates.io pack (mizuchi-core)
         run: cargo publish --locked --dry-run -p mizuchi-core
       - name: Facade package contains readme
@@ -37,6 +44,11 @@ jobs:
           printf '%s\n' "$list"
           echo "$list" | grep -Fx README.md
           echo "$list" | grep -Fx src/lib.rs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crate-packages
+          path: dist/*.crate
+          if-no-files-found: error
 
   wheels:
     name: Wheel (${{ matrix.os }})
@@ -62,3 +74,160 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install maturin==1.15.0
           maturin build --release --locked -o dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+  image:
+    name: Container image
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build, push, and save
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          image="ghcr.io/sannrox/mizuchi:${version}"
+          docker build -f deploy/Dockerfile -t "$image" .
+          docker push "$image"
+          mkdir -p dist
+          docker save "$image" | gzip > "dist/mizuchi-${version}-image.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: container-image
+          path: dist/mizuchi-*-image.tar.gz
+          if-no-files-found: error
+
+  attest:
+    name: Attest artifacts
+    needs: [crate, wheels]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: crate-packages
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum ./*.crate ./*.whl > SHA256SUMS
+          else
+            shasum -a 256 ./*.crate ./*.whl > SHA256SUMS
+          fi
+      - name: Attest artifacts
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            dist/*.crate
+            dist/*.whl
+            dist/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: checksums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    name: GitHub Release
+    needs: [crate, wheels, attest]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: crate-packages
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: checksums
+          path: dist
+      - name: Notes from CHANGELOG
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          python3 - "$version" <<'PY'
+          import pathlib, sys
+          version = sys.argv[1]
+          text = pathlib.Path("CHANGELOG.md").read_text()
+          heading = f"## [{version}]"
+          start = text.find(heading)
+          if start < 0:
+              notes = f"{heading}\n\nRelease {version}.\n"
+          else:
+              rest = text[start + len(heading):]
+              nxt = rest.find("\n## [")
+              body = rest if nxt < 0 else rest[:nxt]
+              notes = heading + body
+          pathlib.Path("dist/RELEASE_NOTES.md").write_text(notes)
+          PY
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*.crate dist/*.whl dist/SHA256SUMS)
+          gh release create "$TAG" "${files[@]}" \
+            --title "$TAG" \
+            --notes-file dist/RELEASE_NOTES.md
+
+  publish-image:
+    name: Attach image to release
+    needs: [publish, image]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: container-image
+          path: dist
+      - name: Attest image archive
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/mizuchi-*-image.tar.gz
+      - name: Upload image archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/mizuchi-*-image.tar.gz

@@ -106,18 +106,21 @@ deploy are under `deploy/`. Optional Flight tests use
 ## Releases
 
 Pre-1.0. The public surface, SemVer rules, deprecation window, and tag
-dry-run job are [ADR 0007](docs/decisions/0007-api-stability-and-releases.md).
+job are [ADR 0007](docs/decisions/0007-api-stability-and-releases.md).
 The `mizuchi` crate is packagable (`publish = true`); the Python cdylib
-stays `publish = false` and ships as a wheel.
+stays `publish = false` and ships as a wheel. crates.io and PyPI stay
+unpublished while a workspace crate pins a git dependency.
 
 1. Run `scripts/changelog-draft.sh <version>`, edit the section it prints
-   from the merged pull requests, and commit it to `CHANGELOG.md`.
+   from the merged pull requests, and commit it to `CHANGELOG.md` as
+   `## [<version>]`.
 2. Tag `v<version>` on `main` (0.1 is experimental).
-3. Wait for `.github/workflows/release.yml` on that tag (or
-   `workflow_dispatch`): `cargo publish --locked --dry-run -p mizuchi`
-   plus `maturin build` wheels on Linux, macOS, and Windows.
-4. A maintainer publishes to crates.io and PyPI only after that job is
-   green. The workflow does not upload.
+3. `.github/workflows/release.yml` on that tag packages crates, builds
+   Linux/macOS/Windows wheels, attests `SHA256SUMS`, publishes a GitHub
+   Release, and pushes `ghcr.io/sannrox/mizuchi:<version>`.
+   `workflow_dispatch` packages crates and wheels only.
+4. Tenkai reads `deploy/tenkai.toml` from the tag. The image tag matches
+   `product.version`.
 
 ## Development
 

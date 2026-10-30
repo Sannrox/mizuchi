@@ -1,4 +1,4 @@
-//! Default-test contract for the release ADR and dry-run workflow.
+//! Default-test contract for the release ADR and publishing workflow.
 
 use std::fs;
 use std::path::PathBuf;
@@ -27,13 +27,15 @@ fn adr_records_surface_semver_and_deprecation() {
         "Windows",
         "crates.io",
         "PyPI",
+        "GitHub Release",
+        "deploy/tenkai.toml",
     ] {
         assert!(text.contains(needle), "ADR missing {needle}");
     }
 }
 
 #[test]
-fn release_workflow_is_tag_dispatch_dry_run() {
+fn release_workflow_publishes_on_tag() {
     let yml = read(".github/workflows/release.yml");
     assert!(yml.contains("workflow_dispatch"));
     assert!(yml.contains("tags:"));
@@ -47,6 +49,64 @@ fn release_workflow_is_tag_dispatch_dry_run() {
         assert!(yml.contains(os), "wheels matrix missing {os}");
     }
     assert!(yml.contains("maturin build"));
+    assert!(yml.contains("gh release create"));
+    assert!(yml.contains("attest-build-provenance"));
+    assert!(yml.contains("SHA256SUMS"));
+    assert!(yml.contains("ghcr.io/sannrox/mizuchi"));
+    assert!(
+        !yml.contains(":latest"),
+        "release must not push a latest image tag"
+    );
+}
+
+#[test]
+fn first_release_notes_and_tenkai_entry_match_workspace_version() {
+    let version = workspace_version();
+    assert_eq!(version, "0.1.0", "first release is 0.1.0");
+    let changelog = read("CHANGELOG.md");
+    assert!(
+        changelog.contains(&format!("## [{version}]")),
+        "CHANGELOG.md missing ## [{version}]"
+    );
+    let pyproject = read("python/pyproject.toml");
+    assert!(
+        pyproject.contains(&format!("version = \"{version}\"")),
+        "python/pyproject.toml version must match workspace {version}"
+    );
+    let tenkai = read("deploy/tenkai.toml");
+    assert!(
+        tenkai.contains(&format!("version = \"{version}\"")),
+        "deploy/tenkai.toml product.version must match workspace {version}"
+    );
+    assert!(
+        tenkai.contains(&format!("ghcr.io/sannrox/mizuchi:{version}")),
+        "deploy/tenkai.toml must pin ghcr.io/sannrox/mizuchi:{version}"
+    );
+    assert!(
+        !tenkai.contains("latest"),
+        "Tenkai entry must not reference latest"
+    );
+    let dockerfile = read("deploy/Dockerfile");
+    assert!(
+        dockerfile.contains("--release"),
+        "release image must be a --release build"
+    );
+    assert!(
+        dockerfile.contains("--features flight"),
+        "release image must build the Flight binary"
+    );
+}
+
+fn workspace_version() -> String {
+    for line in read("Cargo.toml").lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("version = \"")
+            && let Some(end) = rest.find('"')
+        {
+            return rest[..end].to_string();
+        }
+    }
+    panic!("workspace version missing from Cargo.toml");
 }
 
 #[test]
