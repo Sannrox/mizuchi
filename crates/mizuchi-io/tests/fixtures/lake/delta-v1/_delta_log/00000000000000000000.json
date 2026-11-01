@@ -1,0 +1,4 @@
+{"commitInfo":{"operation":"WRITE","timestamp":1793553193033}}
+{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"configuration":{"delta.columnMapping.mode":"name"},"createdTime":1793553193033,"format":{"options":{},"provider":"parquet"},"id":"000001a19819d8490000006c","partitionColumns":[],"schemaString":"{\"fields\":[{\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"id\"},\"name\":\"id\",\"nullable\":true,\"type\":\"long\"},{\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"name\"},\"name\":\"name\",\"nullable\":true,\"type\":\"string\"}],\"type\":\"struct\"}"}}
+{"add":{"dataChange":true,"modificationTime":1793553193033,"partitionValues":{},"path":"part-00000-10853-1a19819d84a-1.parquet","size":741}}
