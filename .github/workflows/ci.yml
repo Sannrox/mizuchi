@@ -143,3 +143,83 @@ jobs:
             exit 1
           fi
           cargo test --locked --test s3_emulator --features s3 -- --ignored --test-threads=1
+
+  # Public API of the library crates against the pull request base. Versions
+  # are release-owned, so a pull request never bumps them: a reported break
+  # passes only when the pull request is marked breaking (`type!:` subject or
+  # a Breaking/Upgrade line or section, as scripts/changelog-draft.sh reads
+  # it) and labelled `risk:breaking`, which the release manifest turns into a
+  # gate.
+  semver:
+    name: Semver
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          # Bump with the toolchain: each release reads a range of rustdoc JSON formats.
+          tool: cargo-semver-checks@0.51.0
+      - name: cargo-semver-checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Every workspace library crate, so a new crate is covered without editing this list.
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          mapfile -t packages < <(jq -r '.packages[] | select(any(.targets[]; .kind | index("lib"))) | .name' <<<"$metadata")
+          # One run per package: only a package that reports a break can be
+          # waived; a tool or build failure in any package stays red.
+          broken=()
+          for package in "${packages[@]}"; do
+            # A crate added by this pull request has no baseline to compare.
+            manifest="$(jq -r --arg p "$package" '.packages[] | select(.name == $p) | .manifest_path' <<<"$metadata")"
+            if ! git cat-file -e "${BASE}:${manifest#"$PWD"/}" 2>/dev/null; then
+              echo "::notice::${package} is new in this pull request; no baseline to check."
+              continue
+            fi
+            rc=0
+            out="$(cargo semver-checks --package "$package" --baseline-rev "$BASE" 2>&1)" || rc=$?
+            echo "$out"
+            [[ $rc -eq 0 ]] && continue
+            if grep -qE 'semver requires new major version' <<<"$out"; then
+              broken+=("$package")
+            elif grep -qE 'semver requires new minor version' <<<"$out"; then
+              # The unchanged version reads as a patch release, so compatible
+              # additions such as deprecations report "minor"; they pass.
+              echo "::notice::${package}: minor-level API change (compatible)."
+            else
+              echo "::error::cargo-semver-checks failed for ${package} without reporting an API break; see the log."
+              exit "$rc"
+            fi
+          done
+          [[ ${#broken[@]} -eq 0 ]] && exit 0
+          echo "API break reported in: ${broken[*]}"
+          # Read the live title, body, and labels so an edit plus a re-run is enough.
+          pr="$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json title,body,labels)"
+          title="$(jq -r .title <<<"$pr")"
+          body="$(jq -r .body <<<"$pr")"
+          bang='^[a-z]+(\([^)]*\))?!:'
+          marked=false
+          if [[ "$title" =~ $bang ]] || grep -qE '^(BREAKING[ -]CHANGE|(Breaking|Upgrade):|#+ *(Breaking|Upgrade))' <<<"$body"; then
+            marked=true
+          fi
+          labelled="$(jq '[.labels[].name] | index("risk:breaking") != null' <<<"$pr")"
+          if [[ "$marked" == true && "$labelled" == true ]]; then
+            echo "::notice::Public API break accepted: the pull request is marked breaking and labelled risk:breaking."
+            exit 0
+          fi
+          echo "::error::cargo-semver-checks found a public API break. Mark the pull request breaking (a 'type!:' title or a '## Breaking' section) and add the risk:breaking label, or keep the change compatible."
+          exit 1

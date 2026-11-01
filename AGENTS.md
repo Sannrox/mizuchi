@@ -332,6 +332,9 @@ the squash merge keeps on `main`. Add a `Breaking: <note>` or `Upgrade: <note>`
 line (or a `## Breaking` / `## Upgrade` section) to the body and the
 `risk:breaking` or `risk:migration` label when callers or operators must act. Release prep drafts the version section with
 `scripts/changelog-draft.sh <version>`.
+The CI `Semver` job runs `cargo-semver-checks` on the library crates against
+the pull request base; a reported major break passes only with that marker and
+the `risk:breaking` label.
 
 ### Public hygiene
 
