@@ -876,6 +876,9 @@ fn delta_replay(io: &dyn LakeIo, travel: TimeTravel) -> Result<Resolved> {
             break;
         }
         for v in actions {
+            if let Some(protocol) = v.get("protocol") {
+                require_delta_reader(protocol)?;
+            }
             if let Some(md) = v.get("metaData") {
                 let (s, p) = parse_delta_schema(md)?;
                 schema = s;
@@ -1101,6 +1104,7 @@ fn iceberg_replay(io: &dyn LakeIo, travel: TimeTravel) -> Result<Resolved> {
         }
     };
     let md = read_json_io(io, &format!("metadata/v{chosen}.metadata.json"))?;
+    require_iceberg_format(&md)?;
     let schema = parse_iceberg_schema(&md)?;
     let physical = iceberg_physical(&md);
     let snap_id = md
@@ -1726,6 +1730,32 @@ fn existing_iceberg(io: &dyn LakeIo) -> Result<Option<Resolved>> {
         return Ok(None);
     }
     Ok(Some(iceberg_replay(io, TimeTravel::Latest)?))
+}
+
+/// Highest Delta reader protocol this reader implements. A table that needs
+/// a newer reader is refused rather than read with features ignored.
+const DELTA_READER_VERSION: i64 = 1;
+/// The Iceberg table format this reader understands.
+const ICEBERG_FORMAT_VERSION: i64 = 2;
+
+fn require_delta_reader(protocol: &Value) -> Result<()> {
+    match protocol.get("minReaderVersion").and_then(Value::as_i64) {
+        Some(version) if (1..=DELTA_READER_VERSION).contains(&version) => Ok(()),
+        version => Err(Error::Io(format!(
+            "Delta table needs reader version {}, this reader supports {DELTA_READER_VERSION}",
+            version.map_or_else(|| "unknown".into(), |v| v.to_string())
+        ))),
+    }
+}
+
+fn require_iceberg_format(md: &Value) -> Result<()> {
+    match md.get("format-version").and_then(Value::as_i64) {
+        Some(ICEBERG_FORMAT_VERSION) => Ok(()),
+        version => Err(Error::Io(format!(
+            "Iceberg format-version {} is not supported, this reader supports {ICEBERG_FORMAT_VERSION}",
+            version.map_or_else(|| "unknown".into(), |v| v.to_string())
+        ))),
+    }
 }
 
 fn iceberg_latest_version(io: &dyn LakeIo) -> Result<Option<i64>> {
@@ -2562,5 +2592,83 @@ mod tests {
         );
         write_delta_keys(&dest, &[batch_i64()], WriteMode::Append, &keys_a).unwrap();
         let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// Copy a committed fixture table into a fresh temp dir, so tests never
+    /// write to the checked-in files.
+    fn fixture(name: &str) -> PathBuf {
+        fn copy(from: &Path, to: &Path) {
+            fs::create_dir_all(to).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy(&entry.path(), &target);
+                } else {
+                    fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        let from = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/lake")
+            .join(name);
+        let to = tmp();
+        copy(&from, &to);
+        to
+    }
+
+    /// Rewrite every `file` under `dest` matching `suffix` with `edit`.
+    fn edit_files(dest: &Path, dir: &str, suffix: &str, edit: impl Fn(&str) -> String) {
+        for entry in fs::read_dir(dest.join(dir)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.to_string_lossy().ends_with(suffix) {
+                let text = fs::read_to_string(&path).unwrap();
+                fs::write(&path, edit(&text)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn committed_tables_of_the_current_format_open() {
+        let delta = fixture("delta-v1");
+        assert_eq!(
+            ids(&read_delta(&delta, TimeTravel::Latest).unwrap()),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            ids(&read_delta(&delta, TimeTravel::Version(0)).unwrap()),
+            vec![1, 2]
+        );
+        let iceberg = fixture("iceberg-v2");
+        assert_eq!(
+            ids(&read_iceberg(&iceberg, TimeTravel::Latest).unwrap()),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            ids(&read_iceberg(&iceberg, TimeTravel::Version(1)).unwrap()),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn a_table_needing_a_newer_reader_fails_closed() {
+        let delta = fixture("delta-v1");
+        edit_files(&delta, "_delta_log", ".json", |text| {
+            text.replace("\"minReaderVersion\":1", "\"minReaderVersion\":3")
+        });
+        let error = read_delta(&delta, TimeTravel::Latest)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reader version 3"), "{error}");
+
+        let iceberg = fixture("iceberg-v2");
+        edit_files(&iceberg, "metadata", ".metadata.json", |text| {
+            text.replace("\"format-version\": 2", "\"format-version\": 3")
+                .replace("\"format-version\":2", "\"format-version\":3")
+        });
+        let error = read_iceberg(&iceberg, TimeTravel::Latest)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("format-version 3"), "{error}");
     }
 }

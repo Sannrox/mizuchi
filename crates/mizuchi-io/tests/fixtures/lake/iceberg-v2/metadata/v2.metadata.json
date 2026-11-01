@@ -1,0 +1,71 @@
+{
+  "current-schema-id": 2,
+  "current-snapshot-id": 1793553193593,
+  "default-sort-order-id": 0,
+  "default-spec-id": 0,
+  "format-version": 2,
+  "last-column-id": 2,
+  "last-sequence-number": 2,
+  "last-updated-ms": 1793553193081,
+  "location": "fixtures/lake/iceberg-v2",
+  "partition-specs": [
+    {
+      "fields": [],
+      "spec-id": 0
+    }
+  ],
+  "properties": {},
+  "refs": {
+    "main": {
+      "snapshot-id": 1793553193593,
+      "type": "branch"
+    }
+  },
+  "schemas": [
+    {
+      "fields": [
+        {
+          "id": 1,
+          "name": "id",
+          "physical-name": "id",
+          "required": false,
+          "type": "long"
+        },
+        {
+          "id": 2,
+          "name": "name",
+          "physical-name": "name",
+          "required": false,
+          "type": "string"
+        }
+      ],
+      "schema-id": 2,
+      "type": "struct"
+    }
+  ],
+  "snapshots": [
+    {
+      "manifest-list": "metadata/snap-1793553193322.json",
+      "snapshot-id": 1793553193322,
+      "summary": {
+        "operation": "append"
+      },
+      "timestamp-ms": 1793553193066
+    },
+    {
+      "manifest-list": "metadata/snap-1793553193593.json",
+      "snapshot-id": 1793553193593,
+      "summary": {
+        "operation": "append"
+      },
+      "timestamp-ms": 1793553193081
+    }
+  ],
+  "sort-orders": [
+    {
+      "fields": [],
+      "order-id": 0
+    }
+  ],
+  "table-uuid": "000001a19819d8790000006e"
+}

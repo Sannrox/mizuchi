@@ -1,0 +1,63 @@
+{
+  "current-schema-id": 1,
+  "current-snapshot-id": 1793553193322,
+  "default-sort-order-id": 0,
+  "default-spec-id": 0,
+  "format-version": 2,
+  "last-column-id": 2,
+  "last-sequence-number": 1,
+  "last-updated-ms": 1793553193066,
+  "location": "fixtures/lake/iceberg-v2",
+  "partition-specs": [
+    {
+      "fields": [],
+      "spec-id": 0
+    }
+  ],
+  "properties": {},
+  "refs": {
+    "main": {
+      "snapshot-id": 1793553193322,
+      "type": "branch"
+    }
+  },
+  "schemas": [
+    {
+      "fields": [
+        {
+          "id": 1,
+          "name": "id",
+          "physical-name": "id",
+          "required": false,
+          "type": "long"
+        },
+        {
+          "id": 2,
+          "name": "name",
+          "physical-name": "name",
+          "required": false,
+          "type": "string"
+        }
+      ],
+      "schema-id": 1,
+      "type": "struct"
+    }
+  ],
+  "snapshots": [
+    {
+      "manifest-list": "metadata/snap-1793553193322.json",
+      "snapshot-id": 1793553193322,
+      "summary": {
+        "operation": "append"
+      },
+      "timestamp-ms": 1793553193066
+    }
+  ],
+  "sort-orders": [
+    {
+      "fields": [],
+      "order-id": 0
+    }
+  ],
+  "table-uuid": "000001a19819d86a0000006e"
+}

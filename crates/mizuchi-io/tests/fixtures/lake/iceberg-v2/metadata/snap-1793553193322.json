@@ -1,0 +1,10 @@
+{
+  "files": [
+    {
+      "file-format": "PARQUET",
+      "file-path": "data/part-00001-10853-1a19819d86b-3.parquet",
+      "file-size-in-bytes": 741
+    }
+  ],
+  "format": "iceberg-json-manifest"
+}
