@@ -43,8 +43,11 @@ fn release_workflow_publishes_on_tag() {
         !yml.contains("pull_request"),
         "release workflow must not run on pull_request"
     );
-    assert!(yml.contains("cargo publish --locked --dry-run -p mizuchi-core"));
-    assert!(yml.contains("cargo package --list --locked -p"));
+    assert!(yml.contains("bash scripts/package-source.sh dist"));
+    assert!(yml.contains("needs: [source, wheels, image, attest]"));
+    assert!(yml.contains("needs.attest.result == 'success'"));
+    assert!(yml.contains("--draft --verify-tag"));
+    assert!(yml.contains("gh release edit \"$TAG\" --draft=false"));
     for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {
         assert!(yml.contains(os), "wheels matrix missing {os}");
     }

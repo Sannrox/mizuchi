@@ -15,8 +15,8 @@ permissions:
   contents: read
 
 jobs:
-  crate:
-    name: Crate package
+  source:
+    name: Source workspace package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -26,28 +26,12 @@ jobs:
           toolchain: 1.97.1
       - name: Cache dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - name: Package workspace crates
-        run: |
-          mkdir -p dist
-          for p in mizuchi-core mizuchi-plan mizuchi-io mizuchi-postgres mizuchi-exec mizuchi mizuchi-flight; do
-            echo "::group::$p"
-            cargo package --list --locked -p "$p"
-            cargo package --locked -p "$p"
-            echo "::endgroup::"
-          done
-          cp target/package/*.crate dist/
-      - name: Dry-run crates.io pack (mizuchi-core)
-        run: cargo publish --locked --dry-run -p mizuchi-core
-      - name: Facade package contains readme
-        run: |
-          list=$(cargo package --list --locked -p mizuchi)
-          printf '%s\n' "$list"
-          echo "$list" | grep -Fx README.md
-          echo "$list" | grep -Fx src/lib.rs
+      - name: Package and verify the source workspace
+        run: bash scripts/package-source.sh dist
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: crate-packages
-          path: dist/*.crate
+          name: source-package
+          path: dist/*-source.tar.gz
           if-no-files-found: error
 
   wheels:
@@ -113,8 +97,8 @@ jobs:
 
   attest:
     name: Attest artifacts
-    needs: [crate, wheels]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [source, wheels, image]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.source.result == 'success' && needs.wheels.result == 'success' && needs.image.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -123,27 +107,32 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: crate-packages
+          name: source-package
           path: dist
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: wheels-*
           merge-multiple: true
           path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: container-image
+          path: dist
       - name: Checksums
         run: |
           set -euo pipefail
           cd dist
           if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum ./*.crate ./*.whl > SHA256SUMS
+            sha256sum ./*.tar.gz ./*.whl > SHA256SUMS
           else
-            shasum -a 256 ./*.crate ./*.whl > SHA256SUMS
+            shasum -a 256 ./*.tar.gz ./*.whl > SHA256SUMS
           fi
       - name: Attest artifacts
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
-            dist/*.crate
+            dist/*-source.tar.gz
+            dist/*-image.tar.gz
             dist/*.whl
             dist/SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -154,8 +143,8 @@ jobs:
 
   publish:
     name: GitHub Release
-    needs: [crate, wheels, attest]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [source, wheels, image, attest]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.source.result == 'success' && needs.wheels.result == 'success' && needs.image.result == 'success' && needs.attest.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -163,12 +152,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: crate-packages
+          name: source-package
           path: dist
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: wheels-*
           merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: container-image
           path: dist
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -186,7 +179,7 @@ jobs:
           heading = f"## [{version}]"
           start = text.find(heading)
           if start < 0:
-              notes = f"{heading}\n\nRelease {version}.\n"
+              raise SystemExit(f"CHANGELOG has no release section for {version}")
           else:
               rest = text[start + len(heading):]
               nxt = rest.find("\n## [")
@@ -201,33 +194,8 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(dist/*.crate dist/*.whl dist/SHA256SUMS)
-          gh release create "$TAG" "${files[@]}" \
+          files=(dist/*.tar.gz dist/*.whl dist/SHA256SUMS)
+          gh release create "$TAG" "${files[@]}" --draft --verify-tag \
             --title "$TAG" \
             --notes-file dist/RELEASE_NOTES.md
-
-  publish-image:
-    name: Attach image to release
-    needs: [publish, image]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-    steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: container-image
-          path: dist
-      - name: Attest image archive
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: dist/mizuchi-*-image.tar.gz
-      - name: Upload image archive
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          gh release upload "$TAG" dist/mizuchi-*-image.tar.gz
+          gh release edit "$TAG" --draft=false
