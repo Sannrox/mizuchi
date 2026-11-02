@@ -1,4 +1,5 @@
 /target
+/dist
 /python/target
 /python/dist
 /python/*.egg-info
