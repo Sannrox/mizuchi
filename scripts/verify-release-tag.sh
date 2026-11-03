@@ -67,8 +67,13 @@ verify_release_tag() {
     [[ "$peeled" == "$expected_commit" ]] || fail "tag ${tag} resolves to ${peeled}, expected ${expected_commit}"
   fi
 
-  raw="$(git verify-tag --raw "$tag" 2>&1)" || true
-  [[ "$raw" == *VALIDSIG* ]] || fail "tag ${tag} is unsigned or the signature is not valid"
+  raw="$(git verify-tag --raw "$tag" 2>&1)" || fail "tag ${tag} is unsigned or the signature is not valid"
+  # GnuPG still reports VALIDSIG for a revoked or expired key; refuse those.
+  if grep -qE '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG) ' <<<"$raw" \
+    || ! grep -qE '^\[GNUPG:\] GOODSIG ' <<<"$raw" \
+    || ! grep -qE '^\[GNUPG:\] VALIDSIG ' <<<"$raw"; then
+    fail "tag ${tag} is unsigned or the signature is not valid"
+  fi
   status_fpr="$(awk '/^\[GNUPG:\] VALIDSIG / { print $3; exit }' <<<"$raw")"
   primary_fpr="$(awk '/^\[GNUPG:\] VALIDSIG / { print $12; exit }' <<<"$raw")"
   status_fpr="$(normalize_fpr "$status_fpr")"
