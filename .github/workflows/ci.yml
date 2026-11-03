@@ -69,6 +69,23 @@ jobs:
       - run: bash scripts/validate-workflow-skills.sh
       - run: python3 scripts/adr-index.py --check
 
+  # The v* release path without attesting or publishing: script self-tests,
+  # signed-tag checks, a schema-checked SBOM, the manifest, and CHANGELOG notes
+  # for the workspace version.
+  release-dry-run:
+    name: Release dry run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.97.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install 'cyclonedx-python-lib[json-validation]==11.12.0'
+      - run: bash scripts/validate-release.sh
+
   python-wheel:
     name: Python wheel
     runs-on: ubuntu-latest
