@@ -44,7 +44,7 @@ fingerprint_allowed() {
 }
 
 workspace_version() {
-  python3 -c 'import re,sys; from pathlib import Path; text=Path(sys.argv[1]).read_text(); m=re.search(r"(?ms)^\[workspace\.package\][^\[]*?^version\s*=\s*\"([^\"]+)\"", text); sys.exit("Cargo.toml has no [workspace.package] version") if not m else print(m.group(1))' "$ROOT_PATH/Cargo.toml"
+  python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["workspace"]["package"]["version"])' "$ROOT_PATH/Cargo.toml"
 }
 
 import_allowed_key() {
