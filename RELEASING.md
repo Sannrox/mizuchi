@@ -36,7 +36,7 @@ attestation prevents publication.
 The manifest (`tenkai.family-release-manifest.v1`) lists the version, git
 SHA, asset digests, the image by registry digest, the attestation URLs, and
 gate flags: `breaking` or `migration` when a pull request merged since the
-previous `v*` tag carries `risk:breaking` or `risk:migration`. A squash
+previous stable `v*` tag carries `risk:breaking` or `risk:migration`. A squash
 subject naming a pull request whose labels cannot be read fails the release.
 
 Every pull request runs `scripts/validate-release.sh` in CI: script
