@@ -1,8 +1,9 @@
 name: Release
 
-# Tagged and manual only. Never on pull requests. Default cargo test stays
-# offline. A v* tag publishes the GitHub Release; workflow_dispatch packages
-# the same files and does not attest or upload.
+# Tagged and manual only. Never on pull requests: CI's release dry run
+# (scripts/validate-release.sh) covers these scripts there. Default cargo
+# test stays offline. A signed v* tag publishes the GitHub Release;
+# workflow_dispatch packages the same files and does not attest or upload.
 on:
   push:
     tags: ["v*"]
@@ -15,6 +16,18 @@ permissions:
   contents: read
 
 jobs:
+  verify-tag:
+    name: Verify signed tag
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Checkout leaves the tag object behind; verify-tag needs it.
+      - name: Fetch annotated tag object
+        run: git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+      - name: Refuse lightweight, unsigned, or mismatched tags
+        run: bash scripts/verify-release-tag.sh verify "${GITHUB_REF_NAME}" "${GITHUB_SHA}"
+
   source:
     name: Source workspace package
     runs-on: ubuntu-latest
@@ -26,12 +39,22 @@ jobs:
           toolchain: 1.97.1
       - name: Cache dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
       - name: Package and verify the source workspace
         run: bash scripts/package-source.sh dist
+      - name: CycloneDX SBOM
+        run: |
+          python -m pip install 'cyclonedx-python-lib[json-validation]==11.12.0'
+          python scripts/release-sbom.py dist/mizuchi.cdx.json
+          python scripts/release-sbom.py --check dist/mizuchi.cdx.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: source-package
-          path: dist/*-source.tar.gz
+          path: |
+            dist/*-source.tar.gz
+            dist/mizuchi.cdx.json
           if-no-files-found: error
 
   wheels:
@@ -66,11 +89,14 @@ jobs:
 
   image:
     name: Container image
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: verify-tag
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.verify-tag.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
@@ -79,6 +105,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build, push, and save
+        id: push
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -87,6 +114,11 @@ jobs:
           image="ghcr.io/sannrox/mizuchi:${version}"
           docker build -f deploy/Dockerfile -t "$image" .
           docker push "$image"
+          # RepoDigests holds name@sha256:... once the push has landed.
+          digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")"
+          digest="${digest#*@}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "no registry digest for $image" >&2; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
           mkdir -p dist
           docker save "$image" | gzip > "dist/mizuchi-${version}-image.tar.gz"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -95,16 +127,23 @@ jobs:
           path: dist/mizuchi-*-image.tar.gz
           if-no-files-found: error
 
+  # Provenance and SBOM attestations, then the Tenkai family release manifest
+  # (digests, attestation URLs, gate flags), itself attested.
   attest:
     name: Attest artifacts
-    needs: [source, wheels, image]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.source.result == 'success' && needs.wheels.result == 'success' && needs.image.result == 'success'
+    needs: [verify-tag, source, wheels, image]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.verify-tag.result == 'success' && needs.source.result == 'success' && needs.wheels.result == 'success' && needs.image.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
       attestations: write
+      pull-requests: read
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: source-package
@@ -122,23 +161,69 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum ./*.tar.gz ./*.whl > SHA256SUMS
-          else
-            shasum -a 256 ./*.tar.gz ./*.whl > SHA256SUMS
-          fi
+          sha256sum ./*.tar.gz ./*.whl ./mizuchi.cdx.json > SHA256SUMS
       - name: Attest artifacts
+        id: provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/*-source.tar.gz
             dist/*-image.tar.gz
             dist/*.whl
+            dist/mizuchi.cdx.json
             dist/SHA256SUMS
+      - name: Attest image
+        id: image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/sannrox/mizuchi
+          subject-digest: ${{ needs.image.outputs.digest }}
+      - name: Attest SBOM
+        id: sbom
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: |
+            dist/*-source.tar.gz
+            dist/*.whl
+          sbom-path: dist/mizuchi.cdx.json
+      - name: Release manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+          PROVENANCE_URL: ${{ steps.provenance.outputs.attestation-url }}
+          IMAGE_URL: ${{ steps.image.outputs.attestation-url }}
+          SBOM_URL: ${{ steps.sbom.outputs.attestation-url }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          # Squash subjects since the previous stable v* tag carry (#N); their
+          # labels set the gate flags, so an upgrade from that release sees
+          # every gate, including ones shipped in a pre-release. A missing
+          # pull request fails the release.
+          range="$TAG"
+          if prev="$(git describe --tags --abbrev=0 --match 'v*' --exclude 'v*-*' "${TAG}^" 2>/dev/null)"; then
+            range="${prev}..${TAG}"
+          fi
+          git log --format=%s "$range" > "$RUNNER_TEMP/commits"
+          gh pr list --repo "$GITHUB_REPOSITORY" --state merged --limit 1000 \
+            --json number,labels > "$RUNNER_TEMP/prs.json"
+          python3 scripts/release-manifest.py --version "$version" --git-sha "$GITHUB_SHA" \
+            --tag "$TAG" --dist dist --out dist/mizuchi-release.json \
+            --image "ghcr.io/sannrox/mizuchi:${version}=${IMAGE_DIGEST}" \
+            --attestation "$PROVENANCE_URL" --attestation "$IMAGE_URL" --attestation "$SBOM_URL" \
+            --commits "$RUNNER_TEMP/commits" --prs "$RUNNER_TEMP/prs.json"
+          cat dist/mizuchi-release.json
+      - name: Attest release manifest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/mizuchi-release.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: checksums
-          path: dist/SHA256SUMS
+          path: |
+            dist/SHA256SUMS
+            dist/mizuchi-release.json
           if-no-files-found: error
 
   publish:
@@ -170,23 +255,7 @@ jobs:
       - name: Notes from CHANGELOG
         env:
           TAG: ${{ github.ref_name }}
-        run: |
-          version="${TAG#v}"
-          python3 - "$version" <<'PY'
-          import pathlib, sys
-          version = sys.argv[1]
-          text = pathlib.Path("CHANGELOG.md").read_text()
-          heading = f"## [{version}]"
-          start = text.find(heading)
-          if start < 0:
-              raise SystemExit(f"CHANGELOG has no release section for {version}")
-          else:
-              rest = text[start + len(heading):]
-              nxt = rest.find("\n## [")
-              body = rest if nxt < 0 else rest[:nxt]
-              notes = heading + body
-          pathlib.Path("dist/RELEASE_NOTES.md").write_text(notes)
-          PY
+        run: python3 scripts/changelog-notes.py "${TAG#v}" > dist/RELEASE_NOTES.md
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -194,7 +263,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(dist/*.tar.gz dist/*.whl dist/SHA256SUMS)
+          files=(dist/*.tar.gz dist/*.whl dist/mizuchi.cdx.json dist/mizuchi-release.json dist/SHA256SUMS)
           gh release create "$TAG" "${files[@]}" --draft --verify-tag \
             --title "$TAG" \
             --notes-file dist/RELEASE_NOTES.md
