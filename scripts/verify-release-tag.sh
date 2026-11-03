@@ -60,6 +60,10 @@ verify_release_tag() {
 
   objtype="$(git cat-file -t "refs/tags/${tag}" 2>/dev/null)" || fail "tag ${tag} was not found"
   [[ "$objtype" == "tag" ]] || fail "tag ${tag} is lightweight; release tags must be annotated"
+  # A signed tag object pushed under another ref name keeps its own name.
+  local signed_name
+  signed_name="$(git cat-file tag "refs/tags/${tag}" | sed -n '/^$/q;s/^tag //p')"
+  [[ "$signed_name" == "$tag" ]] || fail "tag ${tag} points at a tag object named ${signed_name}"
 
   if [[ -n "$expected_commit" ]]; then
     [[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]] || fail "expected commit must be a full lowercase SHA"
@@ -142,6 +146,10 @@ self_test() {
   printf 'AEDA618886BF0331105B9CFCE4DC1F4A579505FB\n' >"${tmp}/fingerprints"
   (cd "$work" && expect_failure "unknown key" v0.1.0 "$first")
   printf '%s\n' "$fpr" >"${tmp}/fingerprints"
+
+  git -C "$work" tag -s v0.1.0-rc.1 -m "renamed" "$first"
+  git -C "$work" update-ref refs/tags/v0.1.0 "$(git -C "$work" rev-parse v0.1.0-rc.1)"
+  (cd "$work" && expect_failure "tag object named v0.1.0-rc.1" v0.1.0 "$first")
 
   git -C "$work" tag -s v0.2.0 -m "wrong version" "$first"
   (cd "$work" && expect_failure "does not match workspace version" v0.2.0 "$first")
