@@ -45,6 +45,15 @@ def self_test() -> None:
             assert message in str(exc), exc
         else:
             raise AssertionError(f"expected failure: {message}")
+    # A release candidate has its own section; the final never reuses it.
+    rc = "## [0.3.0-rc.1] - 2026-11-04\n\n- candidate\n\n" + sample
+    assert notes_for(rc, "0.3.0-rc.1").startswith("## [0.3.0-rc.1] - 2026-11-04\n"), rc
+    try:
+        notes_for(rc, "0.3.0")
+    except SystemExit as exc:
+        assert "no ## [0.3.0] section" in str(exc), exc
+    else:
+        raise AssertionError("expected a final release to need its own section")
     print("changelog-notes self-test passed")
 
 

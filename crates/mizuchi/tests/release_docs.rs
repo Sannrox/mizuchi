@@ -34,18 +34,25 @@ fn adr_records_surface_semver_and_deprecation() {
     }
 }
 
+// A v* tag push only dispatches release.yml on main; scripts/validate-release.sh
+// asserts the full main-run contract.
 #[test]
 fn release_workflow_publishes_on_tag() {
+    let dispatch = read(".github/workflows/release-dispatch.yml");
+    assert!(dispatch.contains("tags: [\"v*\"]"));
+    assert!(dispatch.contains("gh workflow run release.yml --ref main -f tag=\"$TAG\""));
     let yml = read(".github/workflows/release.yml");
     assert!(yml.contains("workflow_dispatch"));
-    assert!(yml.contains("tags:"));
+    assert!(
+        !yml.contains("\n  push:"),
+        "release.yml runs from main, not on a tag push"
+    );
     assert!(
         !yml.contains("pull_request"),
         "release workflow must not run on pull_request"
     );
     assert!(yml.contains("bash scripts/package-source.sh dist"));
-    assert!(yml.contains("needs: [source, wheels, image, attest]"));
-    assert!(yml.contains("needs.attest.result == 'success'"));
+    assert!(yml.contains("needs: [verify-tag, source, wheels, image, attest]"));
     assert!(yml.contains("--draft --verify-tag"));
     assert!(yml.contains("gh release edit \"$TAG\" --draft=false"));
     for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {

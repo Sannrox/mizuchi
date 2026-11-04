@@ -114,11 +114,14 @@ unpublished while a workspace crate pins a git dependency.
 1. Run `scripts/changelog-draft.sh <version>`, edit the section it prints
    from the merged pull requests, and commit it to `CHANGELOG.md` as
    `## [<version>]`.
-2. Tag `v<version>` on `main` (0.1 is experimental).
-3. `.github/workflows/release.yml` on that tag packages crates, builds
-   Linux/macOS/Windows wheels, attests `SHA256SUMS`, publishes a GitHub
-   Release, and pushes `ghcr.io/sannrox/mizuchi:<version>`.
-   `workflow_dispatch` packages crates and wheels only.
+2. Tag `v<version>` on `main` (0.1 is experimental). Cut
+   `v<version>-rc.N` first; it publishes as a pre-release.
+3. The tag push starts main's `.github/workflows/release.yml` for that tag.
+   It packages crates, builds Linux/macOS/Windows wheels, attests
+   `SHA256SUMS`, publishes a GitHub Release, and pushes
+   `ghcr.io/sannrox/mizuchi:<version>`. `workflow_dispatch` without a tag
+   packages crates and wheels only. [RELEASING.md](RELEASING.md) covers
+   retries and release candidates.
 4. Tenkai reads `deploy/tenkai.toml` from the tag. The image tag matches
    `product.version`.
 
