@@ -69,21 +69,28 @@ grep -qF -- 'gh release edit "$TAG" --draft=false --prerelease --latest=false' "
 grep -qE -- '--latest( |$|")' "$workflow" && fail "${workflow} must never force a release to latest"
 [[ "$(grep -c 'is already published; cut a new tag instead of re-running' "$workflow")" -ge 3 ]] \
   || fail "${workflow} must refuse a published release early, when drafting, and before publishing"
-# "Re-run failed jobs" reuses verify-tag's outputs, so every job that changes a
-# release or pushes an image refuses a published release itself.
-python3 - "$workflow" <<'PY_JOBS' || fail "${workflow} must refuse a published release in every job that uploads, publishes, or pushes"
+# "Re-run failed jobs" reuses verify-tag's outputs, so every job that attests,
+# changes a release or pushes an image refuses a published release itself,
+# before its first mutation.
+python3 - "$workflow" <<'PY_JOBS' || fail "${workflow} must refuse a published release in every job that attests, uploads, publishes, or pushes, before its first mutation"
 import re, sys
 body = open(sys.argv[1]).read().split("\njobs:\n", 1)[1]
-mutating = ("gh release upload", "gh release create", "gh release edit", "docker push")
-missing = [
-    block.split(":", 1)[0].strip()
-    for block in re.split(r"(?m)^(?=  [a-z][a-z0-9-]*:\n)", body)
-    if any(m in block for m in mutating)
-    and "is already published; cut a new tag instead of re-running" not in block
-]
-if missing:
-    sys.exit("unguarded jobs: " + ", ".join(missing))
+mutating = ("gh release upload", "gh release create", "gh release edit", "gh release delete-asset", "docker push", "actions/attest")
+guard = "- name: Refuse a published release"
+bad = []
+for block in re.split(r"(?m)^(?=  [a-z][a-z0-9-]*:\n)", body):
+    first = min((i for i in (block.find(m) for m in mutating) if i >= 0), default=-1)
+    if first >= 0 and not 0 <= block.find(guard) < first:
+        bad.append(block.split(":", 1)[0].strip())
+if bad:
+    sys.exit("unguarded jobs: " + ", ".join(bad))
 PY_JOBS
+# A guard continues only on a draft or a missing release; any other gh error fails.
+grep -qF '2>/dev/null || true)' "$workflow" && fail "${workflow} must not treat a failed release lookup as no release"
+[[ "$(grep -cF -- '- name: Refuse a published release' "$workflow")" -eq "$(grep -cF 'elif [[ "$state" != *"release not found"* ]]; then' "$workflow")" ]] \
+  || fail "${workflow} must fail every published-release guard on any answer but a draft or release not found"
+[[ "$(grep -cF 'git ls-remote origin "refs/tags/${TAG}^{}"' "$workflow")" -ge 2 ]] \
+  || fail "${workflow} must check the remote tag still names the release commit before drafting and publishing"
 grep -qF 'gh release delete-asset "$TAG" "$name" --yes' "$workflow" \
   || fail "${workflow} must drop an earlier run's assets when it resumes a draft"
 grep -qF 'needs: [verify-tag, source, wheels, image, attest]' "$workflow" \

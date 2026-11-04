@@ -50,8 +50,11 @@ a new rc or patch version.
 
 A re-run resumes the draft release: it deletes the earlier run's assets and
 uploads the fresh ones. It refuses a release that is already published before
-it builds, in every job that pushes the image or changes the release, and
-before it publishes; cut a new version instead. One run per tag executes at a time. A
+it builds, in every job before it pushes the image, attests or changes the
+release, and before it publishes; cut a new version instead. A failed release
+lookup fails the run rather than counting as no release. Before drafting and
+before publishing, the run also checks that the remote tag still names the
+tagged commit. One run per tag executes at a time. A
 re-run rebuilds and re-pushes the versioned image, so the image digest in the
 manifest is the one from the run that published.
 

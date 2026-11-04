@@ -83,8 +83,11 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)" == false ]]; then
-            echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2
+          # Only a draft or a missing release may continue; any other answer fails.
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>&1)"; then
+            [[ "$state" == true ]] || { echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2; exit 1; }
+          elif [[ "$state" != *"release not found"* ]]; then
+            echo "cannot read release ${TAG}: ${state}" >&2
             exit 1
           fi
       - name: Resolve release commit
@@ -209,8 +212,11 @@ jobs:
           TAG: ${{ needs.verify-tag.outputs.tag }}
         run: |
           set -euo pipefail
-          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)" == false ]]; then
-            echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2
+          # Only a draft or a missing release may continue; any other answer fails.
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>&1)"; then
+            [[ "$state" == true ]] || { echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2; exit 1; }
+          elif [[ "$state" != *"release not found"* ]]; then
+            echo "cannot read release ${TAG}: ${state}" >&2
             exit 1
           fi
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
@@ -266,6 +272,21 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$SHA"
           test "$(git describe --tags --exact-match HEAD)" = "$TAG"
+      # "Re-run failed jobs" reuses verify-tag's outputs; refuse here too.
+      - name: Refuse a published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Only a draft or a missing release may continue; any other answer fails.
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>&1)"; then
+            [[ "$state" == true ]] || { echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2; exit 1; }
+          elif [[ "$state" != *"release not found"* ]]; then
+            echo "cannot read release ${TAG}: ${state}" >&2
+            exit 1
+          fi
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: source-package
@@ -374,8 +395,11 @@ jobs:
           TAG: ${{ needs.verify-tag.outputs.tag }}
         run: |
           set -euo pipefail
-          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)" == false ]]; then
-            echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2
+          # Only a draft or a missing release may continue; any other answer fails.
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>&1)"; then
+            [[ "$state" == true ]] || { echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2; exit 1; }
+          elif [[ "$state" != *"release not found"* ]]; then
+            echo "cannot read release ${TAG}: ${state}" >&2
             exit 1
           fi
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -404,10 +428,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.verify-tag.outputs.tag }}
+          SHA: ${{ needs.verify-tag.outputs.sha }}
           PRERELEASE: ${{ needs.verify-tag.outputs.prerelease }}
         run: |
           set -euo pipefail
           shopt -s nullglob
+          # The release attaches to the remote tag; it must still name SHA.
+          [[ "$(git ls-remote origin "refs/tags/${TAG}^{}" | cut -f1)" == "$SHA" ]] \
+            || { echo "remote tag ${TAG} no longer points at ${SHA}" >&2; exit 1; }
           files=(dist/*.tar.gz dist/*.whl dist/mizuchi.cdx.json dist/mizuchi-release.json dist/SHA256SUMS)
           # A tag with a "-" (vX.Y.Z-rc.N) is a pre-release and never latest.
           kind=()
@@ -415,39 +443,36 @@ jobs:
             kind=(--prerelease --latest=false)
           fi
           # A re-run resumes its draft; a published release is never touched.
-          draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo absent)"
-          case "$draft" in
-            true)
-              # Every run rebuilds every asset; drop the earlier run's so no
-              # stale or renamed file is published.
-              gh release view "$TAG" --json assets --jq '.assets[].name' | while IFS= read -r name; do
-                gh release delete-asset "$TAG" "$name" --yes
-              done
-              gh release upload "$TAG" "${files[@]}" --clobber
-              gh release edit "$TAG" --title "$TAG" --notes-file dist/RELEASE_NOTES.md --draft "${kind[@]}"
-              ;;
-            absent)
-              gh release create "$TAG" "${files[@]}" --draft --verify-tag "${kind[@]}" \
-                --title "$TAG" \
-                --notes-file dist/RELEASE_NOTES.md
-              ;;
-            *)
-              echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2
-              exit 1
-              ;;
-          esac
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>&1)"; then
+            [[ "$state" == true ]] || { echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2; exit 1; }
+            # Every run rebuilds every asset; drop the earlier run's so no
+            # stale or renamed file is published.
+            gh release view "$TAG" --json assets --jq '.assets[].name' | while IFS= read -r name; do
+              gh release delete-asset "$TAG" "$name" --yes
+            done
+            gh release upload "$TAG" "${files[@]}" --clobber
+            gh release edit "$TAG" --title "$TAG" --notes-file dist/RELEASE_NOTES.md --draft "${kind[@]}"
+          elif [[ "$state" == *"release not found"* ]]; then
+            gh release create "$TAG" "${files[@]}" --draft --verify-tag "${kind[@]}" \
+              --title "$TAG" \
+              --notes-file dist/RELEASE_NOTES.md
+          else
+            echo "cannot read release ${TAG}: ${state}" >&2
+            exit 1
+          fi
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.verify-tag.outputs.tag }}
+          SHA: ${{ needs.verify-tag.outputs.sha }}
           PRERELEASE: ${{ needs.verify-tag.outputs.prerelease }}
         run: |
           set -euo pipefail
-          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != true ]]; then
-            echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2
-            exit 1
-          fi
+          [[ "$(git ls-remote origin "refs/tags/${TAG}^{}" | cut -f1)" == "$SHA" ]] \
+            || { echo "remote tag ${TAG} no longer points at ${SHA}" >&2; exit 1; }
+          state="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
+          [[ "$state" == true ]] || { echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2; exit 1; }
           if [[ "$PRERELEASE" == true ]]; then
             gh release edit "$TAG" --draft=false --prerelease --latest=false
           else
