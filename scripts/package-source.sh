@@ -9,7 +9,8 @@ out="${1:?usage: package-source.sh OUTPUT_DIRECTORY}"
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 version="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
-if [[ "${GITHUB_REF_TYPE:-}" == tag && "${GITHUB_REF_NAME:-}" != "v$version" ]]; then
+# The release workflow passes the verified tag; a dry run passes none.
+if [[ -n "${RELEASE_TAG:-}" && "$RELEASE_TAG" != "v$version" ]]; then
   echo 'Release tag must match the workspace version' >&2
   exit 1
 fi
