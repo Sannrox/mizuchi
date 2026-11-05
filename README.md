@@ -1,15 +1,22 @@
 # mizuchi (蛟)
 
-An Arrow-native query and transform engine written in Rust. Single-node
-first; distributed execution ships as experimental, opt-in pieces behind the
-same API.
+**An Arrow-native query and transform engine in Rust, built to be embedded.**
+
+[![CI](https://img.shields.io/github/actions/workflow/status/Sannrox/mizuchi/ci.yml?branch=main&label=ci)](https://github.com/Sannrox/mizuchi/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Sannrox/mizuchi)](https://github.com/Sannrox/mizuchi/releases)
+[![License](https://img.shields.io/github/license/Sannrox/mizuchi)](LICENSE)
+
+[Try it](#try-it) · [SQL coverage](docs/sql-coverage.md) · [Benchmarks](docs/bench/results.md) · [Decisions](docs/decisions/README.md)
 
 > Status: side project, experimental 0.1. Embedding runners should keep using
 > their current engines until mizuchi passes a defined bar
 > (see [ADR 0002](docs/decisions/0002-own-query-engine.md)). A 0.y release may
 > break the public surface.
 
-## Goals
+Mizuchi (蛟, a water dragon) runs SQL and DataFrame jobs inside another
+program's process and limits. A runner opens a session with a memory cap,
+worker count, spill directory and filesystem grants, registers Arrow data or
+files, and gets Arrow batches back along with a report of what ran.
 
 - **Arrow in, Arrow out.** Columnar memory is standard Apache Arrow, so inputs
   and results move between tools without conversion.
@@ -20,6 +27,8 @@ same API.
   thread limits that an embedding sandbox can rely on.
 - **Explainable.** Plans and executed operators are inspectable, so a runner can
   record what ran (lineage).
+- **Governed.** An optional policy context applies table access, row filters,
+  column masks and markings in planning, and markings flow into reports.
 - **Measured.** Correctness via sqllogictest
   ([coverage](docs/sql-coverage.md)) and benchmark comparisons against DuckDB
   and DataFusion.
@@ -30,11 +39,22 @@ The complete embedding walkthrough is one command from a clone (the
 toolchain is pinned by `rust-toolchain.toml`):
 
 ```sh
+git clone https://github.com/Sannrox/mizuchi && cd mizuchi
 cargo run -p mizuchi --example embed
 ```
 
 It opens a capped session, registers data, explains and runs a query, writes
-Parquet, and reads it back. Abridged from
+Parquet, and reads it back:
+
+```text
+engine 0.1.0
+== Logical Plan ==
+Scan t rowcount=2 [a: Int64]
+== Physical Plan ==
+Scan
+```
+
+Abridged from
 [`examples/embed.rs`](crates/mizuchi/examples/embed.rs):
 
 ```rust
@@ -54,18 +74,34 @@ let rows = session.execute_sql("SELECT a, count(*) FROM t GROUP BY a")?;
 Python bindings and the benchmark suites are under
 [Development](#development).
 
-## Architecture
+## How it works
 
-```text
-SQL / DataFrame -> logical plan -> optimizer -> physical plan -> execution
-                                                     (vectorized, morsel-driven)
+```mermaid
+flowchart LR
+  Q[SQL / DataFrame] --> L[logical plan]
+  L --> O[optimizer]
+  O --> P[physical plan]
+  P --> E[vectorized, morsel-driven execution]
+  F[(Parquet, CSV, JSON, Avro, ORC, Delta, Iceberg)] --> E
+  E --> R[Arrow batches + QueryReport]
+  E -. cap hit .-> S[spill]
 ```
 
-Workspace crates (ADR [0013](docs/decisions/0013-workspace-crate-graph.md)):
-`mizuchi-core` (batches, expressions, cancellation), `mizuchi-plan` (SQL and
-optimizer), `mizuchi-io` (files and lake tables), `mizuchi-postgres`,
-`mizuchi-exec` (operators and `Session`), `mizuchi-flight` (optional), and
-the `mizuchi` facade that embedders depend on.
+Everything runs inside a `Session` whose config carries the limits and
+grants; execution spills or fails with a typed error rather than exceed
+them. Workspace crates (ADR
+[0013](docs/decisions/0013-workspace-crate-graph.md)): `mizuchi-core`
+(batches, expressions, cancellation), `mizuchi-plan` (SQL and optimizer),
+`mizuchi-io` (files and lake tables), `mizuchi-postgres`, `mizuchi-exec`
+(operators and `Session`), `mizuchi-flight` (optional), and the `mizuchi`
+facade that embedders depend on.
+
+**Why not an existing embedded engine?** The runners keep using theirs; this
+engine exists because their internals are not built around a sandboxed,
+multi-tenant runner's needs: memory accounting a sandbox can trust, spill
+and thread behavior it can enforce, and stable access to plans for lineage.
+The reasoning, and the bar mizuchi must pass before a runner switches, are
+[ADR 0002](docs/decisions/0002-own-query-engine.md).
 
 ## Status and roadmap
 
