@@ -1,14 +1,22 @@
 # mizuchi (蛟)
 
-An Arrow-native query and transform engine written in Rust. Single-node first,
-distributed later.
+**An Arrow-native query and transform engine in Rust, built to be embedded.**
+
+[![CI](https://img.shields.io/github/actions/workflow/status/Sannrox/mizuchi/ci.yml?branch=main&label=ci)](https://github.com/Sannrox/mizuchi/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Sannrox/mizuchi)](https://github.com/Sannrox/mizuchi/releases)
+[![License](https://img.shields.io/github/license/Sannrox/mizuchi)](LICENSE)
+
+[Try it](#try-it) · [SQL coverage](docs/sql-coverage.md) · [Benchmarks](docs/bench/results.md) · [Decisions](docs/decisions/README.md)
 
 > Status: side project, experimental 0.1. Embedding runners should keep using
 > their current engines until mizuchi passes a defined bar
 > (see [ADR 0002](docs/decisions/0002-own-query-engine.md)). A 0.y release may
 > break the public surface.
 
-## Goals
+Mizuchi (蛟, a water dragon) runs SQL and DataFrame jobs inside another
+program's process and limits. A runner opens a session with a memory cap,
+worker count, spill directory and filesystem grants, registers Arrow data or
+files, and gets Arrow batches back along with a report of what ran.
 
 - **Arrow in, Arrow out.** Columnar memory is standard Apache Arrow, so inputs
   and results move between tools without conversion.
@@ -19,89 +27,194 @@ distributed later.
   thread limits that an embedding sandbox can rely on.
 - **Explainable.** Plans and executed operators are inspectable, so a runner can
   record what ran (lineage).
+- **Governed.** An optional policy context applies table access, row filters,
+  column masks and markings in planning, and markings flow into reports.
 - **Measured.** Correctness via sqllogictest
   ([coverage](docs/sql-coverage.md)) and benchmark comparisons against DuckDB
   and DataFusion.
 
-## Architecture
+## Try it
 
-```text
-SQL / DataFrame -> logical plan -> optimizer -> physical plan -> execution
-                                                     (vectorized, morsel-driven)
+The complete embedding walkthrough is one command from a clone (the
+toolchain is pinned by `rust-toolchain.toml`):
+
+```sh
+git clone https://github.com/Sannrox/mizuchi && cd mizuchi
+cargo run -p mizuchi --example embed
 ```
 
-Workspace crates (ADR [0013](docs/decisions/0013-workspace-crate-graph.md)):
-`mizuchi-core` (batches, expressions, cancellation), `mizuchi-plan` (SQL and
-optimizer), `mizuchi-io` (files and lake tables), `mizuchi-postgres`,
-`mizuchi-exec` (operators and `Session`), `mizuchi-flight` (optional), and
-the `mizuchi` facade that embedders depend on.
+It opens a capped session, registers data, explains and runs a query, writes
+Parquet, and reads it back:
 
-## Roadmap
+```text
+engine 0.1.0
+== Logical Plan ==
+Scan t rowcount=2 [a: Int64]
+== Physical Plan ==
+Scan
+```
 
-Tracked as GitHub Issues and milestones:
+Abridged from
+[`examples/embed.rs`](crates/mizuchi/examples/embed.rs):
 
-1. Foundations: Arrow memory model, expressions, SQL parser, logical plan
-2. Single-node execution: vectorized operators, Parquet/CSV, spill, scheduling
-3. Optimizer: rule-based rewrites, pushdown, cost-based join ordering
-4. Correctness and benchmarks
-5. Integration with a sandboxed transform runner
-6. Distributed execution
-7. Python API
-8. Advanced: incremental/streaming, caching, GPU research
+```rust
+let cfg = SessionConfig {
+    memory_limit: Some(32 * 1024 * 1024),
+    workers: Some(1),
+    spill_dir: Some(root.join("spill")),
+    allowed_read_paths: vec![root.clone()],
+    allowed_write_paths: vec![root.clone()],
+    ..SessionConfig::default()
+};
+let mut session = Session::from_config(cfg)?.with_cancel(CancelToken::new());
+session.register_parquet("t", root.join("data"), ParquetReadOptions::default())?;
+let rows = session.execute_sql("SELECT a, count(*) FROM t GROUP BY a")?;
+```
+
+Python bindings and the benchmark suites are under
+[Development](#development).
+
+## How it works
+
+```mermaid
+flowchart LR
+  Q[SQL / DataFrame] --> L[logical plan]
+  L --> O[optimizer]
+  O --> P[physical plan]
+  P --> E[vectorized, morsel-driven execution]
+  F[(Parquet, CSV, JSON, Avro, ORC, Delta, Iceberg)] --> E
+  E --> R[Arrow batches + QueryReport]
+  E -. cap hit .-> S[spill]
+```
+
+Everything runs inside a `Session` whose config carries the limits and
+grants; execution spills or fails with a typed error rather than exceed
+them. Workspace crates (ADR
+[0013](docs/decisions/0013-workspace-crate-graph.md)): `mizuchi-core`
+(batches, expressions, cancellation), `mizuchi-plan` (SQL and optimizer),
+`mizuchi-io` (files and lake tables), `mizuchi-postgres`, `mizuchi-exec`
+(operators and `Session`), `mizuchi-flight` (optional), and the `mizuchi`
+facade that embedders depend on.
+
+**Why not an existing embedded engine?** The runners keep using theirs; this
+engine exists because their internals are not built around a sandboxed,
+multi-tenant runner's needs: memory accounting a sandbox can trust, spill
+and thread behavior it can enforce, and stable access to plans for lineage.
+The reasoning, and the bar mizuchi must pass before a runner switches, are
+[ADR 0002](docs/decisions/0002-own-query-engine.md).
+
+## Status and roadmap
+
+Planning lives in GitHub Issues and milestones. Shipped today, behind the
+API below and the linked decision records:
+
+- Single-node SQL and DataFrame execution: vectorized operators,
+  morsel-driven scheduling (ADR
+  [0015](docs/decisions/0015-morsel-pipeline-scheduler.md)), spill,
+  Parquet/CSV/JSON/Avro/ORC, lake tables.
+- Optimizer: rule-based rewrites, predicate and projection pushdown,
+  cost-based inner-join ordering.
+- Correctness and benchmarks: sqllogictest coverage
+  ([docs/sql-coverage.md](docs/sql-coverage.md)) and committed comparisons
+  against reference engines ([docs/bench](docs/bench/results.md)).
+- Streaming: continuous micro-batch queries with event-time watermarks and
+  checkpointed sinks (ADR
+  [0009](docs/decisions/0009-stream-watermarks-and-checkpoints.md)).
+- Distributed execution, experimental and opt-in: Arrow Flight workers (ADR
+  [0011](docs/decisions/0011-flight-workers.md)), task retry on worker loss,
+  leased and fenced coordinator leadership with standby takeover (ADR
+  [0016](docs/decisions/0016-fenced-coordinator-lease.md)), and batch queries
+  that resume from their last committed stage after a takeover. Takeover,
+  fencing and stage resume are integration-tested; distributed performance
+  and operational readiness are not yet claimed.
+- Python bindings as a development workflow.
+
+The gating bar is unchanged (ADR 0002): single-node correctness, performance
+and resource behavior under an embedding runner's limits. Open work toward
+that bar is tracked in
+[#209](https://github.com/Sannrox/mizuchi/issues/209) (aggregate spill under
+a memory cap), [#210](https://github.com/Sannrox/mizuchi/issues/210) (memory
+accounting and the engine's own peak) and
+[#211](https://github.com/Sannrox/mizuchi/issues/211) (a constrained
+benchmark profile). Later: caching, incremental computation, GPU research
+(ADR [0006](docs/decisions/0006-gpu-acceleration.md)).
 
 ## Embedding
+
+### Sessions and limits
 
 Runners open a [`Session`](crates/mizuchi-exec/src/lib.rs) from
 `SessionConfig` (memory limit, worker count, spill directory, allowed
 read/write paths, network grant), register Arrow record batches,
 Parquet/CSV/JSON/Avro/ORC files, Delta or Iceberg snapshots, or an
-Arrow C stream, and pull result batches. Parquet reads project to
-requested columns, skip row groups and pages that cannot match
-(`ParquetReadOptions::filters`), and late-materialize remaining columns. Cooperative cancellation is a
-`CancelToken`. `execute_sql_reported` / `write_parquet_reported` return
-a `QueryReport` (inputs after partition prune, outputs, version, plan).
-`write_delta` / `write_iceberg` commit a new snapshot; `TimeTravel`
+Arrow C stream, and pull result batches. Cooperative cancellation is a
+`CancelToken`. The engine opens TCP only when `SessionConfig.allow_network`
+is set (ADR [0008](docs/decisions/0008-network-sources-require-grant.md)).
+Runners apply OS filesystem, memory, and CPU limits; mizuchi honors
+`SessionConfig` and returns `Error::Io` or `Error::Memory` when a grant is
+denied. `mizuchi::VERSION` and `Session::explain` are the strings a runner
+records.
+
+### Formats and lake tables
+
+Parquet reads project to requested columns, skip row groups and pages that
+cannot match (`ParquetReadOptions::filters`), and late-materialize remaining
+columns. `write_delta` / `write_iceberg` commit a new snapshot; `TimeTravel`
 reads a past version. The same commits run on a caller-supplied
 `ObjectStore` (`write_delta_store` / `write_iceberg_store`).
-`IcebergRestCatalog` is a `CatalogProvider` for the Iceberg REST
-protocol (TCP only with `allow_network`). `Session::merge_sql` runs `MERGE INTO`.
-`Session::stream_query` opens a continuous micro-batch query
-(`StreamQuery`) with event-time watermarks, windows, and a
-checkpointed Parquet sink (ADR 0009).
+`IcebergRestCatalog` is a `CatalogProvider` for the Iceberg REST protocol
+(TCP only with `allow_network`). `Session::merge_sql` runs `MERGE INTO`.
+
+### Catalog and DDL
+
 `Catalog` resolves `catalog.namespace.table` (default `mizuchi.public`),
 optionally from a directory of JSON + Arrow schema files
 (`Catalog::open_file`). `Session::execute_ddl` runs `CREATE` / `DROP` /
-`ALTER TABLE`; `SHOW TABLES` lists a namespace (ADR 0010).
-`SessionConfig.query_api` (off by default) records query history and
-serves a versioned HTTP API (`/v1`, contract `mizuchi.query-api/v1` in
-`/healthz`) so external UIs can list completed queries, inspect plans and
-operator metrics, watch running queries, and cancel (ADR 0012). The JSON
-schema is `crates/mizuchi-exec/schemas/query-api-v1.json`. Bind address, optional bearer
-token or HS256 JWT/JWKS verifier, history path, and optional unpacked console
-directory (`ui_dir`, served at `/ui/`) are set by the embedder (ADR 0014);
-loopback listens do not require `allow_network`. `SessionConfig.governed`
-plus a `PolicyContext` (allowed tables, row filters, column masks, opaque
-table and column markings) apply in planning; off by default. Markings
-propagate through the plan into query and write reports. Governed writes
-refuse a destination whose declared labels do not cover the output.
-`mizuchi::VERSION` and `Session::explain` are the strings a runner
-records. A complete walk-through is `cargo run -p mizuchi --example embed`.
-The engine opens TCP only when `SessionConfig.allow_network` is set
-(ADR 0008). Runners apply OS filesystem, memory, and CPU limits; mizuchi
-honors `SessionConfig` and returns `Error::Io` or `Error::Memory` when a
-grant is denied. Optional Linux filesystem-limit tests use
-`--features sandbox` and `.github/workflows/sandbox.yml`
-(`workflow_dispatch` only). PostgreSQL source tests use
-`--features postgres` and `.github/workflows/postgres.yml`
-(`workflow_dispatch` only). Object-store S3 emulator tests (`--features s3
--- --ignored`) run in default CI against MinIO; the job fails if they
-are skipped. Lake REST HTTP remains `.github/workflows/lake-store.yml`
-(`workflow_dispatch` only). `Cluster` sizes in-process workers, scales
-them, and may run speculative task copies. Flight workers
-(`--features flight`, ADR 0011) are separate processes; the engine
-binds TCP only with `allow_network`. Layouts for a runner to
-deploy are under `deploy/`. Optional Flight tests use
-`.github/workflows/flight.yml` (`workflow_dispatch` only).
+`ALTER TABLE`; `SHOW TABLES` lists a namespace (ADR
+[0010](docs/decisions/0010-pluggable-catalog.md)).
+
+### Streaming
+
+`Session::stream_query` opens a continuous micro-batch query (`StreamQuery`)
+with event-time watermarks, windows, and a checkpointed Parquet sink (ADR
+[0009](docs/decisions/0009-stream-watermarks-and-checkpoints.md)).
+
+### Reports and the query API
+
+`execute_sql_reported` / `write_parquet_reported` return a `QueryReport`
+(inputs after partition prune, outputs, version, plan).
+`SessionConfig.query_api` (off by default) records query history and serves
+a versioned HTTP API (`/v1`, contract `mizuchi.query-api/v1` in `/healthz`)
+so external UIs can list completed queries, inspect plans and operator
+metrics, watch running queries, and cancel (ADR
+[0012](docs/decisions/0012-query-history-api.md)). The JSON schema is
+`crates/mizuchi-exec/schemas/query-api-v1.json`. Bind address, optional
+bearer token or HS256 JWT/JWKS verifier, history path, and optional unpacked
+console directory (`ui_dir`, served at `/ui/`) are set by the embedder (ADR
+[0014](docs/decisions/0014-serve-console-at-ui.md)); loopback listens do not
+require `allow_network`.
+
+### Governance
+
+`SessionConfig.governed` plus a `PolicyContext` (allowed tables, row
+filters, column masks, opaque table and column markings) apply in planning;
+off by default. Markings propagate through the plan into query and write
+reports. Governed writes refuse a destination whose declared labels do not
+cover the output.
+
+### Distributed execution (experimental)
+
+`Cluster` sizes in-process workers, scales them, and may run speculative
+task copies. Flight workers (`--features flight`, ADR
+[0011](docs/decisions/0011-flight-workers.md)) are separate processes; the
+engine binds TCP only with `allow_network`. Coordinator leadership is a
+leased, fenced singleton with standby takeover: every assignment carries a
+fencing token, workers refuse work from a superseded coordinator, and a
+batch query resumes from its last committed stage after a takeover (ADR
+[0016](docs/decisions/0016-fenced-coordinator-lease.md)). Without a lease
+directory a coordinator runs unfenced, as a single-coordinator deployment.
+Layouts for a runner to deploy are under `deploy/`. Optional Flight tests
+use `.github/workflows/flight.yml` (`workflow_dispatch` only).
 
 ## Releases
 
@@ -134,6 +247,14 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 bash scripts/validate-workflow-skills.sh
 ```
+
+Optional feature tests ship as manual workflows: Linux filesystem-limit
+tests (`--features sandbox`, `.github/workflows/sandbox.yml`), PostgreSQL
+source tests (`--features postgres`, `.github/workflows/postgres.yml`), and
+lake REST HTTP (`.github/workflows/lake-store.yml`), all
+`workflow_dispatch` only. Object-store S3 emulator tests (`--features s3 --
+--ignored`) run in default CI against MinIO; the job fails if they are
+skipped.
 
 Columnar kernel micro-benchmarks (filter, projection, aggregate, hash join):
 
