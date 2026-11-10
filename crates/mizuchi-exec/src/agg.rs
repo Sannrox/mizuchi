@@ -1056,8 +1056,21 @@ fn repartition_merge(
     }
 }
 
+/// Under a memory limit the dense perfect-hash index may take at most this
+/// share of the limit, so a sparse domain cannot starve later batches.
+const PERFECT_LIMIT_SHARE: u64 = 16;
+
+/// Whether a perfect-hash index for `spec` fits the pool. The index is
+/// charged with the table's retained bytes.
+fn perfect_fits(spec: &PerfectSpec, pool: &MemoryPool) -> bool {
+    let index = (spec.slots * std::mem::size_of::<u32>()) as u64;
+    pool.limit()
+        .is_none_or(|limit| index <= limit / PERFECT_LIMIT_SHARE)
+}
+
 /// Grouped aggregation that starts as a hash table and switches to a perfect
-/// hash when the first batch's key domain fits in [`PERFECT_MAX_SLOTS`].
+/// hash when the first batch's key domain fits in [`PERFECT_MAX_SLOTS`] and,
+/// under a memory limit, in [`PERFECT_LIMIT_SHARE`] of it.
 enum GroupedTable {
     Hash(HashAgg),
     Perfect(PerfectAgg),
@@ -1071,15 +1084,11 @@ impl GroupedTable {
     fn update(&mut self, batch: &Batch, pool: &MemoryPool) -> Result<()> {
         match self {
             Self::Hash(table) => {
-                // Memory-limited queries keep a hash table. A dense index of
-                // [`PERFECT_MAX_SLOTS`] would steal budget from later batches.
-                if table.grouped
-                    && table.n_groups() == 0
-                    && batch.num_rows() > 0
-                    && !pool.has_limit()
-                {
+                if table.grouped && table.n_groups() == 0 && batch.num_rows() > 0 {
                     let key_cols = eval_all(&table.group_exprs, batch)?;
-                    if let Some(spec) = infer_spec(&key_cols) {
+                    if let Some(spec) =
+                        infer_spec(&key_cols).filter(|spec| perfect_fits(spec, pool))
+                    {
                         let mut perfect = PerfectAgg::from_hash(table, spec)?;
                         perfect.update_encoded(batch, &key_cols)?;
                         *self = Self::Perfect(perfect);
@@ -4221,6 +4230,47 @@ mod tests {
             "peak {} reserved the dense index",
             pool.peak()
         );
+    }
+
+    #[test]
+    fn memory_limited_small_domain_uses_the_perfect_hash() {
+        // q1 shape: one-byte string keys, a 257x257 index well under the cap.
+        let in_schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Utf8, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batch = Batch::try_new(
+            in_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["A", "N", "R", "N"])),
+                Arc::new(StringArray::from(vec!["F", "O", "F", "F"])),
+            ],
+        )
+        .unwrap();
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Utf8, false),
+            Field::new("s", DataType::Utf8, false),
+            Field::new("c", DataType::Int64, true),
+        ]));
+        let group = [
+            NamedExpr {
+                expr: Expr::nth(0),
+                name: "f".into(),
+            },
+            NamedExpr {
+                expr: Expr::nth(1),
+                name: "s".into(),
+            },
+        ];
+        let aggs = [("c".to_string(), AggCall::CountStar)];
+        let update = |limit: u64| {
+            let pool = MemoryPool::new(Some(limit), None).unwrap();
+            let mut table = GroupedTable::new(&group, &aggs, out_schema.clone()).unwrap();
+            table.update(&batch, &pool).unwrap();
+            matches!(table, GroupedTable::Perfect(_))
+        };
+        assert!(update(256 << 20), "a 264 KB index fits a 256 MiB cap");
+        assert!(!update(1 << 20), "a 264 KB index is over 1/16 of 1 MiB");
     }
 
     #[test]
