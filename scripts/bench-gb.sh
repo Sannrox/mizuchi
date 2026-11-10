@@ -2,6 +2,8 @@
 # Generate decision-support Parquet and time mizuchi, DuckDB, and DataFusion.
 # Large files stay in bench-data/ (gitignored). Default cargo test does not
 # invoke this script. Usage: scripts/bench-gb.sh [tiny|1|10]
+# BENCH_PROFILE=constrained runs every engine with one worker, a 256 MiB cap,
+# and Parquet read by each query; results land in <label>/constrained/.
 
 set -o errexit
 set -o nounset
@@ -14,6 +16,7 @@ SF="${1:-tiny}"
 OUT="${BENCH_DATA:-${ROOT}/bench-data}"
 REPEATS="${BENCH_REPEATS:-3}"
 WORKERS="${BENCH_WORKERS:-2}"
+PROFILE="${BENCH_PROFILE:-in_memory}"
 
 case "${SF}" in
   tiny) LABEL=tiny ;;
@@ -33,17 +36,27 @@ else
   PYTHON=python3
 fi
 
-echo "bench-gb sf=${SF} label=${LABEL} out=${OUT} python=${PYTHON} workers=${WORKERS}"
+case "${PROFILE}" in
+  in_memory) FLAG=(); RESULTS="${OUT}/${LABEL}" ;;
+  constrained) FLAG=(--constrained); RESULTS="${OUT}/${LABEL}/constrained" ;;
+  *)
+    echo "BENCH_PROFILE must be in_memory or constrained" >&2
+    exit 2
+    ;;
+esac
+
+echo "bench-gb sf=${SF} label=${LABEL} out=${OUT} python=${PYTHON} workers=${WORKERS} profile=${PROFILE}"
 
 cargo run --release --example gb_bench -- generate --sf "${SF}" --out "${OUT}"
 cargo run --release --example gb_bench -- run --sf "${SF}" --dir "${OUT}" \
-  --repeats "${REPEATS}" --workers "${WORKERS}" --json "${OUT}/${LABEL}/mizuchi.json"
+  --repeats "${REPEATS}" --workers "${WORKERS}" ${FLAG[@]+"${FLAG[@]}"} \
+  --json "${RESULTS}/mizuchi.json"
 
 "${PYTHON}" "${ROOT}/scripts/bench_gb_ref.py" \
   --sf "${SF}" --dir "${OUT}" --repeats "${REPEATS}" --engine duckdb \
-  --json "${OUT}/${LABEL}/duckdb.json"
+  ${FLAG[@]+"${FLAG[@]}"} --json "${RESULTS}/duckdb.json"
 "${PYTHON}" "${ROOT}/scripts/bench_gb_ref.py" \
   --sf "${SF}" --dir "${OUT}" --repeats "${REPEATS}" --engine datafusion \
-  --json "${OUT}/${LABEL}/datafusion.json"
+  ${FLAG[@]+"${FLAG[@]}"} --json "${RESULTS}/datafusion.json"
 
-echo "results under ${OUT}/${LABEL}/"
+echo "results under ${RESULTS}/"
