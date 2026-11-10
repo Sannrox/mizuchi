@@ -1,6 +1,6 @@
 //! Session resource config for embedding runners.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use mizuchi_core::error::{Error, Result};
 use mizuchi_io::EncryptionSession;
@@ -17,9 +17,11 @@ pub struct SessionConfig {
     /// Morsel and stage worker threads. `None` uses one worker (the pull
     /// iterator path).
     pub workers: Option<usize>,
-    /// Directory for operator spill files. Removed per query.
+    /// Directory for operator spill files. Removed per query. Must sit
+    /// under [`Self::allowed_write_paths`] when that list is non-empty.
     pub spill_dir: Option<PathBuf>,
-    /// Directory for shuffle IPC files.
+    /// Directory for shuffle IPC files. Must sit under
+    /// [`Self::allowed_write_paths`] when that list is non-empty.
     pub shuffle_dir: Option<PathBuf>,
     /// Roots that [`super::Session::register_parquet`],
     /// [`super::Session::register_csv`], Delta/Iceberg reads, and other
@@ -53,49 +55,32 @@ pub(super) fn resolve_roots(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 }
 
 pub(super) fn assert_allowed(path: &Path, roots: &[PathBuf]) -> Result<()> {
+    allowed(path, roots).map(|_| ())
+}
+
+/// `path` resolved under one of `roots`, or `path` unchanged when `roots` is
+/// empty. Callers that keep the path for later writes keep the resolved one,
+/// so the checked location is the written location.
+pub(super) fn allowed(path: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
     if roots.is_empty() {
-        return Ok(());
+        return Ok(path.to_path_buf());
     }
-    let path = resolve(path)?;
-    for root in roots {
-        if path.starts_with(root) {
-            return Ok(());
-        }
+    let resolved = resolve(path)?;
+    if roots.iter().any(|root| resolved.starts_with(root)) {
+        return Ok(resolved);
     }
     Err(Error::Io(format!(
         "{} is outside allowed paths",
-        path.display()
+        resolved.display()
     )))
 }
 
-/// Absolute, `..`-normalized path. Canonicalizes the longest existing prefix
-/// so allow-list roots on macOS (`/var` vs `/private/var`) still match.
+/// Absolute path resolved the way the filesystem resolves it: the longest
+/// existing prefix is canonicalized (symlinks and `..` in order, and macOS
+/// `/var` vs `/private/var`), and the part that does not exist yet may only
+/// name new entries. A dangling symlink counts as existing, so it fails to
+/// canonicalize instead of being created through.
 fn resolve(path: &Path) -> Result<PathBuf> {
-    let abs = absolute(path)?;
-    let mut prefix = abs.clone();
-    let mut suffix = PathBuf::new();
-    while !prefix.as_os_str().is_empty() && !prefix.exists() {
-        match (prefix.file_name(), prefix.parent()) {
-            (Some(name), Some(parent)) => {
-                let mut next = PathBuf::from(name);
-                next.push(&suffix);
-                suffix = next;
-                prefix = parent.to_path_buf();
-            }
-            _ => break,
-        }
-    }
-    if prefix.exists() {
-        let mut out = std::fs::canonicalize(&prefix)
-            .map_err(|e| Error::Io(format!("{}: {e}", prefix.display())))?;
-        out.push(suffix);
-        Ok(out)
-    } else {
-        Ok(abs)
-    }
-}
-
-fn absolute(path: &Path) -> Result<PathBuf> {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -103,23 +88,23 @@ fn absolute(path: &Path) -> Result<PathBuf> {
             .map_err(|e| Error::Io(e.to_string()))?
             .join(path)
     };
-    Ok(normalize(&abs))
-}
-
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::Prefix(p) => out.push(p.as_os_str()),
-            Component::RootDir => out.push(c.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let _ = out.pop();
+    let mut prefix = abs.as_path();
+    let mut suffix = Vec::new();
+    while std::fs::symlink_metadata(prefix).is_err() {
+        match (prefix.file_name(), prefix.parent()) {
+            (Some(name), Some(parent)) => {
+                suffix.push(name);
+                prefix = parent;
             }
-            Component::Normal(s) => out.push(s),
+            _ => {
+                return Err(Error::Io(format!("{} cannot be resolved", path.display())));
+            }
         }
     }
-    out
+    let mut out = std::fs::canonicalize(prefix)
+        .map_err(|e| Error::Io(format!("{}: {e}", prefix.display())))?;
+    out.extend(suffix.iter().rev());
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -165,5 +150,23 @@ mod tests {
         let err = assert_allowed(&root.join("..").join("nope.parquet"), &roots).unwrap_err();
         assert!(matches!(err, Error::Io(_)), "{err:?}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_after_symlink_follows_the_link() {
+        let base = std::env::temp_dir().join(format!("mizuchi-allow-link-{}", std::process::id()));
+        let root = base.join("root");
+        let outside = base.join("outside").join("child");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let roots = resolve_roots(vec![root.clone()]).unwrap();
+        let escape = root.join("link").join("..").join("spill");
+        let err = allowed(&escape, &roots).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        let inside = allowed(&root.join("new").join("spill"), &roots).unwrap();
+        assert!(inside.starts_with(&roots[0]), "{}", inside.display());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

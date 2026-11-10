@@ -40,7 +40,7 @@ parquet = { version = "60.0.0", default-features = false, features = ["arrow", "
 sekai-keys = { git = "https://github.com/Sannrox/sekai-chisei.git", rev = "1b2e12789a2b360759a087252367cf4bc633caf0" }
 aes-gcm = "0.10"
 rand = { version = "0.8", features = ["std"] }
-sqlparser = { version = "0.63.0" }
+sqlparser = { version = "0.63.0", features = ["visitor"] }
 object_store = { version = "0.14.1", default-features = false }
 futures = { version = "0.3.31", default-features = false, features = ["std", "executor"] }
 bytes = { version = "1.12.1", default-features = false }
