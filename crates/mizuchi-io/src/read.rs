@@ -21,8 +21,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
-    ArrowPredicateFn, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowFilter, RowSelection,
-    RowSelector,
+    ArrowPredicateFn, ArrowReaderOptions, ParquetRecordBatchReader,
+    ParquetRecordBatchReaderBuilder, RowFilter, RowSelection, RowSelector,
 };
 use parquet::bloom_filter::Sbbf;
 use parquet::file::metadata::PageIndexPolicy;
@@ -207,16 +207,37 @@ pub fn read_parquet_reported(
     path: impl AsRef<Path>,
     opts: ParquetReadOptions<'_>,
 ) -> Result<(Vec<Batch>, ParquetScanStats)> {
+    let (batches, scan) = stream_parquet(path, &opts)?;
+    Ok((batches.collect::<Result<_>>()?, scan))
+}
+
+/// Open a Parquet file for decode on demand. Prune runs now, from the footer;
+/// row groups decode one record batch per [`Iterator::next`], so a caller
+/// that drops each morsel holds one decoded batch at a time.
+pub fn stream_parquet(
+    path: impl AsRef<Path>,
+    opts: &ParquetReadOptions<'_>,
+) -> Result<(ParquetBatches, ParquetScanStats)> {
     let path = path.as_ref();
     let file = File::open(path).map_err(|e| io_err(path, e))?;
+    stream_parquet_file(file, &path.display().to_string(), opts)
+}
+
+/// [`stream_parquet`] over a file the caller already opened, so the caller
+/// can check that handle's identity before and after the read.
+pub fn stream_parquet_file(
+    file: File,
+    label: &str,
+    opts: &ParquetReadOptions<'_>,
+) -> Result<(ParquetBatches, ParquetScanStats)> {
     require_encrypted_footer_file(&file, opts.encryption)?;
     let bloom = file.try_clone().ok();
     let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
         file,
         parquet_reader_options_with(opts.encryption)?,
     )
-    .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
-    read_parquet_from_builder(builder, &opts, &path.display().to_string(), bloom.as_ref())
+    .map_err(|e| Error::Io(format!("{label}: {e}")))?;
+    stream_parquet_from_builder(builder, opts, label, bloom.as_ref())
 }
 
 /// Decode a Parquet builder (file or object bytes) with the same prune rules.
@@ -226,6 +247,68 @@ pub fn read_parquet_from_builder<R>(
     label: &str,
     bloom: Option<&R>,
 ) -> Result<(Vec<Batch>, ParquetScanStats)>
+where
+    R: ChunkReader + 'static,
+{
+    let (batches, scan) = stream_parquet_from_builder(builder, opts, label, bloom)?;
+    Ok((batches.collect::<Result<_>>()?, scan))
+}
+
+/// Decoded morsels of one Parquet file, produced on demand.
+pub struct ParquetBatches {
+    schema: SchemaRef,
+    reader: Option<ParquetRecordBatchReader>,
+    pending: std::vec::IntoIter<Batch>,
+    policy: BatchPolicy,
+    label: String,
+}
+
+impl ParquetBatches {
+    /// Schema of every batch this stream yields (after projection).
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+impl Iterator for ParquetBatches {
+    type Item = Result<Batch>;
+
+    fn next(&mut self) -> Option<Result<Batch>> {
+        loop {
+            if let Some(batch) = self.pending.next() {
+                return Some(Ok(batch));
+            }
+            let decoded = self
+                .reader
+                .as_mut()?
+                .next()?
+                .map_err(|e| Error::Io(format!("{}: {e}", self.label)))
+                .and_then(Batch::from_arrow);
+            match decoded {
+                Ok(batch) => {
+                    self.pending = batch
+                        .split_by_policy(&self.policy)
+                        .into_iter()
+                        .filter(|b| b.num_rows() > 0)
+                        .collect::<Vec<_>>()
+                        .into_iter();
+                }
+                Err(err) => {
+                    self.reader = None;
+                    return Some(Err(err));
+                }
+            }
+        }
+    }
+}
+
+/// [`stream_parquet`] over any Parquet builder (file or object bytes).
+pub fn stream_parquet_from_builder<R>(
+    builder: ParquetRecordBatchReaderBuilder<R>,
+    opts: &ParquetReadOptions<'_>,
+    label: &str,
+    bloom: Option<&R>,
+) -> Result<(ParquetBatches, ParquetScanStats)>
 where
     R: ChunkReader + 'static,
 {
@@ -286,19 +369,18 @@ where
         compressed_bytes_kept,
     };
 
-    if keep_groups.is_empty() {
-        return Ok((Vec::new(), scan));
-    }
-
-    let page_selectors = opts.filters.and_then(|preds| {
-        page_selection(
-            builder.metadata().as_ref(),
-            &keep_groups,
-            &column_names,
-            preds,
-            flat,
-        )
-    });
+    let page_selectors = opts
+        .filters
+        .filter(|_| !keep_groups.is_empty())
+        .and_then(|preds| {
+            page_selection(
+                builder.metadata().as_ref(),
+                &keep_groups,
+                &column_names,
+                preds,
+                flat,
+            )
+        });
 
     let batch_size = opts.policy.max_rows().unwrap_or(DEFAULT_MAX_ROWS);
     let mut builder = builder
@@ -320,7 +402,89 @@ where
     let reader = builder
         .build()
         .map_err(|e| Error::Io(format!("{label}: {e}")))?;
-    Ok((collect_reader(reader, &opts.policy)?, scan))
+    let batches = ParquetBatches {
+        schema: arrow::array::RecordBatchReader::schema(&reader),
+        reader: Some(reader),
+        pending: Vec::new().into_iter(),
+        policy: opts.policy,
+        label: label.to_string(),
+    };
+    Ok((batches, scan))
+}
+
+/// Footer totals of one Parquet file, read without decoding any page.
+#[derive(Clone, Debug)]
+pub struct ParquetFooter {
+    /// Rows in the file.
+    pub rows: u64,
+    /// Int64 range and null count per root column, in file order. A bound is
+    /// `None` when any row group lacks it.
+    pub columns: Vec<ColumnFooter>,
+}
+
+/// One column's totals across every row group of a file.
+#[derive(Clone, Debug)]
+pub struct ColumnFooter {
+    /// Column name.
+    pub name: String,
+    /// Smallest Int64 (or widened Int32) value.
+    pub min_i64: Option<i64>,
+    /// Largest Int64 (or widened Int32) value.
+    pub max_i64: Option<i64>,
+    /// Null rows, when every row group records them.
+    pub null_count: Option<u64>,
+}
+
+/// Read the footer of a Parquet file for table statistics.
+pub fn parquet_footer(
+    path: impl AsRef<Path>,
+    encryption: Option<&EncryptionSession>,
+) -> Result<ParquetFooter> {
+    let path = path.as_ref();
+    let file = File::open(path).map_err(|e| io_err(path, e))?;
+    require_encrypted_footer_file(&file, encryption)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+        file,
+        parquet_reader_options_with(encryption)?,
+    )
+    .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+    let names: Vec<String> = builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    let groups = builder.metadata().row_groups();
+    let mut columns: Vec<ColumnFooter> = names
+        .iter()
+        .map(|name| ColumnFooter {
+            name: name.clone(),
+            min_i64: None,
+            max_i64: None,
+            null_count: Some(0),
+        })
+        .collect();
+    let mut rows = 0u64;
+    for (gi, rg) in groups.iter().enumerate() {
+        rows += rg.num_rows().max(0) as u64;
+        let flat = rg.columns().len() == names.len();
+        let (ranges, _) = footer_ranges(rg, &names);
+        for (ci, col) in columns.iter_mut().enumerate() {
+            let nulls = flat
+                .then(|| rg.column(ci).statistics()?.null_count_opt())
+                .flatten();
+            col.null_count = col.null_count.zip(nulls).map(|(a, b)| a + b);
+            let range = ranges.iter().find(|r| r.name == col.name);
+            let (min, max) = range.map_or((None, None), |r| (r.min_i64, r.max_i64));
+            if gi == 0 {
+                (col.min_i64, col.max_i64) = (min, max);
+            } else {
+                col.min_i64 = col.min_i64.zip(min).map(|(a, b)| a.min(b));
+                col.max_i64 = col.max_i64.zip(max).map(|(a, b)| a.max(b));
+            }
+        }
+    }
+    Ok(ParquetFooter { rows, columns })
 }
 
 /// Read a CSV file into engine batches.

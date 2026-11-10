@@ -29,6 +29,7 @@ mod sort;
 mod stage;
 mod stage_commit;
 mod stream;
+mod table_data;
 mod window;
 
 use std::cell::RefCell;
@@ -206,7 +207,7 @@ struct TableSource {
 #[derive(Clone, Debug)]
 struct MemTable {
     schema: SchemaRef,
-    batches: Vec<Batch>,
+    data: table_data::TableData,
     stats: mizuchi_plan::TableStats,
     /// Bumped on every [`Session::register`] of this name.
     generation: u64,
@@ -479,7 +480,7 @@ impl Session {
             name,
             MemTable {
                 schema,
-                batches,
+                data: table_data::TableData::Resident(batches),
                 stats,
                 generation,
                 source: TableSource::default(),
@@ -524,7 +525,7 @@ impl Session {
                     name,
                     MemTable {
                         schema,
-                        batches: Vec::new(),
+                        data: table_data::TableData::Resident(Vec::new()),
                         stats,
                         generation: 1,
                         source: TableSource::default(),
@@ -593,14 +594,25 @@ impl Session {
                 let name = ident.sql_name();
                 let current = self.catalog.table(&name)?.clone();
                 let next = apply_alter(current.as_ref(), &action)?;
+                // Reshape (decoding a file-backed table) before the catalog
+                // changes, so a failed read leaves both untouched.
+                let reshaped = match self.tables.get(&normalize_name(&name)) {
+                    Some(_) => Some(reshape_batches(
+                        &self.table_data(&name)?.1,
+                        next.clone(),
+                        &action,
+                    )?),
+                    None => None,
+                };
                 self.catalog.alter_table(&ident, next.clone())?;
-                if let Some(table) = self.tables.get_mut(&normalize_name(&name)) {
+                if let Some(table) = self.tables.get_mut(&normalize_name(&name))
+                    && let Some(batches) = reshaped
+                {
                     let kept_cols = table.stats.partition_columns.clone();
                     let kept_parts = table.stats.partitions.clone();
-                    table.batches = reshape_batches(&table.batches, next.clone(), &action)?;
                     table.schema = next.clone();
-                    table.stats =
-                        mizuchi_plan::table_stats_from_batches(next.as_ref(), &table.batches);
+                    table.stats = mizuchi_plan::table_stats_from_batches(next.as_ref(), &batches);
+                    table.data = table_data::TableData::Resident(batches);
                     table.stats.partition_columns = kept_cols;
                     table.stats.partitions = kept_parts;
                     table.generation = table.generation.saturating_add(1);
@@ -618,8 +630,10 @@ impl Session {
         show_tables_batches(&catalog, namespace)
     }
 
-    /// Register a Parquet file or dataset directory as an in-memory table
-    /// after the read allow-list check.
+    /// Register a Parquet file or dataset directory after the read allow-list
+    /// check. Registration reads footers only; each scan decodes the files on
+    /// demand, so input rows never sit in session memory. A file changed
+    /// after registration fails the scan; register it again to pick it up.
     pub fn register_parquet(
         &mut self,
         name: impl Into<String>,
@@ -636,17 +650,22 @@ impl Session {
             policy: opts.policy,
             encryption: opts.encryption.or(keys.as_ref()),
         };
-        let (batches, source) = read_parquet_tree(path, opts)?;
-        let schema = match batches.first() {
-            Some(batch) => batch.schema(),
-            None => {
-                return Err(Error::Io(format!("{} produced no batches", path.display())));
-            }
-        };
-        let name = name.into();
-        self.register(name.clone(), schema, batches)?;
-        if let Some(table) = self.tables.get_mut(&normalize_name(&name)) {
-            table.source = source;
+        let files = parquet_files(path)?;
+        if files.is_empty() {
+            return Err(Error::Io(format!(
+                "{} has no parquet files",
+                path.display()
+            )));
+        }
+        let (data, schema, stats) = table_data::ParquetFiles::open(&files, &opts)?;
+        let name = normalize_name(&name.into());
+        self.register(name.clone(), schema, Vec::new())?;
+        if let Some(table) = self.tables.get_mut(&name) {
+            table.data = table_data::TableData::Parquet(data);
+            table.source = table_source_from_files(path, &files);
+            table.stats.row_count = stats.row_count;
+            table.stats.columns = stats.columns;
+            self.catalog.set_stats(name, table.stats.clone())?;
         }
         Ok(())
     }
@@ -859,13 +878,20 @@ impl Session {
         })))
     }
 
-    /// Batches and schema of a registered table.
+    /// Batches and schema of a registered table. A Parquet-backed table is
+    /// decoded in full here, so prefer a query for large inputs.
     pub fn table_data(&self, name: &str) -> Result<(SchemaRef, Vec<Batch>)> {
         let table = self
             .tables
             .get(&normalize_name(name))
             .ok_or_else(|| Error::Plan(format!("table not found: {name}")))?;
-        Ok((table.schema.clone(), table.batches.clone()))
+        let batches = match &table.data {
+            table_data::TableData::Resident(batches) => batches.clone(),
+            table_data::TableData::Parquet(files) => files
+                .morsels(None, &[], &self.policy)
+                .collect::<Result<_>>()?,
+        };
+        Ok((table.schema.clone(), batches))
     }
 
     /// Apply a `MERGE` statement to a registered target table.
@@ -1495,16 +1521,32 @@ impl Session {
         Ok(pool)
     }
 
-    pub(crate) fn table_morsels(&self, table: &str) -> Result<Vec<Batch>> {
+    /// Morsels of a registered table, produced on demand. `columns` and
+    /// `filters` (see [`table_data::scan_columns`]) let a file-backed table
+    /// skip what the scan does not need; batches may carry extra columns, so
+    /// callers select by name. Resident tables ignore both.
+    pub(crate) fn table_morsels(
+        &self,
+        table: &str,
+        columns: Option<Vec<String>>,
+        filters: &[Expr],
+    ) -> Result<table_data::Morsels> {
         let table = self
             .tables
             .get(&normalize_name(table))
             .ok_or_else(|| Error::Plan(format!("table not found at execution: {table}")))?;
-        let mut morsels = Vec::new();
-        for batch in &table.batches {
-            morsels.extend(batch.split_by_policy(&self.policy));
-        }
-        Ok(morsels)
+        Ok(match &table.data {
+            table_data::TableData::Resident(batches) => table_data::Morsels::Resident(
+                batches
+                    .iter()
+                    .flat_map(|b| b.split_by_policy(&self.policy))
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            ),
+            table_data::TableData::Parquet(files) => {
+                table_data::Morsels::Files(Box::new(files.morsels(columns, filters, &self.policy)))
+            }
+        })
     }
 
     fn bind_optimized(&self, sql: &str) -> Result<LogicalPlan> {
@@ -1524,6 +1566,7 @@ impl Session {
         plan: &LogicalPlan,
         run: impl FnOnce() -> Result<Vec<Batch>>,
     ) -> Result<Vec<Batch>> {
+        self.check_file_tables(plan)?;
         let key = cache::key(plan, &self.table_generations());
         if let Some(hit) = self
             .cache
@@ -1541,6 +1584,19 @@ impl Session {
         Ok(out)
     }
 
+    /// Fail when a file behind a table that `plan` scans changed since it
+    /// was registered, so a cached result never hides the change.
+    fn check_file_tables(&self, plan: &LogicalPlan) -> Result<()> {
+        for name in cache::scanned_tables(plan) {
+            if let Some(table) = self.tables.get(&normalize_name(&name))
+                && let table_data::TableData::Parquet(files) = &table.data
+            {
+                files.check()?;
+            }
+        }
+        Ok(())
+    }
+
     fn table_generations(&self) -> BTreeMap<String, u64> {
         self.tables
             .iter()
@@ -1555,31 +1611,15 @@ impl Session {
     }
 }
 
-fn read_parquet_tree(
-    path: &Path,
-    opts: mizuchi_io::ParquetReadOptions<'_>,
-) -> Result<(Vec<Batch>, TableSource)> {
+/// Parquet files under `path` in sorted order, or `path` itself for a file.
+fn parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
     let mut files = Vec::new();
-    if path.is_dir() {
-        collect_parquet_files(path, &mut files)?;
-        files.sort();
-    } else {
-        files.push(path.to_path_buf());
-    }
-    let mut out = Vec::new();
-    for file in &files {
-        out.extend(mizuchi_io::read_parquet(
-            file,
-            mizuchi_io::ParquetReadOptions {
-                projection: opts.projection,
-                prune_row_group: opts.prune_row_group,
-                filters: opts.filters,
-                policy: opts.policy,
-                encryption: opts.encryption,
-            },
-        )?);
-    }
-    Ok((out, table_source_from_files(path, &files)))
+    collect_parquet_files(path, &mut files)?;
+    files.sort();
+    Ok(files)
 }
 
 fn table_source_from_files(root: &Path, files: &[PathBuf]) -> TableSource {
@@ -1800,6 +1840,14 @@ impl Lowering for CpuLowering {
         Self::scan(batches)
     }
 
+    fn scan_stream(
+        &self,
+        input: Box<dyn Operator>,
+        _cancel: &CancelToken,
+    ) -> Result<Box<dyn Operator>> {
+        Ok(input)
+    }
+
     fn filter(&self, input: Box<dyn Operator>, predicate: Expr) -> Result<Box<dyn Operator>> {
         Self::filter(input, predicate)
     }
@@ -1922,6 +1970,60 @@ pub(crate) fn physical_with_work(
     Ok(build_physical(plan, session, pool, analyze, work)?.0)
 }
 
+/// Scan operator over a table's morsels: projection, scan filters, then
+/// runtime join-key preds, one morsel at a time.
+struct TableScan {
+    morsels: table_data::Morsels,
+    projection: Option<Vec<String>>,
+    filters: Vec<Expr>,
+    runtime: Vec<Expr>,
+    ready: std::collections::VecDeque<Batch>,
+}
+
+impl TableScan {
+    fn apply(&self, mut batch: Batch) -> Result<Option<Batch>> {
+        let project_first = self
+            .projection
+            .as_ref()
+            .is_some_and(|names| filters_on_projected(&self.filters, names));
+        if project_first && let Some(names) = &self.projection {
+            batch = project_named(batch, names)?;
+        }
+        for pred in &self.filters {
+            match filter_batch(&batch, pred)? {
+                Some(kept) => batch = kept,
+                None => return Ok(None),
+            }
+        }
+        if !project_first && let Some(names) = &self.projection {
+            batch = project_named(batch, names)?;
+        }
+        if self.runtime.is_empty() {
+            return Ok(Some(batch));
+        }
+        runtime_filter::apply_runtime_preds(batch, &self.runtime)
+    }
+}
+
+impl Operator for TableScan {
+    fn next_batch(&mut self, cancel: &CancelToken) -> Result<Option<Batch>> {
+        loop {
+            cancel.check()?;
+            if let Some(batch) = self.ready.pop_front() {
+                return Ok(Some(batch));
+            }
+            let Some(morsel) = self.morsels.next().transpose()? else {
+                return Ok(None);
+            };
+            if let Some(batch) = self.apply(morsel)?
+                && batch.num_rows() > 0
+            {
+                self.ready.push_back(batch);
+            }
+        }
+    }
+}
+
 pub(crate) fn build_physical(
     plan: &LogicalPlan,
     session: &Session,
@@ -1975,48 +2077,16 @@ fn build_physical_filtered(
             schema,
             ..
         } => {
-            let table = session
-                .tables
-                .get(&normalize_name(table))
-                .ok_or_else(|| Error::Plan(format!("table not found at execution: {table}")))?;
-            let source: Vec<&Batch> = table.batches.iter().collect();
-            let mut morsels = Vec::new();
-            for batch in source {
-                let mut batch = batch.clone();
-                let project_first = projection
-                    .as_ref()
-                    .is_some_and(|names| filters_on_projected(filters, names));
-                if project_first && let Some(names) = projection {
-                    batch = project_named(batch, names)?;
-                }
-                for pred in filters {
-                    match filter_batch(&batch, pred)? {
-                        Some(kept) => batch = kept,
-                        None => {
-                            batch = Batch::empty(batch.schema())?;
-                            break;
-                        }
-                    }
-                }
-                if !project_first && let Some(names) = projection {
-                    batch = project_named(batch, names)?;
-                }
-                if runtime.is_empty() {
-                    morsels.extend(batch.split_by_policy(&session.policy));
-                } else if runtime.iter().all(runtime_filter::is_range) {
-                    // Ranges only skip, so check each morsel: whole morsels drop out.
-                    for morsel in batch.split_by_policy(&session.policy) {
-                        if let Some(kept) = runtime_filter::apply_runtime_preds(morsel, runtime)? {
-                            morsels.push(kept);
-                        }
-                    }
-                } else if let Some(kept) = runtime_filter::apply_runtime_preds(batch, runtime)? {
-                    // Row filters first, so the surviving rows form full morsels.
-                    morsels.extend(kept.split_by_policy(&session.policy));
-                }
-            }
-            let (op, mut node) =
-                metrics::finish("Scan", lowering.scan(morsels)?, Vec::new(), analyze, pool);
+            let columns = table_data::scan_columns(projection.as_deref(), filters);
+            let source = TableScan {
+                morsels: session.table_morsels(table, columns, filters)?,
+                projection: projection.clone(),
+                filters: filters.clone(),
+                runtime: runtime.to_vec(),
+                ready: std::collections::VecDeque::new(),
+            };
+            let scan = lowering.scan_stream(Box::new(source), &session.exec_token())?;
+            let (op, mut node) = metrics::finish("Scan", scan, Vec::new(), analyze, pool);
             if let Some(rf) = runtime_detail(runtime, schema.as_ref()) {
                 node.detail = rf;
             }

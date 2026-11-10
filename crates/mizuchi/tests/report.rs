@@ -133,3 +133,95 @@ fn store_pruned_scan_report_matches_fetched_partitions() {
     assert_eq!(scan.partitions, vec!["year=2020"]);
     assert_eq!(scan.dataset, "ds");
 }
+
+#[test]
+fn registered_parquet_changed_on_disk_fails_until_registered_again() {
+    let dir = tmp("changed");
+    let file = dir.join("t.parquet");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Session::new();
+    let write = |s: &Session, batches: &[Batch]| {
+        s.write_parquet(
+            &file,
+            batches,
+            ParquetWriteOptions {
+                partition_by: &[],
+                mode: WriteMode::Overwrite,
+                encryption: None,
+            },
+        )
+        .unwrap();
+    };
+    write(&s, &[sample()]);
+    s.register_parquet("t", &file, ParquetReadOptions::default())
+        .unwrap();
+    let count = |s: &Session, tag: i64| -> mizuchi::Result<i64> {
+        let out = s.execute_sql(&format!("SELECT COUNT(*) AS n FROM t WHERE id <> {tag}"))?;
+        Ok(out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0))
+    };
+    assert_eq!(count(&s, -1).unwrap(), 3);
+
+    write(&s, &[sample(), sample()]);
+    for tag in [-1, -2] {
+        // -1 repeats the first query, so its cached result must not answer.
+        let err = count(&s, tag).unwrap_err().to_string();
+        assert!(err.contains("changed since it was registered"), "{err}");
+    }
+    let err = s
+        .execute_ddl("ALTER TABLE t ADD COLUMN z BIGINT")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("changed since it was registered"),
+        "{err}"
+    );
+    assert_eq!(
+        s.catalog().table("t").unwrap().fields().len(),
+        3,
+        "catalog kept"
+    );
+
+    s.register_parquet("t", &file, ParquetReadOptions::default())
+        .unwrap();
+    assert_eq!(count(&s, -3).unwrap(), 6);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn decimal_filter_on_registered_parquet_is_not_pruned_by_raw_stats() {
+    use arrow::array::Decimal128Array;
+    let dir = tmp("decimal");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.parquet");
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "amount",
+        mizuchi::DataType::Decimal128(9, 2),
+        false,
+    )]));
+    // Stored unscaled as 100 and 250: raw footer stats exceed the literal 2.
+    let amounts = Decimal128Array::from(vec![100, 250])
+        .with_precision_and_scale(9, 2)
+        .unwrap();
+    let batch =
+        Batch::from_arrow(RecordBatch::try_new(schema, vec![Arc::new(amounts)]).unwrap()).unwrap();
+    let mut s = Session::new();
+    s.write_parquet(&file, &[batch], ParquetWriteOptions::default())
+        .unwrap();
+    s.register_parquet("t", &file, ParquetReadOptions::default())
+        .unwrap();
+    let out = s
+        .execute_sql("SELECT COUNT(*) AS n FROM t WHERE amount < 2")
+        .unwrap();
+    let n = out[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

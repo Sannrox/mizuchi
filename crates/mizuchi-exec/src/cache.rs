@@ -43,9 +43,15 @@ impl QueryCache {
     }
 }
 
-pub(super) fn key(plan: &LogicalPlan, generations: &BTreeMap<String, u64>) -> CacheKey {
+/// Names of the tables `plan` scans, as the cache keys them.
+pub(super) fn scanned_tables(plan: &LogicalPlan) -> BTreeSet<String> {
     let mut tables = BTreeSet::new();
     collect_tables(plan, &mut tables);
+    tables
+}
+
+pub(super) fn key(plan: &LogicalPlan, generations: &BTreeMap<String, u64>) -> CacheKey {
+    let tables = scanned_tables(plan);
     let mut versions = BTreeMap::new();
     for table in tables {
         let generation = generations.get(&table).copied().unwrap_or(0);
