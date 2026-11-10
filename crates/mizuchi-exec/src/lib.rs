@@ -5675,8 +5675,35 @@ mod tests {
         let err = s
             .clone()
             .with_memory_limit(cap)
-            .execute_sql("SELECT g, COUNT(*) AS c FROM t GROUP BY g");
+            .execute_sql("SELECT a, COUNT(*) AS c FROM t GROUP BY a");
         assert!(matches!(err, Err(Error::Memory(_))), "{err:?}");
+    }
+
+    #[test]
+    fn few_groups_over_large_input_stay_under_a_small_cap() {
+        // q1 shape: input is many times the cap; one batch plus 7 groups fit.
+        let (s, tight) = register_numbered(64, 32);
+        let cap = tight * 3;
+        let root = spill_root("fewgroups");
+        let limited = s
+            .clone()
+            .with_workers(1)
+            .unwrap()
+            .with_memory_limit(cap)
+            .with_spill_dir(root.clone());
+        let sql = "SELECT g, SUM(a) AS s, COUNT(*) AS c FROM t GROUP BY g ORDER BY g";
+        let got = limited.execute_sql_reported(sql).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(got.spilled_bytes, 0, "7 groups must not spill");
+        assert!(
+            got.peak_bytes <= cap,
+            "peak {} over cap {cap}",
+            got.peak_bytes
+        );
+        let want = s.execute_sql(sql).unwrap();
+        for col in ["g", "s", "c"] {
+            assert_eq!(col_i64(&got.batches, col), col_i64(&want, col), "{col}");
+        }
     }
 
     #[test]

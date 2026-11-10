@@ -191,6 +191,10 @@ fn fold_avg(
     Batch::try_new(schema.clone(), out)
 }
 
+/// Grouped aggregation of `input`. Under a memory limit the pool holds the
+/// group table's retained bytes plus the one input batch being folded in,
+/// so few groups over a large input stay small. When either reservation
+/// fails the table spills by partition and starts over.
 fn run_table(
     mut input: Box<dyn Operator>,
     group: &[NamedExpr],
@@ -201,46 +205,60 @@ fn run_table(
     cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
     let mut table = GroupedTable::new(group, aggs, schema.clone())?;
-    let mut held: Vec<super::memory::Reservation<'_>> = Vec::new();
+    let mut held: Option<super::memory::Reservation<'_>> = None;
     let npart = AGG_PART_MAX;
     let mut partials: Vec<Vec<std::path::PathBuf>> = vec![Vec::new(); npart];
+    // Spill the current table and start an empty one, releasing its charge.
+    let mut spill_table = |table: &mut GroupedTable,
+                           held: &mut Option<super::memory::Reservation<'_>>,
+                           e: Error|
+     -> Result<()> {
+        if !pool.can_spill() {
+            return Err(e);
+        }
+        if !spill_ok(aggs) {
+            return Err(Error::Memory("this aggregate cannot spill".into()));
+        }
+        let old = std::mem::replace(table, GroupedTable::new(group, aggs, schema.clone())?);
+        *held = None;
+        spill_grouped(
+            old,
+            schema.clone(),
+            policy,
+            pool,
+            group.len(),
+            npart,
+            &mut partials,
+        )
+    };
     while let Some(batch) = input.next_batch(cancel)? {
         if batch.num_rows() == 0 {
             continue;
         }
-        if pool.has_limit() {
-            let sz = batch_bytes(&batch);
-            match pool.try_reserve(sz) {
-                Ok(r) => held.push(r),
-                Err(e) => {
-                    if !pool.can_spill() {
-                        return Err(e);
-                    }
-                    if !spill_ok(aggs) {
-                        return Err(Error::Memory("this aggregate cannot spill".into()));
-                    }
-                    let old = std::mem::replace(
-                        &mut table,
-                        GroupedTable::new(group, aggs, schema.clone())?,
-                    );
-                    spill_grouped(
-                        old,
-                        schema.clone(),
-                        policy,
-                        pool,
-                        group.len(),
-                        npart,
-                        &mut partials,
-                    )?;
-                    held.clear();
-                    let r = pool.try_reserve(sz).map_err(|_| {
-                        Error::Memory("a single aggregate batch exceeds the memory limit".into())
-                    })?;
-                    held.push(r);
-                }
+        if !pool.has_limit() {
+            table.update(&batch, pool)?;
+            continue;
+        }
+        let sz = batch_bytes(&batch);
+        let incoming = match pool.try_reserve(sz) {
+            Ok(r) => r,
+            Err(e) => {
+                spill_table(&mut table, &mut held, e)?;
+                pool.try_reserve(sz).map_err(|_| {
+                    Error::Memory("a single aggregate batch exceeds the memory limit".into())
+                })?
+            }
+        };
+        table.update(&batch, pool)?;
+        drop(incoming);
+        held = None;
+        let retained = table.retained_bytes();
+        if retained > 0 {
+            match pool.try_reserve(retained) {
+                Ok(r) => held = Some(r),
+                Err(e) => spill_table(&mut table, &mut held, e)?,
             }
         }
-        table.update(&batch, pool)?;
     }
     if partials.iter().all(|p| p.is_empty()) {
         return table.finish(policy);
@@ -1086,6 +1104,17 @@ impl GroupedTable {
         match self {
             Self::Hash(table) => table.finish(policy),
             Self::Perfect(table) => table.finish(policy),
+        }
+    }
+
+    /// Bytes the table keeps between batches: keys, accumulators, index.
+    fn retained_bytes(&self) -> u64 {
+        match self {
+            Self::Hash(table) => table.retained_bytes(),
+            Self::Perfect(table) => {
+                let index = (table.index.len() * std::mem::size_of::<u32>()) as u64;
+                table.accums.iter().map(|a| accum_retained(a)).sum::<u64>() + index
+            }
         }
     }
 }
