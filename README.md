@@ -6,7 +6,7 @@
 [![Release](https://img.shields.io/github/v/release/Sannrox/mizuchi)](https://github.com/Sannrox/mizuchi/releases)
 [![License](https://img.shields.io/github/license/Sannrox/mizuchi)](LICENSE)
 
-[Try it](#try-it) · [SQL coverage](docs/sql-coverage.md) · [Benchmarks](docs/bench/results.md) · [Decisions](docs/decisions/README.md)
+[Try it](#try-it) · [SQL coverage](docs/sql-coverage.md) · [Governed run](docs/governed-run.md) · [Benchmarks](docs/bench/results.md) · [Decisions](docs/decisions/README.md)
 
 > Status: side project, experimental 0.1. Embedding runners should keep using
 > their current engines until mizuchi passes a defined bar
