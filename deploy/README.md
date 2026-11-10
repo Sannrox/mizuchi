@@ -10,6 +10,14 @@ only when the embedder sets `MIZUCHI_ALLOW_NETWORK` (ADR 0008, ADR 0011).
   delivery tool can apply. Tagged releases push
   `ghcr.io/sannrox/mizuchi:<version>`; `deploy/tenkai.toml` pins that
   tag for Tenkai.
+- Tenkai contract: the Flight worker provides `mizuchi.query` at `1.0.0`,
+  which products that use mizuchi as an engine declare as a requirement.
+  The version lives in `scripts/tenkai-profile.py` and is not the crate
+  version: the major bumps when the query surface (accepted SQL, result
+  schema, Flight endpoints) breaks, the minor when it grows compatibly.
+  The committed `deploy/tenkai.toml` has no `[compatibility]` block; the
+  release renders one pinned to the pushed image digest and publishes it
+  as the `mizuchi-tenkai.toml` asset.
 - Coordinator failover: both layouts run a leader and a standby that share
   a lease directory (`MIZUCHI_LEASE_DIR`; a shared volume in compose, a
   `ReadWriteMany` claim in Kubernetes). The standby takes over when the

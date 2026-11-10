@@ -329,6 +329,17 @@ jobs:
             dist/*-source.tar.gz
             dist/*.whl
           sbom-path: dist/mizuchi.cdx.json
+      # Before the manifest, which lists every dist file with its digest.
+      - name: Tenkai profile
+        env:
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python3 scripts/tenkai-profile.py --check
+          python3 scripts/tenkai-profile.py --render --version "${TAG#v}" \
+            --digest "$IMAGE_DIGEST" --out dist/mizuchi-tenkai.toml
+          cat dist/mizuchi-tenkai.toml
       - name: Release manifest
         env:
           GH_TOKEN: ${{ github.token }}
@@ -368,6 +379,7 @@ jobs:
           path: |
             dist/SHA256SUMS
             dist/mizuchi-release.json
+            dist/mizuchi-tenkai.toml
           if-no-files-found: error
 
   # Drafts, then publishes last after every asset job, so a failed run leaves
@@ -436,7 +448,7 @@ jobs:
           # The release attaches to the remote tag; it must still name SHA.
           [[ "$(git ls-remote origin "refs/tags/${TAG}^{}" | cut -f1)" == "$SHA" ]] \
             || { echo "remote tag ${TAG} no longer points at ${SHA}" >&2; exit 1; }
-          files=(dist/*.tar.gz dist/*.whl dist/mizuchi.cdx.json dist/mizuchi-release.json dist/SHA256SUMS)
+          files=(dist/*.tar.gz dist/*.whl dist/mizuchi.cdx.json dist/mizuchi-release.json dist/mizuchi-tenkai.toml dist/SHA256SUMS)
           # A tag with a "-" (vX.Y.Z-rc.N) is a pre-release and never latest.
           kind=()
           if [[ "$PRERELEASE" == true ]]; then
