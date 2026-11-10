@@ -537,7 +537,7 @@ fn add_expr_labels(expr: &Expr, input: &PlanMarks, out: &mut BTreeSet<String>) {
     }
 }
 
-fn collect_column_names(expr: &Expr, schema: &Schema, out: &mut BTreeSet<String>) {
+pub(crate) fn collect_column_names(expr: &Expr, schema: &Schema, out: &mut BTreeSet<String>) {
     match expr {
         Expr::Column(name) => {
             out.insert(name.clone());

@@ -34,6 +34,14 @@ a spill directory outside the write grants is refused when the session opens.
 Work that outgrows the cap spills to `spill/` or fails with a typed memory
 error; it never exceeds the cap.
 
+Registering Parquet reads file footers only. Each scan decodes the columns it
+needs one morsel at a time, so input larger than the cap does not sit in
+memory. Process heap stays within the cap plus a margin of about one decoded
+morsel per worker, Parquet page buffers, and the result batches
+(`crates/mizuchi/tests/input_memory.rs` holds it to 16 MiB). A file rewritten
+after registration fails the next scan; register it again to read the new
+version.
+
 ## 2. Policy context
 
 ```rust
