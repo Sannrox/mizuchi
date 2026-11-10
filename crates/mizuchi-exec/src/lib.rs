@@ -235,6 +235,12 @@ impl Session {
         }
         session.allowed_read_paths = config::resolve_roots(cfg.allowed_read_paths)?;
         session.allowed_write_paths = config::resolve_roots(cfg.allowed_write_paths)?;
+        for dir in [&mut session.spill_dir, &mut session.shuffle_dir]
+            .into_iter()
+            .flatten()
+        {
+            *dir = config::allowed(dir, &session.allowed_write_paths)?;
+        }
         session.allow_network = cfg.allow_network;
         session.now_micros = cfg.now_micros;
         session.governed = cfg.governed;

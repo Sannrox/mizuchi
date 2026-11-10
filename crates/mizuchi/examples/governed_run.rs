@@ -34,7 +34,7 @@ fn run(root: &Path) -> Result<()> {
         workers: Some(1),
         spill_dir: Some(root.join("spill")),
         allowed_read_paths: vec![root.join("in")],
-        allowed_write_paths: vec![root.join("out")],
+        allowed_write_paths: vec![root.join("out"), root.join("spill")],
         ..SessionConfig::default()
     };
     let mut session = Session::from_config(cfg)?;

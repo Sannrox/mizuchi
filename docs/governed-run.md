@@ -22,16 +22,17 @@ let cfg = SessionConfig {
     workers: Some(1),
     spill_dir: Some(root.join("spill")),
     allowed_read_paths: vec![root.join("in")],
-    allowed_write_paths: vec![root.join("out")],
+    allowed_write_paths: vec![root.join("out"), root.join("spill")],
     ..SessionConfig::default()
 };
 let mut session = Session::from_config(cfg)?;
 session.register_parquet("orders", &input, ParquetReadOptions::default())?;
 ```
 
-The engine reads only below `in/` and writes only below `out/`. Work that
-outgrows the cap spills to `spill/` or fails with a typed memory error; it
-never exceeds the cap.
+The engine reads only below `in/` and writes only below `out/` and `spill/`;
+a spill directory outside the write grants is refused when the session opens.
+Work that outgrows the cap spills to `spill/` or fails with a typed memory
+error; it never exceeds the cap.
 
 ## 2. Policy context
 
