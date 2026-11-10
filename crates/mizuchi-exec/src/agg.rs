@@ -24,8 +24,8 @@ use arrow::array::{
 };
 use arrow::compute;
 use arrow::datatypes::{
-    DataType, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef,
-    UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    DataType, Field, FieldRef, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
+    Schema, SchemaRef, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 
 use super::CancelToken;
@@ -115,7 +115,83 @@ fn bump_parallel_merges() {
     agg_path_counters::PARALLEL_MERGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Aggregate `input` into `schema` (group columns, then one column per agg).
+/// Under a memory limit AVG runs as SUM and COUNT, so spilled groups merge.
 pub(super) fn run(
+    input: Box<dyn Operator>,
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+    policy: &BatchPolicy,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Vec<Batch>> {
+    if !pool.has_limit() || !aggs.iter().any(|(_, c)| matches!(c, AggCall::Avg(_))) {
+        return run_table(input, group, aggs, schema, policy, pool, cancel);
+    }
+    let group_n = group.len();
+    let mut fields: Vec<FieldRef> = schema.fields()[..group_n].to_vec();
+    let mut split = Vec::with_capacity(aggs.len() + 1);
+    for (i, (name, call)) in aggs.iter().enumerate() {
+        let AggCall::Avg(arg) = call else {
+            split.push((name.clone(), call.clone()));
+            fields.push(schema.fields()[group_n + i].clone());
+            continue;
+        };
+        let sum = AggCall::Sum(Expr::Cast {
+            expr: Box::new(arg.clone()),
+            data_type: DataType::Float64,
+        });
+        split.push((format!("{name}#sum"), sum));
+        fields.push(Arc::new(Field::new(
+            format!("{name}#sum"),
+            DataType::Float64,
+            true,
+        )));
+        split.push((format!("{name}#count"), AggCall::Count(arg.clone())));
+        fields.push(Arc::new(Field::new(
+            format!("{name}#count"),
+            DataType::Int64,
+            true,
+        )));
+    }
+    let split_schema = Arc::new(Schema::new(fields));
+    run_table(input, group, &split, split_schema, policy, pool, cancel)?
+        .iter()
+        .map(|batch| fold_avg(batch, group_n, aggs, &schema))
+        .collect()
+}
+
+/// Turn each SUM/COUNT pair from [`run`]'s AVG split back into one AVG column.
+fn fold_avg(
+    batch: &Batch,
+    group_n: usize,
+    aggs: &[(String, AggCall)],
+    schema: &SchemaRef,
+) -> Result<Batch> {
+    let cols = batch.as_arrow().columns();
+    let mut out: Vec<ArrayRef> = cols[..group_n].to_vec();
+    let mut at = group_n;
+    for (_, call) in aggs {
+        if !matches!(call, AggCall::Avg(_)) {
+            out.push(cols[at].clone());
+            at += 1;
+            continue;
+        }
+        let sum = cols[at].as_primitive::<Float64Type>();
+        let count = cols[at + 1].as_primitive::<Int64Type>();
+        let avg: Float64Array = sum
+            .iter()
+            .zip(count.values())
+            .map(|(s, &n)| s.filter(|_| n > 0).map(|s| s / n as f64))
+            .collect();
+        out.push(Arc::new(avg));
+        at += 2;
+    }
+    Batch::try_new(schema.clone(), out)
+}
+
+fn run_table(
     mut input: Box<dyn Operator>,
     group: &[NamedExpr],
     aggs: &[(String, AggCall)],
