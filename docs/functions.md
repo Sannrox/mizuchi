@@ -23,7 +23,7 @@ Evidence: `crates/mizuchi/tests/slt/functions.slt`, plus `extract_from_date32_co
 
 | Kind | SQL | Notes |
 | --- | --- | --- |
-| Built-in | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(DISTINCT)` | `AVG` and `COUNT(DISTINCT)` do not spill. |
+| Built-in | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(DISTINCT)` | `COUNT(DISTINCT)` does not spill. |
 | User | registered name, one argument | Buffer type equals result type. `update` folds one argument cell into the buffer; `merge` folds two buffers. Replacing a UDAF drops cached query results. |
 
 Rust: `Session::register_udaf` with [`CombineAgg`] (`ProductI64` is the Int64 product used in tests). Python: `Session.register_udaf(name, update, merge, identity)`.

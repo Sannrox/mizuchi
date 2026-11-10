@@ -5604,15 +5604,43 @@ mod tests {
     }
 
     #[test]
-    fn avg_and_count_distinct_fail_closed_when_they_would_spill() {
+    fn avg_spills_under_tiny_limit_and_matches() {
         let (s, cap) = register_numbered(12, 32);
         let root = spill_root("avg");
         let limited = s
             .clone()
             .with_memory_limit(cap)
             .with_spill_dir(root.clone());
-        let avg = limited.execute_sql("SELECT AVG(a) AS av FROM t");
-        assert!(matches!(avg, Err(Error::Memory(_))), "{avg:?}");
+        // q1 shape: few groups, several accumulators including AVG.
+        let sql = "SELECT g, SUM(a) AS s, AVG(a) AS av, AVG(g) AS ag, COUNT(*) AS c \
+                   FROM t GROUP BY g ORDER BY g";
+        let want = s.execute_sql(sql).unwrap();
+        let got = limited.execute_sql_reported(sql).unwrap();
+        assert!(got.spilled_bytes > 0, "the cap must force a spill");
+        for col in ["g", "s", "c"] {
+            assert_eq!(col_i64(&got.batches, col), col_i64(&want, col), "{col}");
+        }
+        for col in ["av", "ag"] {
+            assert_eq!(col_f64(&got.batches, col), col_f64(&want, col), "{col}");
+        }
+        let total = "SELECT AVG(a) AS av FROM t";
+        assert_eq!(
+            col_f64(&limited.execute_sql(total).unwrap(), "av"),
+            col_f64(&s.execute_sql(total).unwrap(), "av")
+        );
+        let left = leftover(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn count_distinct_fails_closed_when_it_would_spill() {
+        let (s, cap) = register_numbered(12, 32);
+        let root = spill_root("cd");
+        let limited = s
+            .clone()
+            .with_memory_limit(cap)
+            .with_spill_dir(root.clone());
         let cd = limited.execute_sql("SELECT COUNT(DISTINCT a) AS cd FROM t");
         assert!(matches!(cd, Err(Error::Memory(_))), "{cd:?}");
         let left = leftover(&root);
