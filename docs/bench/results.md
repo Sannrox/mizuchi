@@ -101,3 +101,55 @@ drives the same paths for correctness
 | ungrouped SUM/COUNT | 0.065 | 1 |
 | grouped COUNT/SUM (8 groups) | 0.136 | 8 |
 | inner join (1_000_000 × 1_000 Int64 keys) | 0.167 | 1 |
+
+## Constrained profile
+
+Measured 2026-11-10 with `BENCH_PROFILE=constrained scripts/bench-gb.sh`
+(see [methodology.md](methodology.md#constrained-profile)). Every engine
+ran with one worker, a 256 MiB memory cap with spill to a temp directory,
+and the Parquet files as tables, so each query decodes its input. SF1 is
+five trials and SF10 three, dropping the first and taking the median of
+the rest, from one round per engine. Ratio is `reference_ms / mizuchi_ms`.
+Host class: single-node workstation, 32 GiB RAM, 10 threads, shared with
+other work (load about 4 to 16). Peak is the mizuchi memory-pool high
+water (`QueryResult::peak_bytes`); the cap is 256.0 MiB.
+
+### Constrained sf1
+
+| query | mizuchi ms | DuckDB ms | DuckDB ratio | DataFusion ms | DataFusion ratio | mizuchi peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| tpch_q1 | 551.182 | 197.512 | 0.358 | 159.288 | 0.289 | 256.0 |
+| tpch_q3 | 265.446 | 203.939 | 0.768 | 192.544 | 0.725 | 11.9 |
+| tpch_q6 | 163.427 | 86.497 | 0.529 | 78.368 | 0.480 | 15.3 |
+| tpcds_store_sales | 62.195 | 65.775 | 1.058 | 53.055 | 0.853 | 23.3 |
+
+Geomean ratio: DuckDB 0.626, DataFusion 0.541.
+
+### Constrained sf10
+
+| query | mizuchi ms | DuckDB ms | DuckDB ratio | DataFusion ms | DataFusion ratio | mizuchi peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| tpch_q1 | 5698.500 | 1934.772 | 0.340 | 2076.113 | 0.364 | 256.0 |
+| tpch_q3 | 2853.257 | 2934.011 | 1.028 | 2553.956 | 0.895 | 119.5 |
+| tpch_q6 | 1705.037 | 1414.256 | 0.829 | 806.629 | 0.473 | 153.0 |
+| tpcds_store_sales | 603.357 | 2528.256 | 4.190 | out of memory | n/a | 232.9 |
+
+Geomean ratio: DuckDB 1.050; DataFusion 0.536 over the three queries it
+finished. DataFusion fails `tpcds_store_sales` at SF10 under the cap: its
+hash join build asks for 76 MB more with 229 MB held and does not spill.
+DuckDB and mizuchi finish all four queries at both scales.
+
+### Constrained operator ranking
+
+`gb_bench profile --sf 10 --constrained`, exclusive time per operator.
+
+| query | first | second | note |
+| --- | --- | --- | --- |
+| tpch_q1 | HashAggregate 4372 ms | Scan 1233 ms | 6 groups, yet the pool reaches the cap and spills (52_056 bytes at SF1) |
+| tpch_q3 | Scan `lineitem` 1598 ms | HashAggregate 946 ms | the `lineitem` scan copies 367 MB of filtered rows |
+| tpch_q6 | Scan 1896 ms | HashAggregate 3 ms | filtered scan decode is the whole query |
+| tpcds_store_sales | Scan 299 ms | HashJoin 134 ms | already faster than DuckDB |
+
+`tpch_q1` is the furthest behind (about 3x both references at both
+scales), and its time is in the aggregate, not the decode. `tpch_q6` is
+behind DataFusion by about 2x, all in the filtered Parquet scan.

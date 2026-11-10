@@ -65,6 +65,20 @@ this method and the committed results table are in git.
 Ratio in the results table is `reference_ms / mizuchi_ms` (same convention as
 `tests/engine_compare.rs`). Values below 1 mean the reference finished faster.
 
+## Constrained profile
+
+`BENCH_PROFILE=constrained bash scripts/bench-gb.sh <1|10>` times the profile
+an embedding runner uses: one worker, a 256 MiB session memory cap with spill
+to a scratch directory, and tables registered as Parquet files, so every
+query decodes its input and load time is part of the query. mizuchi runs
+`gb_bench run --constrained` (`register_parquet` under
+`SessionConfig::memory_limit`). DuckDB runs with `threads=1`,
+`memory_limit=256MiB` and views over `read_parquet`. DataFusion runs with
+`target_partitions=1`, a 256 MiB fair spill pool and `register_parquet`.
+Results land in `bench-data/<label>/constrained/`. Trials and the reported
+median follow Execution step 4. `gb_bench profile --constrained` ranks operators
+under the same session.
+
 ## Operator profiles
 
 `Session::query_metrics` records inclusive `elapsed_ns`, pool `peak_bytes`,
