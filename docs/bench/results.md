@@ -113,8 +113,8 @@ the rest, from one round per engine. Ratio is `reference_ms / mizuchi_ms`.
 Host class: single-node workstation, 32 GiB RAM, 10 threads, shared with
 other work (load about 4 to 16). Peak is the mizuchi memory-pool high
 water (`QueryResult::peak_bytes`); the cap is 256.0 MiB. Peaks and the
-`tpch_q1` row were re-measured after #226; the other times are from the
-first run.
+`tpch_q1` row were re-measured after #226 and the `tpch_q6` row after
+#227; the other times are from the first run.
 
 ### Constrained sf1
 
@@ -122,10 +122,10 @@ first run.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | tpch_q1 | 561.362 | 197.512 | 0.352 | 159.288 | 0.284 | 0.2 |
 | tpch_q3 | 265.446 | 203.939 | 0.768 | 192.544 | 0.725 | 13.0 |
-| tpch_q6 | 163.427 | 86.497 | 0.529 | 78.368 | 0.480 | 0.1 |
+| tpch_q6 | 105.157 | 86.497 | 0.823 | 78.368 | 0.745 | 0.1 |
 | tpcds_store_sales | 62.195 | 65.775 | 1.058 | 53.055 | 0.853 | 23.3 |
 
-Geomean ratio: DuckDB 0.624, DataFusion 0.539.
+Geomean ratio: DuckDB 0.697, DataFusion 0.601.
 
 ### Constrained sf10
 
@@ -133,10 +133,10 @@ Geomean ratio: DuckDB 0.624, DataFusion 0.539.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | tpch_q1 | 5640.877 | 1934.772 | 0.343 | 2076.113 | 0.368 | 0.2 |
 | tpch_q3 | 2853.257 | 2934.011 | 1.028 | 2553.956 | 0.895 | 129.7 |
-| tpch_q6 | 1705.037 | 1414.256 | 0.829 | 806.629 | 0.473 | 0.1 |
+| tpch_q6 | 1052.965 | 1414.256 | 1.343 | 806.629 | 0.766 | 0.1 |
 | tpcds_store_sales | 603.357 | 2528.256 | 4.190 | out of memory | n/a | 232.9 |
 
-Geomean ratio: DuckDB 1.052; DataFusion 0.538 over the three queries it
+Geomean ratio: DuckDB 1.187; DataFusion 0.632 over the three queries it
 finished. DataFusion fails `tpcds_store_sales` at SF10 under the cap: its
 hash join build asks for 76 MB more with 229 MB held and does not spill.
 DuckDB and mizuchi finish all four queries at both scales.
@@ -149,12 +149,18 @@ DuckDB and mizuchi finish all four queries at both scales.
 | --- | --- | --- | --- |
 | tpch_q1 | HashAggregate 4372 ms | Scan 1233 ms | 6 groups; before #226 the pool reached the cap and spilled |
 | tpch_q3 | Scan `lineitem` 1598 ms | HashAggregate 946 ms | the `lineitem` scan copies 367 MB of filtered rows |
-| tpch_q6 | Scan 1896 ms | HashAggregate 3 ms | filtered scan decode is the whole query |
+| tpch_q6 | Scan 1896 ms | HashAggregate 3 ms | filtered scan decode is the whole query; 1061 ms after #227 |
 | tpcds_store_sales | Scan 299 ms | HashJoin 134 ms | already faster than DuckDB |
 
 `tpch_q1` is the furthest behind (about 3x both references at both
 scales), and its time is in the aggregate, not the decode. Since #226 the
 aggregate charges its group table instead of every input batch it has
 seen: q1 peaks at 0.2 MiB without spilling, and q6 at 0.1 MiB. Its time
-did not change, so the gap is aggregate CPU, not spill. `tpch_q6` is
-behind DataFusion by about 2x, all in the filtered Parquet scan.
+did not change, so the gap is aggregate CPU, not spill. `tpch_q6` was
+behind DataFusion by about 2x, all in the filtered Parquet scan. Its five
+conjuncts each ran as a separate Parquet row-filter predicate, and
+intersecting their fine-grained row selections cost more than the decode.
+Since #227 the conjuncts run as one predicate over the three filter
+columns: q6 now beats DuckDB at SF10 and is within 1.4x of DataFusion.
+`tpch_q3`'s `lineitem` filter is a single conjunct, so its scan did not
+change.

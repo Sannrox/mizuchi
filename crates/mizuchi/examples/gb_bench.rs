@@ -185,14 +185,16 @@ struct Flags {
     workers: usize,
     force: bool,
     constrained: bool,
+    /// Run only this query id (`--query`), for profiling one query.
+    query: Option<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage:
   gb_bench generate --sf tiny|1|10 --out DIR [--force]
-  gb_bench run --sf tiny|1|10 --dir DIR [--repeats N] [--workers N] [--constrained] [--json PATH|-]
-  gb_bench profile --sf tiny|1|10 --dir DIR [--workers N] [--constrained] [--json PATH|-]"
+  gb_bench run --sf tiny|1|10 --dir DIR [--repeats N] [--workers N] [--constrained] [--query ID] [--json PATH|-]
+  gb_bench profile --sf tiny|1|10 --dir DIR [--workers N] [--constrained] [--query ID] [--json PATH|-]"
     );
     std::process::exit(2);
 }
@@ -207,6 +209,7 @@ fn parse_flags(mut args: impl Iterator<Item = String>) -> Flags {
         .unwrap_or(1);
     let mut force = false;
     let mut constrained = false;
+    let mut query = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--sf" => sf = Some(args.next().unwrap_or_else(|| usage())),
@@ -228,6 +231,14 @@ fn parse_flags(mut args: impl Iterator<Item = String>) -> Flags {
             "--json" => json = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--force" => force = true,
             "--constrained" => constrained = true,
+            "--query" => {
+                let id = args.next().unwrap_or_else(|| usage());
+                if !QUERIES.iter().any(|spec| spec.id == id) {
+                    eprintln!("unknown query {id}");
+                    usage();
+                }
+                query = Some(id);
+            }
             _ => usage(),
         }
     }
@@ -241,6 +252,7 @@ fn parse_flags(mut args: impl Iterator<Item = String>) -> Flags {
         workers: if constrained { 1 } else { workers.max(1) },
         force,
         constrained,
+        query,
     }
 }
 
@@ -598,6 +610,13 @@ fn load_session(flags: &Flags, account: bool) -> (Session, u64) {
     (session, input_bytes)
 }
 
+/// The suite, or the one query named by `--query`.
+fn selected(flags: &Flags) -> impl Iterator<Item = &'static QuerySpec> + '_ {
+    QUERIES
+        .iter()
+        .filter(|spec| flags.query.as_deref().is_none_or(|id| id == spec.id))
+}
+
 fn profile_name(flags: &Flags) -> &'static str {
     if flags.constrained {
         "constrained"
@@ -663,7 +682,7 @@ fn run_mizuchi(flags: &Flags) {
     let (session, input_bytes) = load_session(flags, false);
 
     let mut query_json = Vec::new();
-    for spec in QUERIES {
+    for spec in selected(flags) {
         let mut trials = Vec::with_capacity(flags.repeats);
         let mut rows = 0usize;
         let (mut peak, mut spilled) = (0u64, 0u64);
@@ -714,7 +733,7 @@ fn run_mizuchi(flags: &Flags) {
 fn profile_mizuchi(flags: &Flags) {
     let (session, input_bytes) = load_session(flags, true);
     let mut query_json = Vec::new();
-    for spec in QUERIES {
+    for spec in selected(flags) {
         let metrics = session
             .query_metrics(spec.sql)
             .unwrap_or_else(|e| panic!("{}: {e}", spec.id));

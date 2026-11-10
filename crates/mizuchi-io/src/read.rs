@@ -1069,6 +1069,13 @@ fn page_pred_cannot_match(
     }
 }
 
+/// One Parquet row-filter predicate: the AND of every conjunct that names a
+/// file column, over the union of those columns. The reader decodes the
+/// predicate columns, builds one row selection, then decodes the remaining
+/// projected columns for surviving rows only. One predicate per conjunct
+/// would also skip rows between predicate columns, but chaining many
+/// fine-grained selections costs more than decoding the few predicate
+/// columns in full (q6: about a third less CPU with one predicate).
 fn row_filter_from_preds(
     parquet_schema: &parquet::schema::types::SchemaDescriptor,
     arrow_schema: &Schema,
@@ -1078,40 +1085,39 @@ fn row_filter_from_preds(
     for pred in preds {
         flatten_and(pred, &mut conjuncts);
     }
-    let mut boxed: Vec<Box<dyn parquet::arrow::arrow_reader::ArrowPredicate>> = Vec::new();
+    let mut indices = Vec::new();
+    let mut kept = Vec::new();
     for pred in conjuncts {
         let mut names = Vec::new();
         expr_columns(&pred, &mut names);
-        if names.is_empty() {
+        let found: Vec<usize> = names
+            .iter()
+            .filter_map(|name| arrow_schema.index_of(name).ok())
+            .collect();
+        if found.is_empty() {
             continue;
         }
-        let mut indices = Vec::new();
-        for name in &names {
-            if let Ok(idx) = arrow_schema.index_of(name) {
-                indices.push(idx);
-            }
-        }
-        if indices.is_empty() {
-            continue;
-        }
-        let mask = ProjectionMask::roots(parquet_schema, indices);
-        boxed.push(Box::new(ArrowPredicateFn::new(mask, move |batch| {
-            let batch =
-                Batch::from_arrow(batch).map_err(|e| ArrowError::ComputeError(e.to_string()))?;
-            let arr = pred
-                .eval(&batch)
-                .map_err(|e| ArrowError::ComputeError(e.to_string()))?;
-            arr.as_any()
-                .downcast_ref::<BooleanArray>()
-                .cloned()
-                .ok_or_else(|| ArrowError::ComputeError("predicate did not yield Boolean".into()))
-        })));
+        indices.extend(found);
+        kept.push(pred);
     }
-    if boxed.is_empty() {
-        None
-    } else {
-        Some(RowFilter::new(boxed))
-    }
+    let pred = kept
+        .into_iter()
+        .reduce(|l, r| Expr::Binary(BinaryOp::And, Box::new(l), Box::new(r)))?;
+    indices.sort_unstable();
+    indices.dedup();
+    let mask = ProjectionMask::roots(parquet_schema, indices);
+    let predicate = ArrowPredicateFn::new(mask, move |batch| {
+        let batch =
+            Batch::from_arrow(batch).map_err(|e| ArrowError::ComputeError(e.to_string()))?;
+        let arr = pred
+            .eval(&batch)
+            .map_err(|e| ArrowError::ComputeError(e.to_string()))?;
+        arr.as_any()
+            .downcast_ref::<BooleanArray>()
+            .cloned()
+            .ok_or_else(|| ArrowError::ComputeError("predicate did not yield Boolean".into()))
+    });
+    Some(RowFilter::new(vec![Box::new(predicate)]))
 }
 
 fn flatten_and(expr: &Expr, out: &mut Vec<Expr>) {
