@@ -2,6 +2,10 @@
 //!
 //! Large files stay under `bench-data/` (gitignored). Published SF1/SF10
 //! numbers live in `docs/bench/`. Default `cargo test` does not run this.
+//!
+//! `--constrained` runs the embedding-runner profile: one worker, a
+//! [`CONSTRAINED_CAP`] session cap with spill, and tables registered with
+//! `register_parquet`, so every query decodes its Parquet input.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -11,7 +15,7 @@ use std::time::Instant;
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use mizuchi::{Batch, ParquetReadOptions, Session, VERSION, read_parquet};
+use mizuchi::{Batch, ParquetReadOptions, Session, SessionConfig, VERSION, read_parquet};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -30,6 +34,9 @@ const CATEGORIES: [&str; 3] = ["Books", "Electronics", "Home"];
 const D_1994_01_01: i64 = 731;
 const D_1995_03_15: i64 = 1169;
 const D_1998_09_01: i64 = 2435;
+
+/// Session memory cap of the `--constrained` profile.
+const CONSTRAINED_CAP: u64 = 256 << 20;
 
 /// Parquet row-group / write chunk. Independent of the engine morsel size.
 const WRITE_CHUNK: usize = 65_536;
@@ -159,10 +166,12 @@ fn main() {
         "run" => {
             let cfg = parse_flags(args);
             run_mizuchi(&cfg);
+            remove_spill_dir(&cfg);
         }
         "profile" => {
             let cfg = parse_flags(args);
             profile_mizuchi(&cfg);
+            remove_spill_dir(&cfg);
         }
         _ => usage(),
     }
@@ -175,14 +184,17 @@ struct Flags {
     json: Option<PathBuf>,
     workers: usize,
     force: bool,
+    constrained: bool,
+    /// Run only this query id (`--query`), for profiling one query.
+    query: Option<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage:
   gb_bench generate --sf tiny|1|10 --out DIR [--force]
-  gb_bench run --sf tiny|1|10 --dir DIR [--repeats N] [--workers N] [--json PATH|-]
-  gb_bench profile --sf tiny|1|10 --dir DIR [--workers N] [--json PATH|-]"
+  gb_bench run --sf tiny|1|10 --dir DIR [--repeats N] [--workers N] [--constrained] [--query ID] [--json PATH|-]
+  gb_bench profile --sf tiny|1|10 --dir DIR [--workers N] [--constrained] [--query ID] [--json PATH|-]"
     );
     std::process::exit(2);
 }
@@ -196,6 +208,8 @@ fn parse_flags(mut args: impl Iterator<Item = String>) -> Flags {
         .map(|n| n.get())
         .unwrap_or(1);
     let mut force = false;
+    let mut constrained = false;
+    let mut query = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--sf" => sf = Some(args.next().unwrap_or_else(|| usage())),
@@ -216,6 +230,15 @@ fn parse_flags(mut args: impl Iterator<Item = String>) -> Flags {
             }
             "--json" => json = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--force" => force = true,
+            "--constrained" => constrained = true,
+            "--query" => {
+                let id = args.next().unwrap_or_else(|| usage());
+                if !QUERIES.iter().any(|spec| spec.id == id) {
+                    eprintln!("unknown query {id}");
+                    usage();
+                }
+                query = Some(id);
+            }
             _ => usage(),
         }
     }
@@ -226,8 +249,10 @@ fn parse_flags(mut args: impl Iterator<Item = String>) -> Flags {
         dir,
         repeats: repeats.max(1),
         json,
-        workers: workers.max(1),
+        workers: if constrained { 1 } else { workers.max(1) },
         force,
+        constrained,
+        query,
     }
 }
 
@@ -552,11 +577,15 @@ fn load_session(flags: &Flags, account: bool) -> (Session, u64) {
         std::process::exit(1);
     }
     eprintln!(
-        "mizuchi {} load {} workers={}",
+        "mizuchi {} load {} workers={} profile={}",
         VERSION,
         dir.display(),
-        flags.workers
+        flags.workers,
+        profile_name(flags)
     );
+    if flags.constrained {
+        return constrained_session(&dir);
+    }
     let mut session = Session::new().with_workers(flags.workers).expect("workers");
     // Profile uses a system-fraction cap plus spill. Wall-clock `run` stays
     // unbounded so SF10 matches results.md.
@@ -581,6 +610,59 @@ fn load_session(flags: &Flags, account: bool) -> (Session, u64) {
     (session, input_bytes)
 }
 
+/// The suite, or the one query named by `--query`.
+fn selected(flags: &Flags) -> impl Iterator<Item = &'static QuerySpec> + '_ {
+    QUERIES
+        .iter()
+        .filter(|spec| flags.query.as_deref().is_none_or(|id| id == spec.id))
+}
+
+fn profile_name(flags: &Flags) -> &'static str {
+    if flags.constrained {
+        "constrained"
+    } else {
+        "in_memory"
+    }
+}
+
+/// Spill directory of a `--constrained` session, private to this process.
+fn spill_dir(dir: &Path) -> PathBuf {
+    dir.join(format!("spill-{}", std::process::id()))
+}
+
+/// Drop the spill directory once the session is gone. Best effort.
+fn remove_spill_dir(flags: &Flags) {
+    if flags.constrained {
+        let _ = fs::remove_dir_all(spill_dir(&data_dir(flags)));
+    }
+}
+
+/// One worker under [`CONSTRAINED_CAP`] with spill; tables stay Parquet
+/// files that each query decodes. Returns the on-disk input bytes.
+fn constrained_session(dir: &Path) -> (Session, u64) {
+    let spill = spill_dir(dir);
+    fs::create_dir_all(&spill).expect("mkdir spill");
+    let mut session = Session::from_config(SessionConfig {
+        memory_limit: Some(CONSTRAINED_CAP),
+        workers: Some(1),
+        spill_dir: Some(spill.clone()),
+        allowed_read_paths: vec![dir.to_path_buf()],
+        allowed_write_paths: vec![spill],
+        ..SessionConfig::default()
+    })
+    .expect("constrained session");
+    let mut input_bytes = 0u64;
+    for name in TABLES {
+        let path = dir.join(format!("{name}.parquet"));
+        input_bytes += fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        session
+            .register_parquet(name, &path, ParquetReadOptions::default())
+            .unwrap_or_else(|e| panic!("register {name}: {e}"));
+        eprintln!("  registered {name}");
+    }
+    (session, input_bytes)
+}
+
 fn write_json_body(flags: &Flags, body: &str) {
     match &flags.json {
         Some(p) if p.as_os_str() == "-" => print!("{body}"),
@@ -600,24 +682,30 @@ fn run_mizuchi(flags: &Flags) {
     let (session, input_bytes) = load_session(flags, false);
 
     let mut query_json = Vec::new();
-    for spec in QUERIES {
+    for spec in selected(flags) {
         let mut trials = Vec::with_capacity(flags.repeats);
         let mut rows = 0usize;
+        let (mut peak, mut spilled) = (0u64, 0u64);
         for trial in 0..flags.repeats {
             // Clone drops the result cache so each trial is a full execute.
             let run = session.clone();
             let start = Instant::now();
             let out = run
-                .execute_sql(spec.sql)
+                .execute_sql_reported(spec.sql)
                 .unwrap_or_else(|e| panic!("{}: {e}", spec.id));
             let ms = start.elapsed().as_secs_f64() * 1000.0;
-            rows = out.iter().map(|b| b.num_rows()).sum();
-            eprintln!("  {} trial {} {:.3} ms rows={rows}", spec.id, trial, ms);
+            rows = out.batches.iter().map(|b| b.num_rows()).sum();
+            peak = peak.max(out.peak_bytes);
+            spilled = spilled.max(out.spilled_bytes);
+            eprintln!(
+                "  {} trial {} {:.3} ms rows={rows} peak_bytes={} spilled_bytes={}",
+                spec.id, trial, ms, out.peak_bytes, out.spilled_bytes
+            );
             trials.push(ms);
         }
         let reported = reported_ms(&trials);
         query_json.push(format!(
-            "    {{\n      \"id\": \"{}\",\n      \"trials_ms\": [{}],\n      \"reported_ms\": {:.3},\n      \"rows\": {}\n    }}",
+            "    {{\n      \"id\": \"{}\",\n      \"trials_ms\": [{}],\n      \"reported_ms\": {:.3},\n      \"rows\": {},\n      \"peak_bytes\": {},\n      \"spilled_bytes\": {}\n    }}",
             spec.id,
             trials
                 .iter()
@@ -625,13 +713,16 @@ fn run_mizuchi(flags: &Flags) {
                 .collect::<Vec<_>>()
                 .join(", "),
             reported,
-            rows
+            rows,
+            peak,
+            spilled
         ));
     }
 
     let body = format!(
-        "{{\n  \"engine\": \"mizuchi\",\n  \"version\": \"{VERSION}\",\n  \"sf\": \"{}\",\n  \"repeats\": {},\n  \"workers\": {},\n  \"input_bytes\": {input_bytes},\n  \"queries\": [\n{}\n  ]\n}}\n",
+        "{{\n  \"engine\": \"mizuchi\",\n  \"version\": \"{VERSION}\",\n  \"sf\": \"{}\",\n  \"profile\": \"{}\",\n  \"repeats\": {},\n  \"workers\": {},\n  \"input_bytes\": {input_bytes},\n  \"queries\": [\n{}\n  ]\n}}\n",
         flags.scale.label,
+        profile_name(flags),
         flags.repeats,
         flags.workers,
         query_json.join(",\n")
@@ -642,7 +733,7 @@ fn run_mizuchi(flags: &Flags) {
 fn profile_mizuchi(flags: &Flags) {
     let (session, input_bytes) = load_session(flags, true);
     let mut query_json = Vec::new();
-    for spec in QUERIES {
+    for spec in selected(flags) {
         let metrics = session
             .query_metrics(spec.sql)
             .unwrap_or_else(|e| panic!("{}: {e}", spec.id));
@@ -672,8 +763,9 @@ fn profile_mizuchi(flags: &Flags) {
         ));
     }
     let body = format!(
-        "{{\n  \"engine\": \"mizuchi\",\n  \"version\": \"{VERSION}\",\n  \"sf\": \"{}\",\n  \"kind\": \"operator_metrics\",\n  \"workers\": {},\n  \"input_bytes\": {input_bytes},\n  \"queries\": [\n{}\n  ]\n}}\n",
+        "{{\n  \"engine\": \"mizuchi\",\n  \"version\": \"{VERSION}\",\n  \"sf\": \"{}\",\n  \"profile\": \"{}\",\n  \"kind\": \"operator_metrics\",\n  \"workers\": {},\n  \"input_bytes\": {input_bytes},\n  \"queries\": [\n{}\n  ]\n}}\n",
         flags.scale.label,
+        profile_name(flags),
         flags.workers,
         query_json.join(",\n")
     );

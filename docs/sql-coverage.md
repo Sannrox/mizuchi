@@ -30,6 +30,11 @@ boundary (`schema.rs` unit tests). SQL `DATE` maps to Arrow `Date32`,
 `INTERVAL … DAY` to `Interval(DayTime)`. `DECIMAL` / `NUMERIC` map onto
 Arrow `Decimal32` / `Decimal64` / `Decimal128`.
 
+Expressions nested deeper than `mizuchi::sql::MAX_EXPR_DEPTH` (128) levels,
+such as a 200-term `x OR x OR ...` chain, fail as `Error::Parse` before
+planning. `IN` lists of any length stay within the limit. The adversarial
+suite (`crates/mizuchi/tests/adversarial.rs`) executes these shapes.
+
 ## Audited families
 
 | Feature | Status | Evidence | Follow-up |

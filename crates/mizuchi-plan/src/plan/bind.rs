@@ -2697,20 +2697,32 @@ fn bind_in_list(expr: &SqlExpr, list: &[SqlExpr], negated: bool, scope: &Scope) 
         });
     }
     let left = bind_scalar(expr, scope)?;
-    let mut acc = Expr::Binary(
-        BinaryOp::Eq,
-        Box::new(left.clone()),
-        Box::new(bind_scalar(&list[0], scope)?),
-    );
-    for item in &list[1..] {
-        let eq = Expr::Binary(
-            BinaryOp::Eq,
-            Box::new(left.clone()),
-            Box::new(bind_scalar(item, scope)?),
-        );
-        acc = Expr::Binary(BinaryOp::Or, Box::new(acc), Box::new(eq));
+    let mut terms = list
+        .iter()
+        .map(|item| {
+            Ok(Expr::Binary(
+                BinaryOp::Eq,
+                Box::new(left.clone()),
+                Box::new(bind_scalar(item, scope)?),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Pairwise OR keeps the tree log2(len) deep, so long lists stay within
+    // the recursion budget of typing and evaluation.
+    while terms.len() > 1 {
+        let mut next = Vec::with_capacity(terms.len().div_ceil(2));
+        let mut it = terms.into_iter();
+        while let Some(l) = it.next() {
+            next.push(match it.next() {
+                Some(r) => Expr::Binary(BinaryOp::Or, Box::new(l), Box::new(r)),
+                None => l,
+            });
+        }
+        terms = next;
     }
-    let pred = acc;
+    let pred = terms
+        .pop()
+        .ok_or_else(|| Error::Plan("IN list is empty".into()))?;
     let _ = expr_type(&pred, &scope.schema)?;
     if negated {
         Ok(Expr::Unary(UnaryOp::Not, Box::new(pred)))

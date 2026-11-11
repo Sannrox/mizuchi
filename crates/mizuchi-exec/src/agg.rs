@@ -24,8 +24,8 @@ use arrow::array::{
 };
 use arrow::compute;
 use arrow::datatypes::{
-    DataType, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef,
-    UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    DataType, Field, FieldRef, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
+    Schema, SchemaRef, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 
 use super::CancelToken;
@@ -115,7 +115,87 @@ fn bump_parallel_merges() {
     agg_path_counters::PARALLEL_MERGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Aggregate `input` into `schema` (group columns, then one column per agg).
+/// Under a memory limit AVG runs as SUM and COUNT, so spilled groups merge.
 pub(super) fn run(
+    input: Box<dyn Operator>,
+    group: &[NamedExpr],
+    aggs: &[(String, AggCall)],
+    schema: SchemaRef,
+    policy: &BatchPolicy,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<Vec<Batch>> {
+    if !pool.has_limit() || !aggs.iter().any(|(_, c)| matches!(c, AggCall::Avg(_))) {
+        return run_table(input, group, aggs, schema, policy, pool, cancel);
+    }
+    let group_n = group.len();
+    let mut fields: Vec<FieldRef> = schema.fields()[..group_n].to_vec();
+    let mut split = Vec::with_capacity(aggs.len() + 1);
+    for (i, (name, call)) in aggs.iter().enumerate() {
+        let AggCall::Avg(arg) = call else {
+            split.push((name.clone(), call.clone()));
+            fields.push(schema.fields()[group_n + i].clone());
+            continue;
+        };
+        let sum = AggCall::Sum(Expr::Cast {
+            expr: Box::new(arg.clone()),
+            data_type: DataType::Float64,
+        });
+        split.push((format!("{name}#sum"), sum));
+        fields.push(Arc::new(Field::new(
+            format!("{name}#sum"),
+            DataType::Float64,
+            true,
+        )));
+        split.push((format!("{name}#count"), AggCall::Count(arg.clone())));
+        fields.push(Arc::new(Field::new(
+            format!("{name}#count"),
+            DataType::Int64,
+            true,
+        )));
+    }
+    let split_schema = Arc::new(Schema::new(fields));
+    run_table(input, group, &split, split_schema, policy, pool, cancel)?
+        .iter()
+        .map(|batch| fold_avg(batch, group_n, aggs, &schema))
+        .collect()
+}
+
+/// Turn each SUM/COUNT pair from [`run`]'s AVG split back into one AVG column.
+fn fold_avg(
+    batch: &Batch,
+    group_n: usize,
+    aggs: &[(String, AggCall)],
+    schema: &SchemaRef,
+) -> Result<Batch> {
+    let cols = batch.as_arrow().columns();
+    let mut out: Vec<ArrayRef> = cols[..group_n].to_vec();
+    let mut at = group_n;
+    for (_, call) in aggs {
+        if !matches!(call, AggCall::Avg(_)) {
+            out.push(cols[at].clone());
+            at += 1;
+            continue;
+        }
+        let sum = cols[at].as_primitive::<Float64Type>();
+        let count = cols[at + 1].as_primitive::<Int64Type>();
+        let avg: Float64Array = sum
+            .iter()
+            .zip(count.values())
+            .map(|(s, &n)| s.filter(|_| n > 0).map(|s| s / n as f64))
+            .collect();
+        out.push(Arc::new(avg));
+        at += 2;
+    }
+    Batch::try_new(schema.clone(), out)
+}
+
+/// Grouped aggregation of `input`. Under a memory limit the pool holds the
+/// group table's retained bytes plus the one input batch being folded in,
+/// so few groups over a large input stay small. When either reservation
+/// fails the table spills by partition and starts over.
+fn run_table(
     mut input: Box<dyn Operator>,
     group: &[NamedExpr],
     aggs: &[(String, AggCall)],
@@ -125,46 +205,60 @@ pub(super) fn run(
     cancel: &CancelToken,
 ) -> Result<Vec<Batch>> {
     let mut table = GroupedTable::new(group, aggs, schema.clone())?;
-    let mut held: Vec<super::memory::Reservation<'_>> = Vec::new();
+    let mut held: Option<super::memory::Reservation<'_>> = None;
     let npart = AGG_PART_MAX;
     let mut partials: Vec<Vec<std::path::PathBuf>> = vec![Vec::new(); npart];
+    // Spill the current table and start an empty one, releasing its charge.
+    let mut spill_table = |table: &mut GroupedTable,
+                           held: &mut Option<super::memory::Reservation<'_>>,
+                           e: Error|
+     -> Result<()> {
+        if !pool.can_spill() {
+            return Err(e);
+        }
+        if !spill_ok(aggs) {
+            return Err(Error::Memory("this aggregate cannot spill".into()));
+        }
+        let old = std::mem::replace(table, GroupedTable::new(group, aggs, schema.clone())?);
+        *held = None;
+        spill_grouped(
+            old,
+            schema.clone(),
+            policy,
+            pool,
+            group.len(),
+            npart,
+            &mut partials,
+        )
+    };
     while let Some(batch) = input.next_batch(cancel)? {
         if batch.num_rows() == 0 {
             continue;
         }
-        if pool.has_limit() {
-            let sz = batch_bytes(&batch);
-            match pool.try_reserve(sz) {
-                Ok(r) => held.push(r),
-                Err(e) => {
-                    if !pool.can_spill() {
-                        return Err(e);
-                    }
-                    if !spill_ok(aggs) {
-                        return Err(Error::Memory("this aggregate cannot spill".into()));
-                    }
-                    let old = std::mem::replace(
-                        &mut table,
-                        GroupedTable::new(group, aggs, schema.clone())?,
-                    );
-                    spill_grouped(
-                        old,
-                        schema.clone(),
-                        policy,
-                        pool,
-                        group.len(),
-                        npart,
-                        &mut partials,
-                    )?;
-                    held.clear();
-                    let r = pool.try_reserve(sz).map_err(|_| {
-                        Error::Memory("a single aggregate batch exceeds the memory limit".into())
-                    })?;
-                    held.push(r);
-                }
+        if !pool.has_limit() {
+            table.update(&batch, pool)?;
+            continue;
+        }
+        let sz = batch_bytes(&batch);
+        let incoming = match pool.try_reserve(sz) {
+            Ok(r) => r,
+            Err(e) => {
+                spill_table(&mut table, &mut held, e)?;
+                pool.try_reserve(sz).map_err(|_| {
+                    Error::Memory("a single aggregate batch exceeds the memory limit".into())
+                })?
+            }
+        };
+        table.update(&batch, pool)?;
+        drop(incoming);
+        held = None;
+        let retained = table.retained_bytes();
+        if retained > 0 {
+            match pool.try_reserve(retained) {
+                Ok(r) => held = Some(r),
+                Err(e) => spill_table(&mut table, &mut held, e)?,
             }
         }
-        table.update(&batch, pool)?;
     }
     if partials.iter().all(|p| p.is_empty()) {
         return table.finish(policy);
@@ -962,8 +1056,21 @@ fn repartition_merge(
     }
 }
 
+/// Under a memory limit the dense perfect-hash index may take at most this
+/// share of the limit, so a sparse domain cannot starve later batches.
+const PERFECT_LIMIT_SHARE: u64 = 16;
+
+/// Whether a perfect-hash index for `spec` fits the pool. The index is
+/// charged with the table's retained bytes.
+fn perfect_fits(spec: &PerfectSpec, pool: &MemoryPool) -> bool {
+    let index = (spec.slots * std::mem::size_of::<u32>()) as u64;
+    pool.limit()
+        .is_none_or(|limit| index <= limit / PERFECT_LIMIT_SHARE)
+}
+
 /// Grouped aggregation that starts as a hash table and switches to a perfect
-/// hash when the first batch's key domain fits in [`PERFECT_MAX_SLOTS`].
+/// hash when the first batch's key domain fits in [`PERFECT_MAX_SLOTS`] and,
+/// under a memory limit, in [`PERFECT_LIMIT_SHARE`] of it.
 enum GroupedTable {
     Hash(HashAgg),
     Perfect(PerfectAgg),
@@ -977,15 +1084,11 @@ impl GroupedTable {
     fn update(&mut self, batch: &Batch, pool: &MemoryPool) -> Result<()> {
         match self {
             Self::Hash(table) => {
-                // Memory-limited queries keep a hash table. A dense index of
-                // [`PERFECT_MAX_SLOTS`] would steal budget from later batches.
-                if table.grouped
-                    && table.n_groups() == 0
-                    && batch.num_rows() > 0
-                    && !pool.has_limit()
-                {
+                if table.grouped && table.n_groups() == 0 && batch.num_rows() > 0 {
                     let key_cols = eval_all(&table.group_exprs, batch)?;
-                    if let Some(spec) = infer_spec(&key_cols) {
+                    if let Some(spec) =
+                        infer_spec(&key_cols).filter(|spec| perfect_fits(spec, pool))
+                    {
                         let mut perfect = PerfectAgg::from_hash(table, spec)?;
                         perfect.update_encoded(batch, &key_cols)?;
                         *self = Self::Perfect(perfect);
@@ -1010,6 +1113,17 @@ impl GroupedTable {
         match self {
             Self::Hash(table) => table.finish(policy),
             Self::Perfect(table) => table.finish(policy),
+        }
+    }
+
+    /// Bytes the table keeps between batches: keys, accumulators, index.
+    fn retained_bytes(&self) -> u64 {
+        match self {
+            Self::Hash(table) => table.retained_bytes(),
+            Self::Perfect(table) => {
+                let index = (table.index.len() * std::mem::size_of::<u32>()) as u64;
+                table.accums.iter().map(|a| accum_retained(a)).sum::<u64>() + index
+            }
         }
     }
 }
@@ -4116,6 +4230,47 @@ mod tests {
             "peak {} reserved the dense index",
             pool.peak()
         );
+    }
+
+    #[test]
+    fn memory_limited_small_domain_uses_the_perfect_hash() {
+        // q1 shape: one-byte string keys, a 257x257 index well under the cap.
+        let in_schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Utf8, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batch = Batch::try_new(
+            in_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["A", "N", "R", "N"])),
+                Arc::new(StringArray::from(vec!["F", "O", "F", "F"])),
+            ],
+        )
+        .unwrap();
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Utf8, false),
+            Field::new("s", DataType::Utf8, false),
+            Field::new("c", DataType::Int64, true),
+        ]));
+        let group = [
+            NamedExpr {
+                expr: Expr::nth(0),
+                name: "f".into(),
+            },
+            NamedExpr {
+                expr: Expr::nth(1),
+                name: "s".into(),
+            },
+        ];
+        let aggs = [("c".to_string(), AggCall::CountStar)];
+        let update = |limit: u64| {
+            let pool = MemoryPool::new(Some(limit), None).unwrap();
+            let mut table = GroupedTable::new(&group, &aggs, out_schema.clone()).unwrap();
+            table.update(&batch, &pool).unwrap();
+            matches!(table, GroupedTable::Perfect(_))
+        };
+        assert!(update(256 << 20), "a 264 KB index fits a 256 MiB cap");
+        assert!(!update(1 << 20), "a 264 KB index is over 1/16 of 1 MiB");
     }
 
     #[test]

@@ -34,6 +34,17 @@ pub trait Lowering: Send + Sync {
         CpuLowering::scan(batches)
     }
 
+    /// Scan whose filtered morsels arrive on demand from `input`. The default
+    /// collects them and calls [`Self::scan`], so a lowering that overrides
+    /// only `scan` still sees every scan. [`CpuLowering`] streams `input`.
+    fn scan_stream(
+        &self,
+        input: Box<dyn Operator>,
+        cancel: &CancelToken,
+    ) -> Result<Box<dyn Operator>> {
+        self.scan(super::collect(input, cancel)?)
+    }
+
     fn filter(&self, input: Box<dyn Operator>, predicate: Expr) -> Result<Box<dyn Operator>> {
         CpuLowering::filter(input, predicate)
     }

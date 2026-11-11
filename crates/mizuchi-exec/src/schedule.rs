@@ -492,7 +492,7 @@ const PIPE_MORSELS_PER_WORKER: usize = 8;
 /// memory-limited query refills one morsel at a time.
 struct PipeSource {
     pipe: Pipeline,
-    morsels: std::vec::IntoIter<Batch>,
+    morsels: super::table_data::Morsels,
     ready: std::collections::VecDeque<Batch>,
     workers: usize,
     /// Morsels per refill: one under a memory limit, since `ready` holds no
@@ -507,7 +507,11 @@ impl Operator for PipeSource {
             if let Some(batch) = self.ready.pop_front() {
                 return Ok(Some(batch));
             }
-            let refill: Vec<Batch> = self.morsels.by_ref().take(self.refill).collect();
+            let refill: Vec<Batch> = self
+                .morsels
+                .by_ref()
+                .take(self.refill)
+                .collect::<Result<_>>()?;
             if refill.is_empty() {
                 return Ok(None);
             }
@@ -518,18 +522,28 @@ impl Operator for PipeSource {
 }
 
 fn pipe_source(pipe: Pipeline, session: &Session, pool: &MemoryPool) -> Result<PipeSource> {
-    let morsels = session.table_morsels(&pipe.table)?;
+    let refill = if pool.has_limit() {
+        1
+    } else {
+        session.workers.max(1) * PIPE_MORSELS_PER_WORKER
+    };
+    pipe_source_refill(pipe, session, refill)
+}
+
+fn pipe_source_refill(pipe: Pipeline, session: &Session, refill: usize) -> Result<PipeSource> {
     Ok(PipeSource {
+        morsels: pipe_morsels(&pipe, session)?,
         pipe,
-        morsels: morsels.into_iter(),
         ready: std::collections::VecDeque::new(),
         workers: session.workers,
-        refill: if pool.has_limit() {
-            1
-        } else {
-            session.workers.max(1) * PIPE_MORSELS_PER_WORKER
-        },
+        refill,
     })
+}
+
+/// Table morsels for `pipe`, narrowed to the columns and row groups it reads.
+fn pipe_morsels(pipe: &Pipeline, session: &Session) -> Result<super::table_data::Morsels> {
+    let columns = super::table_data::scan_columns(pipe.projection.as_deref(), &pipe.scan_filters);
+    session.table_morsels(&pipe.table, columns, &pipe.scan_filters)
 }
 
 fn agg_serial(
@@ -659,11 +673,14 @@ fn as_pipeline(plan: &LogicalPlan) -> Option<Pipeline> {
     }
 }
 
+/// Collect a pipeline's output, applying it on all workers. Input morsels
+/// are decoded a refill at a time, so only the output is held.
 fn parallel_pipeline(pipe: &Pipeline, session: &Session) -> Result<Vec<Batch>> {
-    let morsels = session.table_morsels(&pipe.table)?;
-    map_morsels(session.workers, &session.exec_token(), morsels, |batch| {
-        apply_pipe(pipe, batch)
-    })
+    let refill = session.workers.max(1) * PIPE_MORSELS_PER_WORKER;
+    collect(
+        Box::new(pipe_source_refill(pipe.clone(), session, refill)?),
+        &session.exec_token(),
+    )
 }
 
 /// Unsorted LIMIT over a scan/filter/project pipeline stops after `skip` plus
@@ -677,13 +694,14 @@ fn limited_pipeline(
     if matches!(fetch, Some(0)) {
         return Ok(Vec::new());
     }
-    let morsels = session.table_morsels(&pipe.table)?;
+    let mut morsels = pipe_morsels(pipe, session)?;
     let mut out = Vec::new();
-    for batch in morsels {
+    // Check `fetch` before pulling, so a satisfied LIMIT decodes nothing more.
+    while !matches!(fetch, Some(0)) {
         session.exec_token().check()?;
-        if matches!(fetch, Some(0)) {
+        let Some(batch) = morsels.next().transpose()? else {
             break;
-        }
+        };
         let Some(batch) = apply_pipe(pipe, batch)? else {
             continue;
         };

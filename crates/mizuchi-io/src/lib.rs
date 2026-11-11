@@ -23,9 +23,10 @@ pub use lake::{
 };
 pub use object_store::ObjectStore;
 pub use read::{
-    AvroReadOptions, ColumnRange, CsvReadOptions, FloatRange, JsonReadOptions, OrcReadOptions,
-    ParquetReadOptions, ParquetScanStats, RowGroupStats, read_avro, read_csv, read_json, read_orc,
-    read_parquet, read_parquet_reported, row_group_cannot_match,
+    AvroReadOptions, ColumnFooter, ColumnRange, CsvReadOptions, FloatRange, JsonReadOptions,
+    OrcReadOptions, ParquetBatches, ParquetFooter, ParquetReadOptions, ParquetScanStats,
+    RowGroupStats, parquet_footer, read_avro, read_csv, read_json, read_orc, read_parquet,
+    read_parquet_reported, row_group_cannot_match, stream_parquet, stream_parquet_file,
 };
 pub use store::{
     prune_partitions, read_parquet_store, read_parquet_store_reported, write_parquet_store,
