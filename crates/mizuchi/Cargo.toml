@@ -15,7 +15,7 @@ homepage = "https://github.com/Sannrox/mizuchi"
 arrow = { workspace = true }
 mizuchi-core = { workspace = true }
 mizuchi-exec = { workspace = true }
-mizuchi-flight = { path = "../mizuchi-flight", version = "0.1.0", optional = true }
+mizuchi-flight = { path = "../mizuchi-flight", version = "0.2.0-rc.1", optional = true }
 mizuchi-io = { workspace = true }
 mizuchi-plan = { workspace = true }
 mizuchi-postgres = { workspace = true }

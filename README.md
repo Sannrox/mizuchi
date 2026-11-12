@@ -47,7 +47,7 @@ It opens a capped session, registers data, explains and runs a query, writes
 Parquet, and reads it back:
 
 ```text
-engine 0.1.0
+engine 0.2.0-rc.1
 == Logical Plan ==
 Scan t rowcount=2 [a: Int64]
 == Physical Plan ==
