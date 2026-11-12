@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "mizuchi"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "mizuchi-core",
@@ -1121,14 +1121,14 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-core"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "arrow",
 ]
 
 [[package]]
 name = "mizuchi-exec"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "hmac",
@@ -1145,7 +1145,7 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-io"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -1162,7 +1162,7 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-plan"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "mizuchi-core",
@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-postgres"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "mizuchi-core",
@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-py"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "mizuchi",
