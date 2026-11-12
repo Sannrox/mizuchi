@@ -14,7 +14,7 @@ execute; skipped records are parsed and ignored.
 | Filter, project, arithmetic, `IS NULL` | `select.slt` |
 | String, math, `nullif`, `ARRAY` / `array_length` | `functions.slt` |
 | Hash aggregate, `GROUP BY`, `COUNT(DISTINCT)` | `agg.slt` |
-| Inner join | `join.slt` |
+| INNER, LEFT, RIGHT, FULL OUTER, CROSS, LEFT SEMI, LEFT ANTI join | `join.slt` (#233) |
 | Uncorrelated `FROM` subquery (derived table) | `subquery.slt` |
 | `IN` lists, `IN`/`NOT IN (SELECT ...)`, `EXISTS`, scalar subquery, `LATERAL` | `subquery.slt` (#80) |
 | `CAST` of integer, float, and text; `DECIMAL` / `NUMERIC` casts and arithmetic | `decimal.slt` (#82) |
@@ -39,11 +39,20 @@ suite (`crates/mizuchi/tests/adversarial.rs`) executes these shapes.
 
 | Feature | Status | Evidence | Follow-up |
 | --- | --- | --- | --- |
+| `INNER JOIN` | supported | `join.slt` | #233 |
+| `LEFT` / `RIGHT` / `FULL OUTER JOIN` | supported unbounded; `Error::Memory` when the join would spill | `join.slt` | #233 |
+| `CROSS JOIN` | supported | `join.slt` | #233 |
+| `LEFT SEMI` / `LEFT ANTI JOIN` | supported | `join.slt` | #233 |
 | `IN` lists, `IN`/`NOT IN (SELECT ...)`, `EXISTS`, scalar subquery, `LATERAL` | supported | `subquery.slt` | #80 |
 | `UNION` / `UNION ALL` / `UNION DISTINCT` | supported | `setops.slt` | #81 |
 | `INTERSECT` / `EXCEPT` (DISTINCT and ALL) | supported | `setops.slt` | #81 |
 | DECIMAL arithmetic and casts | supported | `decimal.slt` | #82 |
 | DATE, TIMESTAMP, INTERVAL casts and functions | supported | `datetime.slt` | #83 |
+
+Join null keys never match. `JOIN USING` and `NATURAL JOIN` are unimplemented.
+Inner and left-semi joins honour a session memory cap (spill or stream). Outer
+joins that would spill return `Error::Memory` rather than a partial result.
+Null-aware anti (`NOT IN (SELECT ...)`) is the subquery family (#80).
 
 Set operators keep left column names. Column counts must match. Compatible
 integer, float, and null types widen; incompatible types fail at plan time.
