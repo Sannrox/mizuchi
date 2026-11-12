@@ -34,12 +34,19 @@ fn coverage_table_names_audited_families() {
         "setops.slt",
         "decimal.slt",
         "datetime.slt",
+        "join.slt",
+        "INNER JOIN",
+        "LEFT SEMI",
+        "LEFT ANTI",
+        "CROSS JOIN",
+        "FULL OUTER",
         "#78",
         "#79",
         "#80",
         "#81",
         "#82",
         "#83",
+        "#233",
     ] {
         assert!(text.contains(needle), "coverage table missing {needle}");
     }
@@ -79,4 +86,16 @@ fn per_feature_slt_files_exist_with_skipif_gaps() {
         dec.contains("SELECT CAST(1 AS TEXT)"),
         "integer/text CAST should be a supported decimal.slt record"
     );
+    let join = fs::read_to_string(slt.join("join.slt")).unwrap();
+    for needle in [
+        "INNER JOIN",
+        "LEFT JOIN",
+        "RIGHT JOIN",
+        "FULL OUTER JOIN",
+        "CROSS JOIN",
+        "LEFT SEMI JOIN",
+        "LEFT ANTI JOIN",
+    ] {
+        assert!(join.contains(needle), "join.slt missing {needle}");
+    }
 }

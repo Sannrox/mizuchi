@@ -1,3 +1,6 @@
+# Join kinds the binder accepts. Null keys never match.
+# t.a: 1, 2, 2, 3, NULL. u.id: 2, 2, 4, NULL.
+
 statement ok
 CREATE TABLE t (a INTEGER)
 
@@ -22,3 +25,134 @@ SELECT t.a, u.id FROM t JOIN u ON t.a = u.id
 2
 2
 2
+
+query II rowsort
+SELECT t.a, u.id FROM t INNER JOIN u ON t.a = u.id
+----
+2
+2
+2
+2
+2
+2
+2
+2
+
+# Left: unmatched left keys (1, 3, NULL) pad the right side.
+query II rowsort
+SELECT t.a, u.id FROM t LEFT JOIN u ON t.a = u.id
+----
+1
+NULL
+2
+2
+2
+2
+2
+2
+2
+2
+3
+NULL
+NULL
+NULL
+
+# Right: unmatched right keys (4, NULL) pad the left side.
+query II rowsort
+SELECT t.a, u.id FROM t RIGHT JOIN u ON t.a = u.id
+----
+2
+2
+2
+2
+2
+2
+2
+2
+NULL
+4
+NULL
+NULL
+
+# Full: unmatched rows from both sides.
+query II rowsort
+SELECT t.a, u.id FROM t FULL OUTER JOIN u ON t.a = u.id
+----
+1
+NULL
+2
+2
+2
+2
+2
+2
+2
+2
+3
+NULL
+NULL
+4
+NULL
+NULL
+NULL
+NULL
+
+# Cross: 5 × 4 cartesian rows.
+query II rowsort
+SELECT t.a, u.id FROM t CROSS JOIN u
+----
+1
+2
+1
+2
+1
+4
+1
+NULL
+2
+2
+2
+2
+2
+2
+2
+2
+2
+4
+2
+4
+2
+NULL
+2
+NULL
+3
+2
+3
+2
+3
+4
+3
+NULL
+NULL
+2
+NULL
+2
+NULL
+4
+NULL
+NULL
+
+# Semi: left rows that match at least once (the two 2s).
+query I rowsort
+SELECT t.a FROM t LEFT SEMI JOIN u ON t.a = u.id
+----
+2
+2
+
+# Anti: left rows that never match (1, 3, NULL).
+query I rowsort
+SELECT t.a FROM t LEFT ANTI JOIN u ON t.a = u.id
+----
+1
+3
+NULL
