@@ -8,6 +8,32 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+## [0.2.0] - 2026-11-12
+
+### Upgrade
+
+- When `allowed_write_paths` is non-empty, `spill_dir` and `shuffle_dir` must sit under those grants. Add the spill directory to the write list (the governed-run example does). (#223)
+- SQL expressions nested deeper than 128 levels (`mizuchi::sql::MAX_EXPR_DEPTH`) now return `Error::Parse`. Long `IN` lists still bind. (#223)
+- `Session::register_parquet` refuses a `prune_row_group` hook (`Error::Plan`). Pass `filters` instead. Registration reads footers only; a file that changes after registration fails the next scan with `Error::Io`. (#224)
+
+### Added
+
+- Tagged releases publish `mizuchi-tenkai.toml`: the product template with the image pinned by digest and a profile v2 block that provides `mizuchi.query` at `1.0.0`. (#232)
+- Release tags are verified as signed and annotated. The GitHub Release includes a CycloneDX SBOM and a family release manifest. `-rc.N` tags publish as pre-releases and are never latest. (#208, #214)
+- Constrained single-worker bench profile (`--constrained`, 256 MiB cap) with published SF1/SF10 ratios. (#225)
+
+### Changed
+
+- Grouped aggregates charge the group table, not the whole input, so few-group queries stay under a memory cap. (#228)
+- Small integer, boolean, or short-string group domains may use the perfect-hash aggregate under a memory limit when the index fits 1/16 of the cap. (#231)
+- Parquet scans with several conjuncts evaluate them as one predicate. (#230)
+
+### Fixed
+
+- Grouped `AVG` spills under a memory cap instead of failing closed. `COUNT(DISTINCT)` still fails closed. (#221)
+- Registered Parquet tables stream within the session cap instead of decoding at registration. (#224)
+- Deep expression chains, spill/shuffle paths outside write grants, and `..` / symlink path escapes fail closed. (#223)
+
 ## [0.2.0-rc.1] - 2026-11-12
 
 ### Upgrade

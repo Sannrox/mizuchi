@@ -945,7 +945,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mizuchi"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "mizuchi-core",
@@ -959,14 +959,14 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-core"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "arrow",
 ]
 
 [[package]]
 name = "mizuchi-exec"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "mizuchi-core",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-fuzz"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "libfuzzer-sys",
@@ -989,7 +989,7 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-io"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "arrow-avro",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-plan"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "mizuchi-core",
@@ -1013,7 +1013,7 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-postgres"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "mizuchi-core",
