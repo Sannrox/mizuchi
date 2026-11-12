@@ -6,14 +6,14 @@
 
 [product]
 name = "mizuchi"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 description = "Arrow-native query engine (Flight worker)"
 
 [deploy]
 workdir = "."
 install = """
 set -e
-IMG=ghcr.io/sannrox/mizuchi:0.1.0
+IMG=ghcr.io/sannrox/mizuchi:0.2.0-rc.1
 docker pull "$IMG"
 docker rm -f mizuchi-worker >/dev/null 2>&1 || true
 docker run -d --name mizuchi-worker -e MIZUCHI_ALLOW_NETWORK=1 -p 8815:8815 "$IMG" worker --bind 0.0.0.0:8815

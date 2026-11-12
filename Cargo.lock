@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "mizuchi"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "arrow",
  "futures",
@@ -1621,14 +1621,14 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-core"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "arrow",
 ]
 
 [[package]]
 name = "mizuchi-exec"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "arrow",
  "hmac",
@@ -1645,7 +1645,7 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-flight"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-io"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -1675,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-plan"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "arrow",
  "mizuchi-core",
@@ -1685,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "mizuchi-postgres"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "arrow",
  "mizuchi-core",

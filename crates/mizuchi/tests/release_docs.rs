@@ -70,9 +70,8 @@ fn release_workflow_publishes_on_tag() {
 }
 
 #[test]
-fn first_release_notes_and_tenkai_entry_match_workspace_version() {
+fn release_notes_and_tenkai_entry_match_workspace_version() {
     let version = workspace_version();
-    assert_eq!(version, "0.1.0", "first release is 0.1.0");
     let changelog = read("CHANGELOG.md");
     assert!(
         changelog.contains(&format!("## [{version}]")),
