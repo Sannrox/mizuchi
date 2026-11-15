@@ -21,7 +21,7 @@ local state (`.state/`), benchmark datasets (`bench-data/`), spill files, or
 generated artifacts.
 
 Human documentation: [README.md](README.md). Architecture decisions:
-[docs/decisions/](docs/decisions/README.md). `CLAUDE.md` only points here;
+[docs/decisions/](docs/decisions/README.md). `CLAUDE.md` is a symlink to this file;
 this file is canonical.
 
 ## Dependencies and Ownership
