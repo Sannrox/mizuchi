@@ -75,7 +75,7 @@ boundaries, trust-model changes, and public contracts as ADRs with the
 The workflow Skills (`advance-issue-frontier`, `assess-change-impact`,
 `capture-project-decision`, `deliver-ready-issue`, `prepare-release`,
 `refactor-docs`, `shape-work-item`, `technical-documentation`, `verify-change`)
-and the opt-in `sekai-ontology` Skill are canonical in
+and the opt-in `sekai-ontology` and `ci-audit` Skills are canonical in
 [Sannrox/agent-kit](https://github.com/Sannrox/agent-kit). There is no pin:
 this repository always uses the latest `main`. `.agents/skills/<name>/` holds
 only a generated stub that points to the shared skill; read the installed
