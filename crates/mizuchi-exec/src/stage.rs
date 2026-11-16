@@ -406,6 +406,14 @@ fn ensure_distribution(plan: PhysicalPlan, n: usize, next_id: &mut usize) -> Phy
         } => {
             let input = ensure_distribution(*input, n, next_id);
             if group.is_empty() {
+                // A global aggregate yields one row, so it runs over a single
+                // partition; over partitioned input it would emit one row per
+                // partition.
+                let input = if input.output_partitions() == 1 {
+                    input
+                } else {
+                    exchange(input, Vec::new(), 1, next_id)
+                };
                 PhysicalPlan::Aggregate {
                     input: Box::new(input),
                     group,
@@ -2282,6 +2290,49 @@ mod tests {
         }
         rows.sort_by_key(|(a, b)| (a.unwrap_or(i64::MIN), b.unwrap_or(i64::MIN)));
         rows
+    }
+
+    /// #243: a global aggregate over a partitioned join ran once per
+    /// partition and returned one row each.
+    #[test]
+    fn global_aggregate_over_partitioned_join_returns_one_row() {
+        let _g = lock_stage_tests();
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from((0..8).collect::<Vec<i64>>()))],
+        )
+        .unwrap();
+        let sql = "SELECT COUNT(*) AS c, SUM(t.a) AS s, AVG(t.a) AS m, MIN(t.a) AS lo, \
+                   MAX(t.a) AS hi FROM t JOIN u ON t.a = u.a";
+        let empty = format!("{sql} WHERE t.a > 100");
+        for workers in [2, 4] {
+            let mut s = Session::new().with_workers(workers).unwrap();
+            s.register("t", schema.clone(), vec![batch.clone()])
+                .unwrap();
+            s.register("u", schema.clone(), vec![batch.clone()])
+                .unwrap();
+            for (query, want) in [
+                (sql, "8|28|3.5|0|7"),
+                (empty.as_str(), "0|NULL|NULL|NULL|NULL"),
+            ] {
+                let out = s.execute_staged(query).unwrap();
+                let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+                assert_eq!(rows, 1, "workers={workers} {query}");
+                let b = out.iter().find(|b| b.num_rows() == 1).unwrap();
+                let cells: Vec<String> = (0..b.num_columns())
+                    .map(|c| {
+                        let col = b.column(c);
+                        if col.is_null(0) {
+                            "NULL".to_string()
+                        } else {
+                            arrow::util::display::array_value_to_string(col, 0).unwrap()
+                        }
+                    })
+                    .collect();
+                assert_eq!(cells.join("|"), want, "workers={workers} {query}");
+            }
+        }
     }
 
     #[test]
