@@ -19,8 +19,7 @@ use arrow::compute::kernels::length::length;
 use arrow::compute::kernels::numeric::{add, div, mul, neg, sub};
 use arrow::compute::kernels::substring::substring;
 use arrow::compute::kernels::temporal::{DatePart, date_part};
-use arrow::compute::kernels::zip::zip;
-use arrow::compute::{CastOptions, cast, cast_with_options, take};
+use arrow::compute::{CastOptions, cast, cast_with_options, filter, interleave, take};
 use arrow::datatypes::{
     DataType, Date32Type, Date64Type, Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type,
     Field, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, TimeUnit,
@@ -457,6 +456,76 @@ fn eval_unary(op: UnaryOp, child: &ArrayRef) -> Result<ArrayRef> {
     }
 }
 
+/// Rows of a batch that no CASE branch or COALESCE argument has decided yet,
+/// as row numbers of the original batch.
+struct Undecided {
+    rows: Vec<u32>,
+    all: usize,
+}
+
+impl Undecided {
+    fn all(batch: &Batch) -> Result<Self> {
+        let all = batch.num_rows();
+        let n = u32::try_from(all).map_err(|_| Error::Eval("batch exceeds u32 rows".into()))?;
+        Ok(Self {
+            rows: (0..n).collect(),
+            all,
+        })
+    }
+
+    /// `batch` restricted to the undecided rows, so a branch only sees the
+    /// rows that select it and cannot fail on the others.
+    fn of(&self, batch: &Batch) -> Result<Batch> {
+        if self.rows.len() == self.all {
+            Ok(batch.clone())
+        } else {
+            batch.gather(&self.rows)
+        }
+    }
+
+    /// Splits off the undecided rows where `mask` (over [`Self::of`]) is set.
+    fn take(&mut self, mask: &BooleanArray) -> Vec<u32> {
+        let mut picked = Vec::new();
+        let mut set = mask.values().iter();
+        self.rows.retain(|&row| {
+            let hit = set.next().unwrap_or(false);
+            if hit {
+                picked.push(row);
+            }
+            !hit
+        });
+        picked
+    }
+}
+
+/// One result array of `rows` rows of type `data_type` from `pieces`, each a
+/// set of row numbers and the values computed for them in that order. Rows
+/// no piece covers are null.
+fn assemble(
+    rows: usize,
+    data_type: &DataType,
+    pieces: &[(Vec<u32>, ArrayRef)],
+) -> Result<ArrayRef> {
+    if let [(covered, values)] = pieces
+        && covered.len() == rows
+    {
+        return Ok(values.clone());
+    }
+    let null = new_null_array(data_type, 1);
+    let mut slots = vec![(pieces.len(), 0usize); rows];
+    for (piece, (covered, _)) in pieces.iter().enumerate() {
+        for (k, &row) in covered.iter().enumerate() {
+            slots[row as usize] = (piece, k);
+        }
+    }
+    let mut arrays: Vec<&dyn Array> = pieces.iter().map(|(_, v)| v.as_ref()).collect();
+    arrays.push(null.as_ref());
+    interleave(&arrays, &slots).map_err(eval_err)
+}
+
+/// CASE: each WHEN is evaluated only on rows no earlier WHEN matched, and
+/// each THEN / ELSE only on the rows that select it, so a branch never fails
+/// on a row it does not produce.
 fn eval_case(
     batch: &Batch,
     operand: Option<&Expr>,
@@ -470,35 +539,82 @@ fn eval_case(
         Some(expr) => Some(eval_expr(expr, batch)?),
         None => None,
     };
-    let mut else_array = match else_expr {
-        Some(expr) => eval_expr(expr, batch)?,
-        None => new_null_array(when_then[0].1.eval(batch)?.data_type(), batch.num_rows()),
-    };
-    for (when, then) in when_then.iter().rev() {
-        let when_array = eval_expr(when, batch)?;
+    let none = batch.slice(0, 0)?;
+    let data_type = match else_expr {
+        Some(expr) => eval_expr(expr, &none)?,
+        None => eval_expr(&when_then[0].1, &none)?,
+    }
+    .data_type()
+    .clone();
+    let mut undecided = Undecided::all(batch)?;
+    let mut pieces = Vec::new();
+    for (when, then) in when_then {
+        if undecided.rows.is_empty() {
+            break;
+        }
+        let rows = undecided.of(batch)?;
+        let when_array = eval_expr(when, &rows)?;
         let mask = match &operand {
-            Some(op) => Arc::new(eq(op, &when_array).map_err(eval_err)?) as ArrayRef,
+            Some(op) => {
+                let op = if undecided.rows.len() == undecided.all {
+                    op.clone()
+                } else {
+                    take(
+                        op.as_ref(),
+                        &UInt32Array::from(undecided.rows.clone()),
+                        None,
+                    )
+                    .map_err(eval_err)?
+                };
+                Arc::new(eq(&op, &when_array).map_err(eval_err)?) as ArrayRef
+            }
             None => when_array,
         };
-        let then_array = eval_expr(then, batch)?;
-        else_array = zip(&predicate(&mask)?, &then_array, &else_array).map_err(eval_err)?;
+        let picked = undecided.take(&predicate(&mask)?);
+        if !picked.is_empty() {
+            let values = eval_expr(then, &batch.gather(&picked)?)?;
+            pieces.push((picked, values));
+        }
     }
-    Ok(else_array)
+    if let Some(expr) = else_expr
+        && !undecided.rows.is_empty()
+    {
+        let values = eval_expr(expr, &undecided.of(batch)?)?;
+        pieces.push((undecided.rows, values));
+    }
+    assemble(batch.num_rows(), &data_type, &pieces)
 }
 
+/// COALESCE: each argument is evaluated only on rows every earlier argument
+/// left null.
 fn eval_coalesce(batch: &Batch, args: &[Expr]) -> Result<ArrayRef> {
-    if args.is_empty() {
+    let Some((last, firsts)) = args.split_last() else {
         return Err(Error::Eval(
             "coalesce requires at least one argument".into(),
         ));
+    };
+    let data_type = eval_expr(last, &batch.slice(0, 0)?)?.data_type().clone();
+    let mut undecided = Undecided::all(batch)?;
+    let mut pieces = Vec::new();
+    for arg in firsts {
+        if undecided.rows.is_empty() {
+            break;
+        }
+        let values = eval_expr(arg, &undecided.of(batch)?)?;
+        let set = is_not_null(values.as_ref()).map_err(eval_err)?;
+        let picked = undecided.take(&set);
+        if picked.len() == values.len() {
+            pieces.push((picked, values));
+        } else if !picked.is_empty() {
+            let values = filter(values.as_ref(), &set).map_err(eval_err)?;
+            pieces.push((picked, values));
+        }
     }
-    let mut out = eval_expr(&args[args.len() - 1], batch)?;
-    for arg in args[..args.len() - 1].iter().rev() {
-        let next = eval_expr(arg, batch)?;
-        let mask = is_not_null(next.as_ref()).map_err(eval_err)?;
-        out = zip(&mask, &next, &out).map_err(eval_err)?;
+    if !undecided.rows.is_empty() {
+        let values = eval_expr(last, &undecided.of(batch)?)?;
+        pieces.push((undecided.rows, values));
     }
-    Ok(out)
+    assemble(batch.num_rows(), &data_type, &pieces)
 }
 
 fn eval_concat(batch: &Batch, args: &[Expr]) -> Result<ArrayRef> {
