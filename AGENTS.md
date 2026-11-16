@@ -358,13 +358,20 @@ the shared lane tool, never with a plain `git push` or a hand-run merge:
    It creates the Verified commit through GraphQL `createCommitOnBranch` and
    resets the worktree to it, so local `HEAD` is the Pull Request head.
    Confirm it reports `verification.verified=true`.
-3. Land with
+3. Queue squash auto-merge pinned to the reviewed head, then land with the
+   lane tool:
+   `gh pr merge <pr> --auto --squash --match-head-commit <sha>`, then
    `bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh land <issue> --pr <pr>`.
-   It squash-merges with the reviewed head as the precondition, so the land
-   commit on `main` is Verified and history stays linear.
+   GitHub merges once the required checks pass; `land` watches the checks
+   and confirms that `main` holds the merge, the Issue closed, and the claim
+   branch is gone. The squash keeps the land commit on `main` Verified and
+   history linear.
 
-Never queue GitHub auto-merge and avoid GitHub **rebase** merges: rebase-merge
-rewrites commits and drops signatures. Do not rewrite protected `main` after
+Auto-merge is queued only with `--squash` and `--match-head-commit` for the
+reviewed head. A queued request survives later pushes, so before pushing to a
+Pull Request with auto-merge queued, disable it (`gh pr merge <pr>
+--disable-auto`) and queue it again for the new reviewed head. Avoid GitHub
+**rebase** merges: rebase-merge rewrites commits and drops signatures. Do not rewrite protected `main` after
 merging unless the user explicitly approves; if protection is temporarily
 relaxed, restore force-push and status-check settings immediately after the
 correction.
