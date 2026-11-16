@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, ArrowNativeTypeOp, AsArray, BooleanArray, Int64Array, ListArray, StringArray,
-    UInt32Array, new_null_array,
+    Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, AsArray, BooleanArray, Int64Array,
+    ListArray, PrimitiveArray, StringArray, UInt32Array, new_null_array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::kernels::boolean::{and_kleene, is_not_null, is_null, not, or_kleene};
@@ -717,24 +717,34 @@ fn map_utf8_i64(array: &ArrayRef, f: impl Fn(&str) -> i64) -> Result<ArrayRef> {
     Ok(Arc::new(out))
 }
 
+/// `abs` over a signed primitive array. The minimum value has no positive
+/// counterpart, so it reports overflow like unary minus does.
+fn checked_abs<T: ArrowPrimitiveType>(
+    child: &ArrayRef,
+    abs: impl Fn(T::Native) -> Option<T::Native>,
+) -> Result<PrimitiveArray<T>> {
+    child
+        .as_primitive::<T>()
+        .try_unary(|v| {
+            abs(v).ok_or_else(|| {
+                ArrowError::ArithmeticOverflow(format!("Overflow happened on: abs({v:?})"))
+            })
+        })
+        .map_err(eval_err)
+}
+
 fn eval_abs(child: &ArrayRef) -> Result<ArrayRef> {
     Ok(match child.data_type() {
         DataType::Decimal32(p, s) => {
-            let out = child
-                .as_primitive::<Decimal32Type>()
-                .unary::<_, Decimal32Type>(|v| v.saturating_abs());
+            let out = checked_abs::<Decimal32Type>(child, |v| v.checked_abs())?;
             Arc::new(out.with_precision_and_scale(*p, *s).map_err(eval_err)?)
         }
         DataType::Decimal64(p, s) => {
-            let out = child
-                .as_primitive::<Decimal64Type>()
-                .unary::<_, Decimal64Type>(|v| v.saturating_abs());
+            let out = checked_abs::<Decimal64Type>(child, |v| v.checked_abs())?;
             Arc::new(out.with_precision_and_scale(*p, *s).map_err(eval_err)?)
         }
         DataType::Decimal128(p, s) => {
-            let out = child
-                .as_primitive::<Decimal128Type>()
-                .unary::<_, Decimal128Type>(|v| v.saturating_abs());
+            let out = checked_abs::<Decimal128Type>(child, |v| v.checked_abs())?;
             Arc::new(out.with_precision_and_scale(*p, *s).map_err(eval_err)?)
         }
         DataType::Decimal256(p, s) => {
@@ -749,26 +759,10 @@ fn eval_abs(child: &ArrayRef) -> Result<ArrayRef> {
                 });
             Arc::new(out.with_precision_and_scale(*p, *s).map_err(eval_err)?)
         }
-        DataType::Int8 => Arc::new(
-            child
-                .as_primitive::<Int8Type>()
-                .unary::<_, Int8Type>(|v| v.saturating_abs()),
-        ),
-        DataType::Int16 => Arc::new(
-            child
-                .as_primitive::<Int16Type>()
-                .unary::<_, Int16Type>(|v| v.saturating_abs()),
-        ),
-        DataType::Int32 => Arc::new(
-            child
-                .as_primitive::<Int32Type>()
-                .unary::<_, Int32Type>(|v| v.saturating_abs()),
-        ),
-        DataType::Int64 => Arc::new(
-            child
-                .as_primitive::<Int64Type>()
-                .unary::<_, Int64Type>(|v| v.saturating_abs()),
-        ),
+        DataType::Int8 => Arc::new(checked_abs::<Int8Type>(child, |v| v.checked_abs())?),
+        DataType::Int16 => Arc::new(checked_abs::<Int16Type>(child, |v| v.checked_abs())?),
+        DataType::Int32 => Arc::new(checked_abs::<Int32Type>(child, |v| v.checked_abs())?),
+        DataType::Int64 => Arc::new(checked_abs::<Int64Type>(child, |v| v.checked_abs())?),
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => child.clone(),
         DataType::Float32 => Arc::new(
             child
@@ -940,7 +934,9 @@ fn eval_err(err: ArrowError) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{AsArray, Date32Array, Int64Array, ListArray};
+    use arrow::array::{
+        AsArray, Date32Array, Int8Array, Int16Array, Int32Array, Int64Array, ListArray,
+    };
     use arrow::datatypes::{Field, Float64Type, Int64Type, Schema};
 
     use super::*;
@@ -1024,6 +1020,40 @@ mod tests {
             i64_values(&neg.eval(&batch).unwrap()),
             vec![Some(-10), None, Some(-3)]
         );
+    }
+
+    /// ABS of each signed integer minimum overflows instead of saturating;
+    /// one above the minimum still works.
+    #[test]
+    fn abs_of_integer_minimum_overflows() {
+        let cases: Vec<(ArrayRef, ArrayRef, i64)> = vec![
+            (
+                Arc::new(Int8Array::from(vec![i8::MIN])),
+                Arc::new(Int8Array::from(vec![i8::MIN + 1])),
+                i64::from(i8::MAX),
+            ),
+            (
+                Arc::new(Int16Array::from(vec![i16::MIN])),
+                Arc::new(Int16Array::from(vec![i16::MIN + 1])),
+                i64::from(i16::MAX),
+            ),
+            (
+                Arc::new(Int32Array::from(vec![i32::MIN])),
+                Arc::new(Int32Array::from(vec![i32::MIN + 1])),
+                i64::from(i32::MAX),
+            ),
+            (
+                Arc::new(Int64Array::from(vec![i64::MIN])),
+                Arc::new(Int64Array::from(vec![i64::MIN + 1])),
+                i64::MAX,
+            ),
+        ];
+        for (min, above, max) in cases {
+            let err = eval_abs(&min).unwrap_err().to_string();
+            assert!(err.contains("Overflow"), "{err}");
+            let out = cast(&eval_abs(&above).unwrap(), &DataType::Int64).unwrap();
+            assert_eq!(out.as_primitive::<Int64Type>().value(0), max);
+        }
     }
 
     #[test]
