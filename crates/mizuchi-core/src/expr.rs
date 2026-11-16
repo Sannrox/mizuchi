@@ -17,7 +17,7 @@ use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow::compute::kernels::concat_elements::concat_elements_utf8_many;
 use arrow::compute::kernels::length::length;
 use arrow::compute::kernels::numeric::{add, div, mul, neg, sub};
-use arrow::compute::kernels::substring::substring;
+use arrow::compute::kernels::substring::substring_by_char;
 use arrow::compute::kernels::temporal::{DatePart, date_part};
 use arrow::compute::{CastOptions, cast, cast_with_options, filter, interleave, take};
 use arrow::datatypes::{
@@ -287,8 +287,7 @@ fn eval_expr(expr: &Expr, batch: &Batch) -> Result<ArrayRef> {
             length,
         } => {
             let child = plain_utf8(eval_expr(expr, batch)?)?;
-            let arrow_start = if *start >= 1 { *start - 1 } else { *start };
-            substring(child.as_ref(), arrow_start, *length).map_err(eval_err)
+            eval_substring(&child, *start, *length)
         }
         Expr::Array(elems) => eval_array(batch, elems),
     }
@@ -669,6 +668,30 @@ fn as_utf8(array: &ArrayRef) -> Result<&StringArray> {
 }
 
 /// Dictionary Utf8 becomes plain Utf8 so string kernels keep working.
+/// SQL `SUBSTRING` on characters: positions before 1 exist but hold no
+/// character, so they use up `length` without producing output. For example
+/// `SUBSTRING('abc', 0, 2)` is `'a'` and `SUBSTRING('abc', -1, 3)` is `'a'`.
+fn eval_substring(array: &ArrayRef, start: i64, length: Option<u64>) -> Result<ArrayRef> {
+    let (offset, length) = if start >= 1 {
+        (start - 1, length)
+    } else {
+        let before = u64::try_from(1 - i128::from(start)).unwrap_or(u64::MAX);
+        (0, length.map(|len| len.saturating_sub(before)))
+    };
+    match array.data_type() {
+        DataType::Utf8 => Ok(Arc::new(
+            substring_by_char(array.as_string::<i32>(), offset, length).map_err(eval_err)?,
+        )),
+        DataType::LargeUtf8 => Ok(Arc::new(
+            substring_by_char(array.as_string::<i64>(), offset, length).map_err(eval_err)?,
+        )),
+        DataType::Null => Ok(array.clone()),
+        other => Err(Error::Eval(format!(
+            "SUBSTRING expects a string, got {other}"
+        ))),
+    }
+}
+
 fn plain_utf8(array: ArrayRef) -> Result<ArrayRef> {
     match array.data_type() {
         DataType::Dictionary(_, value)

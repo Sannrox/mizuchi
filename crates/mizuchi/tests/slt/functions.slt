@@ -152,3 +152,57 @@ NULL
 
 statement error
 SELECT CASE WHEN x = 2 THEN 1 / 0 ELSE 1 END FROM g
+
+# SUBSTRING counts characters, and positions before 1 use up the length.
+query T
+SELECT substring('abcdef' FROM 1 FOR 3)
+----
+abc
+
+query T
+SELECT substring('abcdef' FROM 3)
+----
+cdef
+
+query T
+SELECT substring('abc' FROM 0 FOR 2)
+----
+a
+
+query T
+SELECT substring('abc' FROM -1 FOR 3)
+----
+a
+
+query T
+SELECT concat('<', substring('abc' FROM -5 FOR 3), '>')
+----
+<>
+
+query T
+SELECT substring('abc' FROM -1)
+----
+abc
+
+query T
+SELECT concat('<', substring('abc' FROM 5 FOR 2), '>')
+----
+<>
+
+query T
+SELECT concat('<', substring('abc' FROM 4), '>')
+----
+<>
+
+query T
+SELECT substring('ä€😀x' FROM 2 FOR 2)
+----
+€😀
+
+query T
+SELECT substring('ä€😀x' FROM 3)
+----
+😀x
+
+statement error
+SELECT substring('abc' FROM 1 FOR -1)
