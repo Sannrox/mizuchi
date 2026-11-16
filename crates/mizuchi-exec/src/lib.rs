@@ -247,7 +247,7 @@ impl Session {
         session.governed = cfg.governed;
         session.query_policy = cfg.policy;
         session.encryption = cfg.encryption;
-        if let Some(api) = cfg.query_api {
+        if let Some(mut api) = cfg.query_api {
             if api.auth_token.as_ref().is_some_and(|t| t.is_empty()) {
                 return Err(Error::Plan("query API auth_token must be non-empty".into()));
             }
@@ -256,8 +256,8 @@ impl Session {
                     "query API non-loopback bind requires allow_network".into(),
                 ));
             }
-            let log = if let Some(path) = &api.history_path {
-                config::assert_allowed(path, &session.allowed_write_paths)?;
+            let log = if let Some(path) = &mut api.history_path {
+                *path = config::allowed(path, &session.allowed_write_paths)?;
                 query_api::QueryLog::open(path, api.retention.clone())?
             } else {
                 query_api::QueryLog::memory(api.retention.clone())
@@ -641,7 +641,7 @@ impl Session {
         opts: mizuchi_io::ParquetReadOptions<'_>,
     ) -> Result<()> {
         let path = path.as_ref();
-        config::assert_allowed(path, &self.allowed_read_paths)?;
+        let path = &config::allowed(path, &self.allowed_read_paths)?;
         let keys = self.encryption.clone();
         let opts = mizuchi_io::ParquetReadOptions {
             projection: opts.projection,
@@ -679,7 +679,7 @@ impl Session {
         opts: mizuchi_io::CsvReadOptions<'_>,
     ) -> Result<()> {
         let path = path.as_ref();
-        config::assert_allowed(path, &self.allowed_read_paths)?;
+        let path = &config::allowed(path, &self.allowed_read_paths)?;
         let batches = mizuchi_io::read_csv(path, opts)?;
         let schema = match batches.first() {
             Some(batch) => batch.schema(),
@@ -698,7 +698,7 @@ impl Session {
         opts: mizuchi_io::JsonReadOptions<'_>,
     ) -> Result<()> {
         let path = path.as_ref();
-        config::assert_allowed(path, &self.allowed_read_paths)?;
+        let path = &config::allowed(path, &self.allowed_read_paths)?;
         let batches = mizuchi_io::read_json(path, opts)?;
         let schema = match batches.first() {
             Some(batch) => batch.schema(),
@@ -717,7 +717,7 @@ impl Session {
         opts: mizuchi_io::AvroReadOptions<'_>,
     ) -> Result<()> {
         let path = path.as_ref();
-        config::assert_allowed(path, &self.allowed_read_paths)?;
+        let path = &config::allowed(path, &self.allowed_read_paths)?;
         let batches = mizuchi_io::read_avro(path, opts)?;
         let schema = match batches.first() {
             Some(batch) => batch.schema(),
@@ -736,7 +736,7 @@ impl Session {
         opts: mizuchi_io::OrcReadOptions<'_>,
     ) -> Result<()> {
         let path = path.as_ref();
-        config::assert_allowed(path, &self.allowed_read_paths)?;
+        let path = &config::allowed(path, &self.allowed_read_paths)?;
         let batches = mizuchi_io::read_orc(path, opts)?;
         let schema = match batches.first() {
             Some(batch) => batch.schema(),
@@ -785,16 +785,20 @@ impl Session {
     /// Open a continuous query. Recovers from `cfg.checkpoint` when metadata
     /// from a previous run is present. Checkpoint and sink paths must pass
     /// the write allow-list (and the read allow-list, for recovery).
-    pub fn stream_query(&self, schema: SchemaRef, cfg: StreamQueryConfig) -> Result<StreamQuery> {
+    pub fn stream_query(
+        &self,
+        schema: SchemaRef,
+        mut cfg: StreamQueryConfig,
+    ) -> Result<StreamQuery> {
         if self.encryption.is_some() {
             return Err(Error::Io(
                 "encrypted sessions cannot use streaming queries".into(),
             ));
         }
         self.refuse_bare_governed_write()?;
-        config::assert_allowed(&cfg.checkpoint, &self.allowed_write_paths)?;
-        config::assert_allowed(&cfg.checkpoint, &self.allowed_read_paths)?;
-        config::assert_allowed(&cfg.sink, &self.allowed_write_paths)?;
+        cfg.checkpoint = config::allowed(&cfg.checkpoint, &self.allowed_write_paths)?;
+        config::allowed(&cfg.checkpoint, &self.allowed_read_paths)?;
+        cfg.sink = config::allowed(&cfg.sink, &self.allowed_write_paths)?;
         stream::StreamQuery::open_or_new(schema, cfg, self.cancel.clone())
     }
 
@@ -814,7 +818,7 @@ impl Session {
         self.refuse_plaintext_format("json")?;
         self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
-        config::assert_allowed(dest, &self.allowed_write_paths)?;
+        let dest = &config::allowed(dest, &self.allowed_write_paths)?;
         mizuchi_io::write_json(dest, batches)
     }
 
@@ -823,7 +827,7 @@ impl Session {
         self.refuse_plaintext_format("avro")?;
         self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
-        config::assert_allowed(dest, &self.allowed_write_paths)?;
+        let dest = &config::allowed(dest, &self.allowed_write_paths)?;
         mizuchi_io::write_avro(dest, batches)
     }
 
@@ -832,7 +836,7 @@ impl Session {
         self.refuse_plaintext_format("orc")?;
         self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
-        config::assert_allowed(dest, &self.allowed_write_paths)?;
+        let dest = &config::allowed(dest, &self.allowed_write_paths)?;
         mizuchi_io::write_orc(dest, batches)
     }
 
@@ -863,7 +867,7 @@ impl Session {
         mut opts: mizuchi_io::ParquetWriteOptions<'a>,
     ) -> Result<QueryReport> {
         let dest = dest.as_ref();
-        config::assert_allowed(dest, &self.allowed_write_paths)?;
+        let dest = &config::allowed(dest, &self.allowed_write_paths)?;
         if opts.encryption.is_none() {
             opts.encryption = self.encryption.as_ref();
         }
@@ -919,7 +923,7 @@ impl Session {
     ) -> Result<mizuchi_io::LakeSnapshot> {
         self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
-        config::assert_allowed(dest, &self.allowed_write_paths)?;
+        let dest = &config::allowed(dest, &self.allowed_write_paths)?;
         let (_, batches) = self.table_data(name)?;
         match &self.encryption {
             Some(keys) => mizuchi_io::write_delta_keys(dest, &batches, mode, keys),
@@ -935,7 +939,7 @@ impl Session {
         travel: mizuchi_io::TimeTravel,
     ) -> Result<()> {
         let path = path.as_ref();
-        config::assert_allowed(path, &self.allowed_read_paths)?;
+        let path = &config::allowed(path, &self.allowed_read_paths)?;
         let batches = match &self.encryption {
             Some(keys) => mizuchi_io::read_delta_keys(path, travel, keys)?,
             None => mizuchi_io::read_delta(path, travel)?,
@@ -955,8 +959,8 @@ impl Session {
     ) -> Result<mizuchi_io::LakeSnapshot> {
         self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
-        config::assert_allowed(dest, &self.allowed_write_paths)?;
-        config::assert_allowed(dest, &self.allowed_read_paths)?;
+        let dest = &config::allowed(dest, &self.allowed_write_paths)?;
+        config::allowed(dest, &self.allowed_read_paths)?;
         let target = mizuchi_plan::merge_target_table(sql)?;
         let head = mizuchi_io::delta_head(dest)?;
         let batches = match &self.encryption {
@@ -998,7 +1002,7 @@ impl Session {
     ) -> Result<mizuchi_io::LakeSnapshot> {
         self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
-        config::assert_allowed(dest, &self.allowed_write_paths)?;
+        let dest = &config::allowed(dest, &self.allowed_write_paths)?;
         let (_, batches) = self.table_data(name)?;
         match &self.encryption {
             Some(keys) => mizuchi_io::write_iceberg_keys(dest, &batches, mode, keys),
@@ -1014,7 +1018,7 @@ impl Session {
         travel: mizuchi_io::TimeTravel,
     ) -> Result<()> {
         let path = path.as_ref();
-        config::assert_allowed(path, &self.allowed_read_paths)?;
+        let path = &config::allowed(path, &self.allowed_read_paths)?;
         let batches = match &self.encryption {
             Some(keys) => mizuchi_io::read_iceberg_keys(path, travel, keys)?,
             None => mizuchi_io::read_iceberg(path, travel)?,
@@ -1034,8 +1038,8 @@ impl Session {
     ) -> Result<mizuchi_io::LakeSnapshot> {
         self.refuse_bare_governed_write()?;
         let dest = dest.as_ref();
-        config::assert_allowed(dest, &self.allowed_write_paths)?;
-        config::assert_allowed(dest, &self.allowed_read_paths)?;
+        let dest = &config::allowed(dest, &self.allowed_write_paths)?;
+        config::allowed(dest, &self.allowed_read_paths)?;
         let target = mizuchi_plan::merge_target_table(sql)?;
         let head = mizuchi_io::iceberg_head(dest)?;
         let batches = match &self.encryption {

@@ -1481,6 +1481,50 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The checkpoint and sink are checked once at open and written on every
+    /// trigger, so the stream must keep writing where the check approved even
+    /// when a symlink on the configured path is repointed afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn stream_writes_where_the_allow_list_approved_after_a_symlink_swap() {
+        let root = tmp("swap-root");
+        let outside = tmp("swap-outside");
+        fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("live")).unwrap();
+        let session = Session::from_config(crate::SessionConfig {
+            allowed_read_paths: vec![root.clone()],
+            allowed_write_paths: vec![root.clone()],
+            ..Default::default()
+        })
+        .unwrap();
+        let mut q = session
+            .stream_query(
+                schema(),
+                cfg(
+                    &root.join("live"),
+                    EventWindow::Tumbling {
+                        size: Duration::from_secs(10),
+                    },
+                    StreamOutput::Complete,
+                    Duration::from_secs(0),
+                ),
+            )
+            .unwrap();
+        fs::remove_file(root.join("live")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("live")).unwrap();
+        q.ingest(batch(&[1_000_000], &["a"], &[1])).unwrap();
+        q.trigger().unwrap();
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(
+            fs::read_dir(root.join("real").join("sink"))
+                .unwrap()
+                .count()
+                > 0
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
     #[test]
     fn session_stream_query_writes_checkpoint() {
         let root = tmp("session-api");

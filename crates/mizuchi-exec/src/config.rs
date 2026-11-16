@@ -54,13 +54,9 @@ pub(super) fn resolve_roots(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     paths.iter().map(|p| resolve(p)).collect()
 }
 
-pub(super) fn assert_allowed(path: &Path, roots: &[PathBuf]) -> Result<()> {
-    allowed(path, roots).map(|_| ())
-}
-
 /// `path` resolved under one of `roots`, or `path` unchanged when `roots` is
-/// empty. Callers that keep the path for later writes keep the resolved one,
-/// so the checked location is the written location.
+/// empty. Callers open, and keep, the returned path rather than the one they
+/// passed in, so a symlink swapped after the check cannot redirect them.
 pub(super) fn allowed(path: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
     if roots.is_empty() {
         return Ok(path.to_path_buf());
@@ -113,7 +109,7 @@ mod tests {
 
     #[test]
     fn empty_allow_list_accepts_any_path() {
-        assert_allowed(Path::new("/tmp/anywhere"), &[]).unwrap();
+        allowed(Path::new("/tmp/anywhere"), &[]).unwrap();
     }
 
     #[test]
@@ -123,7 +119,7 @@ mod tests {
         let file = root.join("in.parquet");
         std::fs::write(&file, b"").unwrap();
         let roots = resolve_roots(vec![root.clone()]).unwrap();
-        assert_allowed(&file, &roots).unwrap();
+        allowed(&file, &roots).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -136,7 +132,7 @@ mod tests {
         let file = other.join("secret.parquet");
         std::fs::write(&file, b"").unwrap();
         let roots = resolve_roots(vec![root.clone()]).unwrap();
-        let err = assert_allowed(&file, &roots).unwrap_err();
+        let err = allowed(&file, &roots).unwrap_err();
         assert!(matches!(err, Error::Io(_)), "{err:?}");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&other);
@@ -147,7 +143,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("mizuchi-allow-esc-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let roots = resolve_roots(vec![root.clone()]).unwrap();
-        let err = assert_allowed(&root.join("..").join("nope.parquet"), &roots).unwrap_err();
+        let err = allowed(&root.join("..").join("nope.parquet"), &roots).unwrap_err();
         assert!(matches!(err, Error::Io(_)), "{err:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
