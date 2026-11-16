@@ -396,12 +396,6 @@ impl SpillReader {
     /// Batches of the spill file at `path`, one at a time. A missing file is an
     /// error, never an empty run.
     pub(super) fn open(&self, path: &Path) -> Result<SpillIter> {
-        if !path.exists() {
-            return Err(Error::Io(format!(
-                "spill run {} is missing",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            )));
-        }
         spill_batches_with(path, self.key.clone())
     }
 }
@@ -625,14 +619,16 @@ fn read_spill_with(
 }
 
 /// One Arrow IPC record at a time so a multi-batch spill file is not all live.
+/// A spill file that is missing is an error, never an empty run: an empty
+/// spill is still written as a file with its schema.
 fn spill_batches_with(path: &Path, key: Option<Arc<SpillKey>>) -> Result<SpillIter> {
-    if !path.exists() {
-        return Ok(SpillIter {
-            file: None,
-            sealed: None,
-        });
-    }
-    let mut file = File::open(path).map_err(|e| Error::Io(e.to_string()))?;
+    let mut file = File::open(path).map_err(|e| {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        match e.kind() {
+            ErrorKind::NotFound => Error::Io(format!("spill file {name} is missing")),
+            _ => Error::Io(format!("spill file {name}: {e}")),
+        }
+    })?;
     let mut magic = [0u8; 4];
     let n = file
         .read(&mut magic)
@@ -747,6 +743,29 @@ mod tests {
         assert!(pool.try_reserve(1).is_err());
         drop(held);
         assert!(pool.try_reserve(10).is_ok());
+    }
+
+    #[test]
+    fn a_missing_spill_file_is_an_error_and_an_empty_one_is_not() {
+        let dir = std::env::temp_dir().join(format!(
+            "mizuchi-spill-missing-{}-{}",
+            std::process::id(),
+            JOB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let empty = dir.join("empty.arrow");
+        write_spill(&empty, schema.clone(), &[]).unwrap();
+        let read = read_spill(&empty, schema.clone());
+        let missing = read_spill(&dir.join("gone.arrow"), schema);
+        let _ = fs::remove_dir_all(&dir);
+        let read = read.unwrap();
+        assert_eq!(read.iter().map(Batch::num_rows).sum::<usize>(), 0);
+        assert_eq!(read[0].schema().field(0).name(), "a");
+        let err = missing.unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
     }
 
     #[test]
