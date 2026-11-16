@@ -362,16 +362,10 @@ impl FlightService for FlightWorker {
         let batches = match batches {
             Some(b) => b,
             None => match &self.state.spill_dir {
-                Some(dir) => {
-                    let path = dir.join(format!("{key}.arrow"));
-                    if path.exists() {
-                        read_spill(&path, empty_schema())
-                            .map_err(|e| Status::internal(e.to_string()))?
-                    } else {
-                        return Err(Status::not_found(key));
-                    }
+                Some(dir) if dir.join(format!("{key}.arrow")).exists() => {
+                    read_shuffle_spill(dir, &key).map_err(|e| Status::internal(e.to_string()))?
                 }
-                None => return Err(Status::not_found(key)),
+                _ => return Err(Status::not_found(key)),
             },
         };
         // Data read after a successor raised the fence is not returned.
@@ -499,12 +493,12 @@ fn put_shuffle(
     state
         .fence
         .publish(token, || {
-            if let (Some(dir), Some(schema)) =
-                (&state.spill_dir, batches.first().map(Batch::schema))
-            {
-                let _ = std::fs::create_dir_all(dir);
-                let path = dir.join(format!("{key}.arrow"));
-                let _ = write_spill(&path, schema, &batches);
+            // The spill copy backs the coordinator's fallback, so a write
+            // that fails fails the put. An empty partition is still written,
+            // so the fallback can tell it from a missing one.
+            if let Some(dir) = &state.spill_dir {
+                write_shuffle_spill(dir, &key, &batches)
+                    .map_err(|e| Status::internal(format!("shuffle spill: {e}")))?;
             }
             state
                 .shuffle
@@ -514,6 +508,43 @@ fn put_shuffle(
         })
         .map_err(fenced)??;
     Ok(Vec::new())
+}
+
+/// Writes `batches` as the spill file of shuffle partition `key` under `dir`.
+/// The file appears complete or not at all: it is written beside its final
+/// name, synced, then renamed.
+fn write_shuffle_spill(dir: &std::path::Path, key: &str, batches: &[Batch]) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| Error::Io(e.to_string()))?;
+    let schema = batches.first().map_or_else(empty_schema, Batch::schema);
+    let path = dir.join(format!("{key}.arrow"));
+    let partial = dir.join(format!(
+        ".{key}.arrow.partial-{}-{}",
+        std::process::id(),
+        PARTIAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = write_spill(&partial, schema, batches).and_then(|()| {
+        std::fs::File::open(&partial)
+            .and_then(|f| f.sync_all())
+            .and_then(|()| std::fs::rename(&partial, &path))
+            .map_err(|e| Error::Io(e.to_string()))
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    written
+}
+
+static PARTIAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Shuffle partition `key` from the spill directory `dir`. A missing file is
+/// an error; zero-row batches are dropped, as a Flight fetch would.
+fn read_shuffle_spill(dir: &std::path::Path, key: &str) -> Result<Vec<Batch>> {
+    Ok(
+        read_spill(&dir.join(format!("{key}.arrow")), empty_schema())?
+            .into_iter()
+            .filter(|b| b.num_rows() > 0)
+            .collect(),
+    )
 }
 
 fn fetch_remote(
@@ -805,10 +836,7 @@ impl RemoteCluster {
                 // leadership first and reads only this generation's file.
                 let token = self.token()?;
                 match &self.spill_dir {
-                    Some(dir) => read_spill(
-                        &dir.join(format!("{}.arrow", generation_key(key, token))),
-                        empty_schema(),
-                    ),
+                    Some(dir) => read_shuffle_spill(dir, &generation_key(key, token)),
                     None => fetch_shuffle(&owner.addr, key, token).map_err(Error::from),
                 }
             }
@@ -1100,6 +1128,90 @@ mod tests {
         assert_eq!(rows(&cluster.execute_sql("SELECT a FROM t").unwrap()), 3);
         stop.send(()).unwrap();
         handle.join().unwrap().unwrap();
+    }
+
+    /// A unique spill directory for one test.
+    fn spill_dir(tag: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "mizuchi-flight-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An address nothing listens on, so a call to it fails as transport.
+    fn unreachable_addr() -> String {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shuffle_put_fails_when_its_spill_cannot_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = spill_dir("ro");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Permission bits do not bind a privileged user; nothing to prove then.
+        let writable = std::fs::write(dir.join("probe"), b"x").is_ok();
+        let (owner, _) = spawn_worker(true, Some(dir.clone()), None).unwrap();
+        let (reader, _) = spawn_worker(true, Some(dir.clone()), None).unwrap();
+        let cluster =
+            RemoteCluster::connect(vec![owner.to_string(), reader.to_string()], true, None)
+                .unwrap();
+        let (_, batches) = numbers(3);
+        let out = cluster.shuffle_round_trip(0, 1, "ro-part", &batches);
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(&dir);
+        if !writable {
+            let err = out.unwrap_err();
+            assert!(err.to_string().contains("shuffle spill"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_missing_shuffle_spill_is_an_error_not_an_empty_partition() {
+        let dir = spill_dir("missing");
+        let (owner, _) = spawn_worker(true, Some(dir.clone()), None).unwrap();
+        let (reader, _) = spawn_worker(true, Some(dir.clone()), None).unwrap();
+        let cluster =
+            RemoteCluster::connect(vec![owner.to_string(), reader.to_string()], true, None)
+                .unwrap();
+        let (_, batches) = numbers(3);
+        cluster
+            .shuffle_round_trip(0, 1, "gone-part", &batches)
+            .unwrap();
+        let spilled = read_shuffle_spill(&dir, "gone-part").map(|b| rows(&b));
+        std::fs::remove_file(dir.join("gone-part.arrow")).unwrap();
+        let missing = read_shuffle_spill(&dir, "gone-part");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(spilled.unwrap(), 3);
+        let err = missing.unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_shuffle_partition_round_trips_through_the_spill_fallback() {
+        let dir = spill_dir("empty");
+        let (owner, _) = spawn_worker(true, Some(dir.clone()), None).unwrap();
+        // The reader cannot be reached, so the coordinator reads the spill.
+        let cluster = RemoteCluster::connect(
+            vec![owner.to_string(), unreachable_addr()],
+            true,
+            Some(dir.clone()),
+        )
+        .unwrap();
+        let empty = cluster.shuffle_round_trip(0, 1, "empty-part", &[]);
+        let (_, batches) = numbers(2);
+        let full = cluster.shuffle_round_trip(0, 1, "full-part", &batches);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rows(&empty.unwrap()), 0);
+        assert_eq!(rows(&full.unwrap()), 2);
     }
 
     #[test]
