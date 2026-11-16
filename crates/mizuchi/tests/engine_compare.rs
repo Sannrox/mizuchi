@@ -9,6 +9,7 @@ mod ds_common;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
@@ -433,14 +434,37 @@ fn report_json(
     (s, ok)
 }
 
+/// Scratch directory owned by one test run: the process id and a counter keep
+/// concurrent runs apart, and drop removes only this run's files.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static SEQ: AtomicU64 = AtomicU64::new(1);
+        let path = std::env::temp_dir().join(format!(
+            "mizuchi-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn tiny_compare_matches_reference_goldens() {
-    let tmp = std::env::temp_dir().join("mizuchi-engine-compare");
-    let _ = fs::remove_dir_all(&tmp);
-    write_tables_csv(&tmp);
+    let dir = TempDir::new("engine-compare");
+    let tmp = &dir.0;
+    write_tables_csv(tmp);
     let mizuchi = run_mizuchi();
-    let duckdb = reference_for("duckdb", run_duckdb(&tmp));
-    let datafusion = reference_for("datafusion", run_datafusion(&tmp));
+    let duckdb = reference_for("duckdb", run_duckdb(tmp));
+    let datafusion = reference_for("datafusion", run_datafusion(tmp));
     let (json, ok) = report_json(&mizuchi, &duckdb, &datafusion);
     println!("{json}");
     assert!(json.contains("\"time_ratio\""));
@@ -454,11 +478,11 @@ fn record_goldens_if_requested() {
     if std::env::var("MIZUCHI_RECORD_GOLDENS").ok().as_deref() != Some("1") {
         return;
     }
-    let tmp = std::env::temp_dir().join("mizuchi-engine-compare-record");
-    let _ = fs::remove_dir_all(&tmp);
-    write_tables_csv(&tmp);
-    let duck = run_duckdb(&tmp).expect("duckdb CLI required to record goldens");
-    let df = run_datafusion(&tmp).expect("datafusion-cli required to record goldens");
+    let dir = TempDir::new("engine-compare-record");
+    let tmp = &dir.0;
+    write_tables_csv(tmp);
+    let duck = run_duckdb(tmp).expect("duckdb CLI required to record goldens");
+    let df = run_datafusion(tmp).expect("datafusion-cli required to record goldens");
     for (engine, runs) in [("duckdb", duck), ("datafusion", df)] {
         let dir = golden_dir().join(engine);
         fs::create_dir_all(&dir).unwrap();
