@@ -2,7 +2,9 @@
 //!
 //! Parquet files land under a hidden staging directory, then publish by rename
 //! so the dataset directory never shows a partial write. A failed or cancelled
-//! job removes staging and leaves committed files as they were. Partition
+//! job removes staging and leaves committed files as they were. An overwrite
+//! that fails or crashes mid-publish rolls back to the previous files; see
+//! [`publish_overwrite`]. Partition
 //! layout is Hive-style `col=value` directories. Partition columns stay in the
 //! file schema so [`crate::read::read_parquet`] round-trips a part file.
 //! JSON is newline-delimited. Avro is Object Container Files. ORC is the
@@ -138,7 +140,10 @@ pub fn write_parquet_stats(
 #[derive(Clone, Copy, Default)]
 struct CommitCtrl {
     fail_before_commit: bool,
+    /// Simulates a crash: no cleanup or rollback runs after the failure.
     leave_staging: bool,
+    /// Fail the move of staged files into the dataset after this many files.
+    fail_move_after: Option<usize>,
     cancel_after_groups: Option<usize>,
 }
 
@@ -177,6 +182,9 @@ fn write_inner(
     }
 
     fs::create_dir_all(dest).map_err(|e| io_err(dest, e))?;
+    // Finish or roll back an overwrite that a crashed writer left behind
+    // before this write builds on the directory.
+    recover_overwrite(dest)?;
     let id = JOB.fetch_add(1, Ordering::Relaxed);
     let staging = dest.join(format!(".mizuchi-staging-{id}"));
     fs::create_dir_all(&staging).map_err(|e| io_err(&staging, e))?;
@@ -195,7 +203,7 @@ fn write_inner(
         if ctrl.fail_before_commit {
             return Err(Error::Io("injected commit failure".into()));
         }
-        publish(dest, &staging, opts.mode, id)?;
+        publish(dest, &staging, opts.mode, id, ctrl)?;
         write_success(dest)?;
         dataset_write_stats(dest, batches, opts)
     })();
@@ -427,30 +435,113 @@ fn escape_segment(s: &str) -> String {
     out
 }
 
-fn publish(dest: &Path, staging: &Path, mode: WriteMode, id: u64) -> Result<()> {
+fn publish(dest: &Path, staging: &Path, mode: WriteMode, id: u64, ctrl: CommitCtrl) -> Result<()> {
     match mode {
-        WriteMode::Overwrite => publish_overwrite(dest, staging, id),
+        WriteMode::Overwrite => match publish_overwrite(dest, staging, id, ctrl.fail_move_after) {
+            Err(e) if !ctrl.leave_staging => match recover_overwrite(dest) {
+                Ok(()) => Err(e),
+                Err(r) => Err(Error::Io(format!("{e}; rollback failed: {r}"))),
+            },
+            result => result,
+        },
         WriteMode::Append => publish_append(dest, staging),
     }
 }
 
-fn publish_overwrite(dest: &Path, staging: &Path, id: u64) -> Result<()> {
-    let old = dest.join(format!(".mizuchi-old-{id}"));
-    fs::create_dir_all(&old).map_err(|e| io_err(&old, e))?;
-    let children = fs::read_dir(dest).map_err(|e| io_err(dest, e))?;
-    for ent in children {
-        let ent = ent.map_err(|e| io_err(dest, e))?;
-        let name = ent.file_name();
-        let name_s = name.to_string_lossy();
-        if name_s.starts_with(".mizuchi-") {
-            continue;
-        }
+/// Rollback directory of an overwrite that is still moving old entries out.
+/// Every visible entry of the dataset is still an old one.
+///
+/// Older versions used `.mizuchi-old-` without phases; such a leftover cannot
+/// be told apart from a half-published overwrite, so recovery leaves it alone.
+const OVERWRITE_OLD: &str = ".mizuchi-evac-";
+/// Every old entry has moved out; visible entries are this write's new files.
+const OVERWRITE_MOVED: &str = ".mizuchi-moved-";
+/// The new files are published; the directory only waits for removal.
+const OVERWRITE_DONE: &str = ".mizuchi-done-";
+
+/// Replaces the visible entries of `dest` with the staged files. The old
+/// entries move into a rollback directory whose name records the phase, so
+/// [`recover_overwrite`] can always tell whether to finish or roll back:
+/// `.mizuchi-evac-` while evacuating, `.mizuchi-moved-` while publishing,
+/// `.mizuchi-done-` once the new files are complete.
+fn publish_overwrite(
+    dest: &Path,
+    staging: &Path,
+    id: u64,
+    fail_move_after: Option<usize>,
+) -> Result<()> {
+    let old = dest.join(format!("{OVERWRITE_OLD}{id}"));
+    let moved = dest.join(format!("{OVERWRITE_MOVED}{id}"));
+    let done = dest.join(format!("{OVERWRITE_DONE}{id}"));
+    fs::create_dir(&old).map_err(|e| io_err(&old, e))?;
+    for name in visible_entries(dest)? {
         let from = dest.join(&name);
         fs::rename(&from, old.join(&name)).map_err(|e| io_err(&from, e))?;
     }
-    move_tree(staging, dest)?;
-    let _ = fs::remove_dir_all(&old);
+    fs::rename(&old, &moved).map_err(|e| io_err(&old, e))?;
+    move_tree(staging, dest, fail_move_after)?;
+    fs::rename(&moved, &done).map_err(|e| io_err(&moved, e))?;
+    let _ = fs::remove_dir_all(&done);
     Ok(())
+}
+
+/// Finishes or rolls back every overwrite left in `dest` by a failed or
+/// crashed writer. Assumes one writer per dataset directory: a concurrent
+/// overwrite in progress would be rolled back. Each step is safe to repeat
+/// after a crash in the middle of recovery.
+fn recover_overwrite(dest: &Path) -> Result<()> {
+    let mut pending = Vec::new();
+    for ent in fs::read_dir(dest).map_err(|e| io_err(dest, e))? {
+        let ent = ent.map_err(|e| io_err(dest, e))?;
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if name.starts_with(OVERWRITE_DONE) {
+            // `remove_dir_all` deletes the contents first, so the name keeps
+            // marking the overwrite as finished until the very end.
+            fs::remove_dir_all(ent.path()).map_err(|e| io_err(&ent.path(), e))?;
+        } else if name.starts_with(OVERWRITE_OLD) || name.starts_with(OVERWRITE_MOVED) {
+            pending.push(name);
+        }
+    }
+    for name in pending {
+        let mut dir = dest.join(&name);
+        if let Some(id) = name.strip_prefix(OVERWRITE_MOVED) {
+            // The visible entries are a partial new dataset: drop them, then
+            // mark the directory as evacuating so a crash from here on only
+            // moves old entries back.
+            for visible in visible_entries(dest)? {
+                let path = dest.join(visible);
+                let removed = if path.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
+                removed.map_err(|e| io_err(&path, e))?;
+            }
+            let old = dest.join(format!("{OVERWRITE_OLD}{id}"));
+            fs::rename(&dir, &old).map_err(|e| io_err(&dir, e))?;
+            dir = old;
+        }
+        for ent in fs::read_dir(&dir).map_err(|e| io_err(&dir, e))? {
+            let ent = ent.map_err(|e| io_err(&dir, e))?;
+            let to = dest.join(ent.file_name());
+            fs::rename(ent.path(), &to).map_err(|e| io_err(&to, e))?;
+        }
+        fs::remove_dir(&dir).map_err(|e| io_err(&dir, e))?;
+    }
+    Ok(())
+}
+
+/// Entry names of `dest` that belong to the dataset, i.e. everything but the
+/// writer's own `.mizuchi-` staging and rollback directories.
+fn visible_entries(dest: &Path) -> Result<Vec<std::ffi::OsString>> {
+    let mut out = Vec::new();
+    for ent in fs::read_dir(dest).map_err(|e| io_err(dest, e))? {
+        let name = ent.map_err(|e| io_err(dest, e))?.file_name();
+        if !name.to_string_lossy().starts_with(".mizuchi-") {
+            out.push(name);
+        }
+    }
+    Ok(out)
 }
 
 fn publish_append(dest: &Path, staging: &Path) -> Result<()> {
@@ -466,8 +557,11 @@ fn publish_append(dest: &Path, staging: &Path) -> Result<()> {
     Ok(())
 }
 
-fn move_tree(from: &Path, to: &Path) -> Result<()> {
-    for file in list_parquets(from)? {
+fn move_tree(from: &Path, to: &Path, fail_after: Option<usize>) -> Result<()> {
+    for (n, file) in list_parquets(from)?.into_iter().enumerate() {
+        if fail_after == Some(n) {
+            return Err(Error::Io("injected publish failure".into()));
+        }
         let rel = file.strip_prefix(from).unwrap_or(&file);
         let dest_file = to.join(rel);
         if let Some(parent) = dest_file.parent() {
@@ -872,6 +966,111 @@ mod tests {
             .collect();
         assert!(leftover.is_empty());
         let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// #240: a failed move of staged files used to leave the dataset empty
+    /// or partial, with the old files hidden under `.mizuchi-old-*`.
+    #[test]
+    fn failed_overwrite_publish_keeps_previous_rows() {
+        let dest = tmp_dest();
+        write_year(&dest, &[sample_batch()], WriteMode::Overwrite).unwrap();
+        let before = read_ids(&dest);
+        let err = write_year_inner(
+            &dest,
+            &[sample_batch()],
+            WriteMode::Overwrite,
+            CommitCtrl {
+                fail_move_after: Some(1),
+                ..CommitCtrl::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("injected publish failure"),
+            "{err}"
+        );
+        assert_eq!(read_ids(&dest), before);
+        assert_eq!(hidden_entries(&dest), Vec::<String>::new());
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// #240: a crash mid-publish leaves a partial new dataset and the old
+    /// files under a rollback directory; the next write rolls back first.
+    #[test]
+    fn next_write_recovers_a_crashed_overwrite() {
+        let dest = tmp_dest();
+        write_year(&dest, &[sample_batch()], WriteMode::Overwrite).unwrap();
+        let before = read_ids(&dest);
+        write_year_inner(
+            &dest,
+            &[sample_batch()],
+            WriteMode::Overwrite,
+            CommitCtrl {
+                fail_move_after: Some(1),
+                leave_staging: true,
+                ..CommitCtrl::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            hidden_entries(&dest)
+                .iter()
+                .any(|n| n.starts_with(OVERWRITE_MOVED)),
+            "crash leaves the rollback directory"
+        );
+        write_year(&dest, &[sample_batch()], WriteMode::Append).unwrap();
+        let mut expected = [before.clone(), before].concat();
+        expected.sort();
+        let mut ids = read_ids(&dest);
+        ids.sort();
+        assert_eq!(ids, expected);
+        assert!(
+            hidden_entries(&dest)
+                .iter()
+                .all(|n| n.starts_with(".mizuchi-staging-")),
+            "{:?}",
+            hidden_entries(&dest)
+        );
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// A crash while old entries move out rolls back by moving them home.
+    #[test]
+    fn recovery_restores_a_half_evacuated_overwrite() {
+        let dest = tmp_dest();
+        write_year(&dest, &[sample_batch()], WriteMode::Overwrite).unwrap();
+        let before = read_ids(&dest);
+        let old = dest.join(format!("{OVERWRITE_OLD}7"));
+        fs::create_dir(&old).unwrap();
+        fs::rename(dest.join("year=2020"), old.join("year=2020")).unwrap();
+        recover_overwrite(&dest).unwrap();
+        assert_eq!(read_ids(&dest), before);
+        assert!(!old.exists());
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// A pre-phase `.mizuchi-old-*` leftover has no marker saying how far the
+    /// publish got, so recovery must not move its files into the dataset.
+    #[test]
+    fn recovery_leaves_a_legacy_rollback_directory_alone() {
+        let dest = tmp_dest();
+        write_year(&dest, &[sample_batch()], WriteMode::Overwrite).unwrap();
+        let before = read_ids(&dest);
+        let legacy = dest.join(".mizuchi-old-3");
+        fs::create_dir(&legacy).unwrap();
+        fs::write(legacy.join("part-00000.parquet"), b"stale").unwrap();
+        recover_overwrite(&dest).unwrap();
+        assert_eq!(read_ids(&dest), before);
+        assert!(legacy.join("part-00000.parquet").exists());
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    fn hidden_entries(dest: &Path) -> Vec<String> {
+        fs::read_dir(dest)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".mizuchi-"))
+            .collect()
     }
 
     #[test]
