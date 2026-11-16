@@ -206,3 +206,37 @@ SELECT substring('ä€😀x' FROM 3)
 
 statement error
 SELECT substring('abc' FROM 1 FOR -1)
+
+# ABS of an integer type's minimum has no positive value and overflows, like
+# unary minus; one above the minimum is fine.
+statement error
+SELECT abs(CAST(-128 AS TINYINT))
+
+query I
+SELECT CAST(abs(CAST(-127 AS TINYINT)) AS BIGINT)
+----
+127
+
+statement error
+SELECT abs(CAST(-32768 AS SMALLINT))
+
+query I
+SELECT CAST(abs(CAST(-32767 AS SMALLINT)) AS BIGINT)
+----
+32767
+
+statement error
+SELECT abs(CAST(-2147483648 AS INTEGER))
+
+query I
+SELECT CAST(abs(CAST(-2147483647 AS INTEGER)) AS BIGINT)
+----
+2147483647
+
+statement error
+SELECT abs(-9223372036854775807 - 1)
+
+query I
+SELECT abs(-9223372036854775807)
+----
+9223372036854775807
