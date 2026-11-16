@@ -369,3 +369,44 @@ fn a_standby_resumes_a_batch_query_from_its_last_committed_stage() {
     );
     let _ = std::fs::remove_dir_all(lease);
 }
+
+/// Runs the binary with no lease, network, or worker settings from the
+/// environment and returns its exit success and stderr.
+fn run_bin(args: &[&str]) -> (bool, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_mizuchi"))
+        .args(args)
+        .env_remove("MIZUCHI_LEASE_DIR")
+        .env_remove("MIZUCHI_ALLOW_NETWORK")
+        .env_remove("MIZUCHI_WORKERS")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// #238: a trailing `--lease-dir` used to read as omitted and start an
+/// unfenced worker or a coordinator that never took the lease.
+#[test]
+fn a_lease_dir_flag_without_a_value_is_refused() {
+    for args in [
+        &["worker", "--bind", "127.0.0.1:0", "--lease-dir"][..],
+        &["coordinator", "--workers", "127.0.0.1:1", "--lease-dir"][..],
+    ] {
+        let (ok, stderr) = run_bin(args);
+        assert!(!ok, "{args:?} must fail");
+        assert!(
+            stderr.contains("flag --lease-dir needs a value"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_flag_is_refused() {
+    let (ok, stderr) = run_bin(&["worker", "--lease-dri", "/tmp/x"]);
+    assert!(!ok);
+    assert!(stderr.contains("unknown flag --lease-dri"), "{stderr}");
+}

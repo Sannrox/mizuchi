@@ -50,20 +50,25 @@ fn spill_dir() -> Option<PathBuf> {
 }
 
 fn worker(args: &[String]) -> Result<(), String> {
-    let bind = flag(args, "--bind")
+    let args = Flags::parse(args, &["--bind", "--lease-dir"])?;
+    let bind = args
+        .get("--bind")
         .or_else(|| env::var("MIZUCHI_BIND").ok())
         .unwrap_or_else(|| "0.0.0.0:8815".into());
     let addr: SocketAddr = bind.parse().map_err(|e| format!("bind: {e}"))?;
     // A worker that mounts the coordinators' lease directory checks every
     // fencing token against it (ADR 0016).
-    let lease_dir = flag(args, "--lease-dir")
+    let lease_dir = args
+        .get("--lease-dir")
         .or_else(|| env::var("MIZUCHI_LEASE_DIR").ok())
         .map(PathBuf::from);
     serve_worker(addr, allow_network(), spill_dir(), lease_dir).map_err(|e| e.to_string())
 }
 
 fn coordinator(args: &[String]) -> Result<(), String> {
-    let workers = flag(args, "--workers")
+    let args = Flags::parse(args, &["--workers", "--lease-dir", "--holder", "--sql"])?;
+    let workers = args
+        .get("--workers")
         .or_else(|| env::var("MIZUCHI_WORKERS").ok())
         .ok_or_else(|| "coordinator needs --workers or MIZUCHI_WORKERS".to_string())?;
     let addrs = workers
@@ -73,10 +78,12 @@ fn coordinator(args: &[String]) -> Result<(), String> {
         .collect::<Vec<_>>();
     let mut cluster =
         RemoteCluster::connect(addrs, allow_network(), spill_dir()).map_err(|e| e.to_string())?;
-    let leadership = match flag(args, "--lease-dir").or_else(|| env::var("MIZUCHI_LEASE_DIR").ok())
+    let leadership = match args
+        .get("--lease-dir")
+        .or_else(|| env::var("MIZUCHI_LEASE_DIR").ok())
     {
         Some(dir) => {
-            let leadership = Arc::new(lead(&dir, args)?);
+            let leadership = Arc::new(lead(&dir, &args)?);
             cluster = cluster.with_leadership(leadership.clone());
             Some(leadership)
         }
@@ -107,7 +114,9 @@ fn coordinator(args: &[String]) -> Result<(), String> {
             vec![Batch::from_arrow(batch).map_err(|e| e.to_string())?],
         )
         .map_err(|e| e.to_string())?;
-    let sql = flag(args, "--sql").unwrap_or_else(|| "SELECT SUM(a) AS s FROM t".into());
+    let sql = args
+        .get("--sql")
+        .unwrap_or_else(|| "SELECT SUM(a) AS s FROM t".into());
     let out = cluster.execute_sql(&sql).map_err(|e| e.to_string())?;
     println!("rows={}", out.iter().map(|b| b.num_rows()).sum::<usize>());
     if let Some(leadership) = leadership {
@@ -124,8 +133,9 @@ fn lease_ttl() -> Duration {
 }
 
 /// Waits as a standby until this coordinator holds the lease in `dir`.
-fn lead(dir: &str, args: &[String]) -> Result<Leadership, String> {
-    let holder = flag(args, "--holder")
+fn lead(dir: &str, args: &Flags) -> Result<Leadership, String> {
+    let holder = args
+        .get("--holder")
         .or_else(|| env::var("MIZUCHI_HOLDER").ok())
         .or_else(|| env::var("HOSTNAME").ok())
         .unwrap_or_else(|| format!("coordinator-{}", process::id()));
@@ -137,6 +147,37 @@ fn lead(dir: &str, args: &[String]) -> Result<Leadership, String> {
     Ok(leadership)
 }
 
-fn flag(args: &[String], name: &str) -> Option<String> {
-    args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
+/// `--name value` pairs of one command. Parsing fails closed: a flag outside
+/// the command's `known` list, a flag without a value, or a stray argument is a
+/// startup error, so `--lease-dir` can never be dropped silently (ADR 0016).
+struct Flags(Vec<(String, String)>);
+
+impl Flags {
+    fn parse(args: &[String], known: &[&str]) -> Result<Self, String> {
+        let mut pairs = Vec::new();
+        let mut rest = args.iter();
+        while let Some(name) = rest.next() {
+            if !known.contains(&name.as_str()) {
+                return Err(if name.starts_with("--") {
+                    format!("unknown flag {name}")
+                } else {
+                    format!("unexpected argument {name}")
+                });
+            }
+            match rest.next() {
+                Some(value) if !value.starts_with("--") => {
+                    pairs.push((name.clone(), value.clone()));
+                }
+                _ => return Err(format!("flag {name} needs a value")),
+            }
+        }
+        Ok(Self(pairs))
+    }
+
+    fn get(&self, name: &str) -> Option<String> {
+        self.0
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    }
 }
