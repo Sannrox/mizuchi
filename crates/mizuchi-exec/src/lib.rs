@@ -2277,7 +2277,8 @@ fn build_physical_filtered(
             let (child, child_node) = build_physical(input, session, pool, analyze, work)?;
             let t0 = Instant::now();
             let copied0 = pool.copied();
-            let batches = sort::ordered(
+            let cancel = session.exec_token();
+            let rows = sort::sorted(
                 child,
                 input.schema().clone(),
                 order,
@@ -2285,12 +2286,12 @@ fn build_physical_filtered(
                 None,
                 &session.policy,
                 pool,
-                &session.exec_token(),
+                &cancel,
             )?;
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let (op, node) = metrics::finish(
                 "Sort",
-                lowering.scan(batches)?,
+                rows.lower(lowering, &cancel)?,
                 vec![child_node],
                 analyze,
                 pool,
@@ -2313,7 +2314,8 @@ fn build_physical_filtered(
                 let (child, child_node) = build_physical(sorted, session, pool, analyze, work)?;
                 let t0 = Instant::now();
                 let copied0 = pool.copied();
-                let batches = sort::ordered(
+                let cancel = session.exec_token();
+                let rows = sort::sorted(
                     child,
                     sorted.schema().clone(),
                     order,
@@ -2321,12 +2323,12 @@ fn build_physical_filtered(
                     *fetch,
                     &session.policy,
                     pool,
-                    &session.exec_token(),
+                    &cancel,
                 )?;
                 let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 let (op, node) = metrics::finish(
                     "Sort",
-                    lowering.scan(batches)?,
+                    rows.lower(lowering, &cancel)?,
                     vec![child_node],
                     analyze,
                     pool,
@@ -5530,7 +5532,11 @@ mod tests {
 
     #[test]
     fn sort_spills_under_tiny_limit_and_matches() {
-        let (s, cap) = register_numbered(12, 32);
+        let (schema, batches) = numbered_batches(12, 32, 0);
+        // Still spills, with room for the merge to hold two reserved chunks.
+        let cap = tight_limit(&batches) * 3;
+        let mut s = Session::new();
+        s.register("t", schema, batches).unwrap();
         let sql = "SELECT a FROM t ORDER BY a";
         let want = col_i64(&s.execute_sql(sql).unwrap(), "a");
         let root = spill_root("sort");
@@ -5718,17 +5724,32 @@ mod tests {
             .clone()
             .with_memory_limit(cap)
             .with_spill_dir(root.clone());
-        // q1 shape: few groups, several accumulators including AVG.
+        // q1 shape: few groups, several accumulators including AVG. No ORDER
+        // BY: the cap leaves a sort of the output no room to merge, so rows
+        // are matched by group below.
         let sql = "SELECT g, SUM(a) AS s, AVG(a) AS av, AVG(g) AS ag, COUNT(*) AS c \
-                   FROM t GROUP BY g ORDER BY g";
+                   FROM t GROUP BY g";
         let want = s.execute_sql(sql).unwrap();
         let got = limited.execute_sql_reported(sql).unwrap();
         assert!(got.spilled_bytes > 0, "the cap must force a spill");
+        let by_group = |batches: &[Batch]| {
+            let g = col_i64(batches, "g");
+            let mut rows: Vec<usize> = (0..g.len()).collect();
+            rows.sort_by_key(|&i| g[i]);
+            rows
+        };
+        let (got_rows, want_rows) = (by_group(&got.batches), by_group(&want));
         for col in ["g", "s", "c"] {
-            assert_eq!(col_i64(&got.batches, col), col_i64(&want, col), "{col}");
+            let (l, r) = (col_i64(&got.batches, col), col_i64(&want, col));
+            let l: Vec<_> = got_rows.iter().map(|&i| l[i]).collect();
+            let r: Vec<_> = want_rows.iter().map(|&i| r[i]).collect();
+            assert_eq!(l, r, "{col}");
         }
         for col in ["av", "ag"] {
-            assert_eq!(col_f64(&got.batches, col), col_f64(&want, col), "{col}");
+            let (l, r) = (col_f64(&got.batches, col), col_f64(&want, col));
+            let l: Vec<_> = got_rows.iter().map(|&i| l[i]).collect();
+            let r: Vec<_> = want_rows.iter().map(|&i| r[i]).collect();
+            assert_eq!(l, r, "{col}");
         }
         let total = "SELECT AVG(a) AS av FROM t";
         assert_eq!(

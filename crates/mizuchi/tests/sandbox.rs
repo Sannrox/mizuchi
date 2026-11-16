@@ -146,10 +146,8 @@ fn os_denied_read_is_io() {
 #[test]
 fn spill_stays_in_configured_dir() {
     let (schema, batches) = numbered_batches(12, 32);
-    let cap = {
-        let sz = batches[0].as_arrow().get_array_memory_size() as u64;
-        sz + sz / 2
-    };
+    // Small enough to spill, large enough for the merge to hold two chunks.
+    let cap = 4 * batches[0].as_arrow().get_array_memory_size() as u64;
     let spill = tmp("spill");
     let other = tmp("other");
     std::fs::create_dir_all(&spill).unwrap();

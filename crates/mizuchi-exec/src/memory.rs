@@ -98,11 +98,55 @@ pub(crate) struct Budget {
     pub used: Arc<AtomicU64>,
 }
 
-/// Query-scoped pool. `used` is the live reservation; `peak` is its high water.
-pub(crate) struct MemoryPool {
+/// Limit, live reservation, and its high water. Shared by a pool and the
+/// [`OwnedReservation`]s it hands to operators that outlive a borrow of it.
+struct Ledger {
     limit: Option<u64>,
     used: Arc<AtomicU64>,
     peak: AtomicU64,
+}
+
+impl Ledger {
+    fn add(&self, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        if let Some(limit) = self.limit {
+            let mut current = self.used.load(Ordering::SeqCst);
+            loop {
+                let next = current.saturating_add(bytes);
+                if next > limit {
+                    return Err(Error::Memory(format!(
+                        "reservation {bytes} would use {next} of limit {limit}"
+                    )));
+                }
+                match self
+                    .used
+                    .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+                {
+                    Ok(_) => break,
+                    Err(seen) => current = seen,
+                }
+            }
+        } else {
+            self.used.fetch_add(bytes, Ordering::SeqCst);
+        }
+        let live = self.used.load(Ordering::SeqCst);
+        self.peak.fetch_max(live, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn release(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.used.fetch_sub(bytes, Ordering::SeqCst);
+    }
+}
+
+/// Query-scoped pool. Reservations draw from its [`Ledger`].
+pub(crate) struct MemoryPool {
+    ledger: Arc<Ledger>,
     copied: Arc<AtomicU64>,
     spilled: AtomicU64,
     spill_dir: Option<PathBuf>,
@@ -192,9 +236,11 @@ impl MemoryPool {
             None => None,
         };
         Ok(Self {
-            limit,
-            used,
-            peak: AtomicU64::new(0),
+            ledger: Arc::new(Ledger {
+                limit,
+                used,
+                peak: AtomicU64::new(0),
+            }),
             copied: Arc::new(AtomicU64::new(0)),
             spilled: AtomicU64::new(0),
             spill_dir,
@@ -212,53 +258,33 @@ impl MemoryPool {
     }
 
     pub(super) fn has_limit(&self) -> bool {
-        self.limit.is_some()
+        self.ledger.limit.is_some()
     }
 
     pub(super) fn limit(&self) -> Option<u64> {
-        self.limit
-    }
-
-    fn add_used(&self, bytes: u64) -> Result<()> {
-        if bytes == 0 {
-            return Ok(());
-        }
-        if let Some(limit) = self.limit {
-            let mut current = self.used.load(Ordering::SeqCst);
-            loop {
-                let next = current.saturating_add(bytes);
-                if next > limit {
-                    return Err(Error::Memory(format!(
-                        "reservation {bytes} would use {next} of limit {limit}"
-                    )));
-                }
-                match self
-                    .used
-                    .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
-                {
-                    Ok(_) => break,
-                    Err(seen) => current = seen,
-                }
-            }
-        } else {
-            self.used.fetch_add(bytes, Ordering::SeqCst);
-        }
-        let live = self.used.load(Ordering::SeqCst);
-        self.peak.fetch_max(live, Ordering::Relaxed);
-        Ok(())
+        self.ledger.limit
     }
 
     pub(super) fn try_reserve(&self, bytes: u64) -> Result<Reservation<'_>> {
-        self.add_used(bytes)?;
+        self.ledger.add(bytes)?;
         Ok(Reservation { pool: self, bytes })
     }
 
+    /// Reserves from this pool without borrowing it, for operators handed
+    /// back to the caller. Its reservations count against this pool's limit
+    /// and peak.
+    pub(super) fn reserver(&self) -> Reserver {
+        Reserver {
+            ledger: self.ledger.clone(),
+        }
+    }
+
     pub(super) fn used_handle(&self) -> Arc<AtomicU64> {
-        self.used.clone()
+        self.ledger.used.clone()
     }
 
     pub(super) fn peak(&self) -> u64 {
-        self.peak.load(Ordering::Relaxed)
+        self.ledger.peak.load(Ordering::Relaxed)
     }
 
     pub(super) fn record_copy(&self, bytes: u64) {
@@ -296,6 +322,13 @@ impl MemoryPool {
         spill_batches_with(path, self.spill_key.clone())
     }
 
+    /// Opens this pool's spill files without borrowing the pool.
+    pub(super) fn spill_reader(&self) -> SpillReader {
+        SpillReader {
+            key: self.spill_key.clone(),
+        }
+    }
+
     pub(super) fn spill_path(&self) -> Result<PathBuf> {
         let dir = self
             .spill_dir
@@ -303,13 +336,6 @@ impl MemoryPool {
             .ok_or_else(|| Error::Memory("spill requested without a spill directory".into()))?;
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
         Ok(dir.join(format!("spill-{n}.arrow")))
-    }
-
-    fn release(&self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        self.used.fetch_sub(bytes, Ordering::SeqCst);
     }
 }
 
@@ -329,7 +355,54 @@ pub(super) struct Reservation<'a> {
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        self.pool.release(self.bytes);
+        self.pool.ledger.release(self.bytes);
+    }
+}
+
+/// Detached handle on a pool's ledger (see [`MemoryPool::reserver`]).
+pub(super) struct Reserver {
+    ledger: Arc<Ledger>,
+}
+
+impl Reserver {
+    pub(super) fn try_reserve(&self, bytes: u64) -> Result<OwnedReservation> {
+        self.ledger.add(bytes)?;
+        Ok(OwnedReservation {
+            ledger: self.ledger.clone(),
+            bytes,
+        })
+    }
+}
+
+/// Live reservation that owns its share of the pool's ledger. Dropping it
+/// returns the bytes, even after the pool itself is gone.
+pub(super) struct OwnedReservation {
+    ledger: Arc<Ledger>,
+    bytes: u64,
+}
+
+impl Drop for OwnedReservation {
+    fn drop(&mut self) {
+        self.ledger.release(self.bytes);
+    }
+}
+
+/// Spill file opener detached from the pool (see [`MemoryPool::spill_reader`]).
+pub(super) struct SpillReader {
+    key: Option<Arc<SpillKey>>,
+}
+
+impl SpillReader {
+    /// Batches of the spill file at `path`, one at a time. A missing file is an
+    /// error, never an empty run.
+    pub(super) fn open(&self, path: &Path) -> Result<SpillIter> {
+        if !path.exists() {
+            return Err(Error::Io(format!(
+                "spill run {} is missing",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )));
+        }
+        spill_batches_with(path, self.key.clone())
     }
 }
 
