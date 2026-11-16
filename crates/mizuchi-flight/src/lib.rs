@@ -1,8 +1,11 @@
 //! Arrow Flight workers: heartbeat, task retry, shuffle fetch, and fencing.
 //!
 //! TCP is opened only when the embedder sets `allow_network`. Shuffle
-//! partitions are served as Flight `DoGet` streams. A missed heartbeat
-//! marks the worker dead; the coordinator retries the task on a live peer.
+//! partitions are served as Flight `DoGet` streams. A worker that cannot be
+//! reached is marked dead and the coordinator retries the task on a live
+//! peer; a worker that answers with a refusal (a SQL error, say) stays live
+//! and the error goes back to the caller. A later successful heartbeat
+//! revives a dead worker.
 //! When Flight fetch fails and a spill directory is set, the reader falls
 //! back to the local spill file.
 //!
@@ -141,12 +144,22 @@ pub fn serve_worker(
             "Flight worker requires SessionConfig.allow_network".into(),
         ));
     }
+    serve_until(bind, spill_dir, lease_dir, std::future::pending())
+}
+
+/// Serves a worker on `bind` until `shutdown` completes.
+fn serve_until(
+    bind: SocketAddr,
+    spill_dir: Option<PathBuf>,
+    lease_dir: Option<PathBuf>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()> {
     let worker = FlightWorker::new(spill_dir, lease_dir)?;
     let rt = tokio::runtime::Runtime::new().map_err(|e| Error::Io(e.to_string()))?;
     rt.block_on(async move {
         Server::builder()
             .add_service(FlightServiceServer::new(worker))
-            .serve(bind)
+            .serve_with_shutdown(bind, shutdown)
             .await
             .map_err(|e| Error::Io(e.to_string()))
     })
@@ -197,6 +210,35 @@ fn encode_batches(batches: &[Batch]) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// A table for `register`: its schema, then its batches. With no batches it
+/// is a schema-only stream, so an empty table still registers.
+fn encode_table(schema: &SchemaRef, batches: &[Batch]) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut w =
+        StreamWriter::try_new(&mut buf, schema.as_ref()).map_err(|e| Error::Io(e.to_string()))?;
+    for b in batches {
+        w.write(b.as_arrow())
+            .map_err(|e| Error::Io(e.to_string()))?;
+    }
+    w.finish().map_err(|e| Error::Io(e.to_string()))?;
+    drop(w);
+    Ok(buf)
+}
+
+/// Schema and batches of an [`encode_table`] payload; `None` for an empty one.
+fn decode_table(bytes: &[u8]) -> Result<Option<(SchemaRef, Vec<Batch>)>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let r = StreamReader::try_new(std::io::Cursor::new(bytes), None)
+        .map_err(|e| Error::Io(e.to_string()))?;
+    let schema = r.schema();
+    let batches = r
+        .map(|b| Batch::from_arrow(b.map_err(|e| Error::Io(e.to_string()))?))
+        .collect::<Result<_>>()?;
+    Ok(Some((schema, batches)))
+}
+
 fn decode_batches(bytes: &[u8]) -> Result<Vec<Batch>> {
     if bytes.is_empty() {
         return Ok(Vec::new());
@@ -230,6 +272,12 @@ fn fencing_token(
 
 fn fenced(error: Error) -> Status {
     Status::failed_precondition(error.to_string())
+}
+
+/// An engine error for this request. The worker is fine, so the coordinator
+/// returns it to the caller instead of retrying on a peer.
+fn refused(error: Error) -> Status {
+    Status::invalid_argument(error.to_string())
 }
 
 /// The generation a shuffle partition name belongs to; 0 when unfenced.
@@ -398,19 +446,15 @@ fn register_table(
     token: Option<u64>,
 ) -> std::result::Result<Vec<u8>, Status> {
     let (name, rest) = split_name(body)?;
-    let batches = decode_batches(rest).map_err(|e| Status::internal(e.to_string()))?;
-    if batches.is_empty() {
-        return Err(Status::invalid_argument("empty table"));
-    }
-    let schema = batches[0].schema();
+    let (schema, batches) = decode_table(rest)
+        .map_err(|e| Status::invalid_argument(e.to_string()))?
+        .ok_or_else(|| Status::invalid_argument("table payload without a schema"))?;
     // The table lands in this generation's own session, and only while the
     // generation is current; a late one is invisible to its successor.
     state
         .with_session(token, |session| {
             state.fence.publish(token, || {
-                session
-                    .register(&name, schema, batches)
-                    .map_err(|e| Status::internal(e.to_string()))
+                session.register(&name, schema, batches).map_err(refused)
             })
         })?
         .map_err(fenced)??;
@@ -438,7 +482,7 @@ fn execute_sql(
     // Fenced first: a superseded generation's query reports the fence, not
     // whatever went wrong after its session was retired.
     state.fence.still_current(token).map_err(fenced)?;
-    let out = out.map_err(|e| Status::internal(e.to_string()))?;
+    let out = out.map_err(refused)?;
     encode_batches(&out).map_err(|e| Status::internal(e.to_string()))
 }
 
@@ -487,9 +531,9 @@ fn fetch_remote(
     let batches = std::thread::spawn(move || fetch_shuffle(&owner, &key, token))
         .join()
         .map_err(|_| Status::internal("shuffle fetch thread"))?
-        .map_err(|e| match e {
+        .map_err(|e| match Error::from(e) {
             // The owner's fence refusal reaches the coordinator as such.
-            Error::Fenced(_) => fenced(e),
+            e @ Error::Fenced(_) => fenced(e),
             e => Status::internal(e.to_string()),
         })?;
     state.fence.still_current(token).map_err(fenced)?;
@@ -604,14 +648,12 @@ impl RemoteCluster {
         self.peers.iter().map(|p| p.addr.clone()).collect()
     }
 
-    /// Ping every worker and mark failures dead.
+    /// Ping every worker, dead ones included. An answer marks the worker
+    /// live again; no answer marks a worker seen before dead.
     pub fn heartbeat(&self) -> usize {
         for peer in &self.peers {
-            if is_dead(peer) {
-                continue;
-            }
             match action(&peer.addr, "heartbeat", &[], None) {
-                Ok(_) => touch(peer),
+                Ok(_) => revive(peer),
                 Err(_) => mark_dead_if_seen(peer),
             }
         }
@@ -627,9 +669,10 @@ impl RemoteCluster {
     }
 
     /// Broadcast a table to every live worker.
+    /// A refusal (a bad table, a fence) is returned at once; an unreachable
+    /// worker is marked dead and skipped.
     pub fn register(&self, name: &str, schema: SchemaRef, batches: Vec<Batch>) -> Result<()> {
-        let _ = schema;
-        let payload = prefix_name(name, &encode_batches(&batches)?);
+        let payload = prefix_name(name, &encode_table(&schema, &batches)?);
         let mut last = None;
         for peer in &self.peers {
             if is_dead(peer) {
@@ -637,8 +680,8 @@ impl RemoteCluster {
             }
             match action(&peer.addr, "register", &payload, self.token()?) {
                 Ok(_) => touch(peer),
-                Err(e @ Error::Fenced(_)) => return Err(e),
-                Err(e) => {
+                Err(CallError::Refused(e)) => return Err(e),
+                Err(CallError::Transport(e)) => {
                     mark_dead(peer);
                     last = Some(e);
                 }
@@ -651,7 +694,8 @@ impl RemoteCluster {
         Ok(())
     }
 
-    /// Run `sql` on a live worker. Retries on a peer after a failure.
+    /// Run `sql` on a live worker. Retries on a peer when a worker cannot be
+    /// reached; a worker's refusal (a SQL or plan error) is returned as is.
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<Batch>> {
         self.execute_kind("execute", sql)
     }
@@ -673,9 +717,9 @@ impl RemoteCluster {
                     self.token()?;
                     return decode_batches(&body);
                 }
-                // A fenced coordinator stops; retrying on a peer would not help.
-                Err(e @ Error::Fenced(_)) => return Err(e),
-                Err(e) => {
+                // A refusal, the fence included, would repeat on every peer.
+                Err(CallError::Refused(e)) => return Err(e),
+                Err(CallError::Transport(e)) => {
                     mark_dead(&peer);
                     last = e;
                 }
@@ -755,7 +799,7 @@ impl RemoteCluster {
                 touch(reader);
                 decode_batches(&body)
             }
-            Err(e @ Error::Fenced(_)) => Err(e),
+            Err(CallError::Refused(e @ Error::Fenced(_))) => Err(e),
             Err(_) => {
                 // The fallback reads shared storage directly, so it re-checks
                 // leadership first and reads only this generation's file.
@@ -765,7 +809,7 @@ impl RemoteCluster {
                         &dir.join(format!("{}.arrow", generation_key(key, token))),
                         empty_schema(),
                     ),
-                    None => fetch_shuffle(&owner.addr, key, token),
+                    None => fetch_shuffle(&owner.addr, key, token).map_err(Error::from),
                 }
             }
         };
@@ -806,6 +850,13 @@ fn mark_dead(peer: &Peer) {
     }
 }
 
+fn revive(peer: &Peer) {
+    touch(peer);
+    if let Ok(mut d) = peer.dead.lock() {
+        *d = false;
+    }
+}
+
 fn mark_dead_if_seen(peer: &Peer) {
     let seen = *peer.seen.lock().unwrap_or_else(|e| e.into_inner());
     if seen {
@@ -817,10 +868,30 @@ fn rt() -> Result<tokio::runtime::Runtime> {
     tokio::runtime::Runtime::new().map_err(|e| Error::Io(e.to_string()))
 }
 
-fn action(addr: &str, kind: &str, body: &[u8], token: Option<u64>) -> Result<Vec<u8>> {
-    let rt = rt()?;
+/// Why a call to a worker failed.
+#[derive(Debug)]
+enum CallError {
+    /// No answer: connect failure, timeout, or a dropped connection. The
+    /// worker may be gone.
+    Transport(Error),
+    /// The worker answered and refused the request. It is live.
+    Refused(Error),
+}
+
+impl From<CallError> for Error {
+    fn from(error: CallError) -> Self {
+        match error {
+            CallError::Transport(e) | CallError::Refused(e) => e,
+        }
+    }
+}
+
+type CallResult<T> = std::result::Result<T, CallError>;
+
+fn action(addr: &str, kind: &str, body: &[u8], token: Option<u64>) -> CallResult<Vec<u8>> {
+    let rt = rt().map_err(CallError::Transport)?;
     rt.block_on(async {
-        let mut client = connect(addr, token).await?;
+        let mut client = connect(addr, token).await.map_err(CallError::Transport)?;
         let mut stream = client
             .do_action(Action {
                 r#type: kind.into(),
@@ -832,15 +903,15 @@ fn action(addr: &str, kind: &str, body: &[u8], token: Option<u64>) -> Result<Vec
             .try_next()
             .await
             .map_err(flight_error)?
-            .ok_or_else(|| Error::Io("empty action result".into()))?;
+            .ok_or_else(|| CallError::Transport(Error::Io("empty action result".into())))?;
         Ok(msg.to_vec())
     })
 }
 
-fn fetch_shuffle(owner: &str, key: &str, token: Option<u64>) -> Result<Vec<Batch>> {
-    let rt = rt()?;
+fn fetch_shuffle(owner: &str, key: &str, token: Option<u64>) -> CallResult<Vec<Batch>> {
+    let rt = rt().map_err(CallError::Transport)?;
     rt.block_on(async {
-        let mut client = connect(owner, token).await?;
+        let mut client = connect(owner, token).await.map_err(CallError::Transport)?;
         let stream = client
             .do_get(Ticket {
                 ticket: key.as_bytes().to_vec().into(),
@@ -848,21 +919,59 @@ fn fetch_shuffle(owner: &str, key: &str, token: Option<u64>) -> Result<Vec<Batch
             .await
             .map_err(flight_error)?;
         let rbs: Vec<RecordBatch> = stream.try_collect().await.map_err(flight_error)?;
-        rbs.into_iter().map(Batch::from_arrow).collect()
+        rbs.into_iter()
+            .map(Batch::from_arrow)
+            .collect::<Result<_>>()
+            .map_err(CallError::Refused)
     })
 }
 
-/// A worker's fence refusal stays typed; everything else is transport.
-fn flight_error(error: arrow_flight::error::FlightError) -> Error {
-    match &error {
-        arrow_flight::error::FlightError::Tonic(status)
-            if status.code() == tonic::Code::FailedPrecondition
-                && status.message().starts_with("fenced: ") =>
-        {
-            Error::Fenced(status.message().trim_start_matches("fenced: ").to_string())
-        }
-        _ => Error::Io(error.to_string()),
+/// Sorts a failed call into a worker's refusal or a transport failure. The
+/// codes a worker sends for a request it rejects are refusals; anything else
+/// (unavailable, deadline, a dropped stream, an internal fault) is transport.
+fn flight_error(error: arrow_flight::error::FlightError) -> CallError {
+    use tonic::Code;
+    let arrow_flight::error::FlightError::Tonic(status) = &error else {
+        return CallError::Transport(Error::Io(error.to_string()));
+    };
+    let message = status.message();
+    match status.code() {
+        Code::FailedPrecondition if message.starts_with("fenced: ") => CallError::Refused(
+            Error::Fenced(message.trim_start_matches("fenced: ").to_string()),
+        ),
+        Code::InvalidArgument
+        | Code::NotFound
+        | Code::FailedPrecondition
+        | Code::AlreadyExists
+        | Code::OutOfRange
+        | Code::Unimplemented
+        | Code::PermissionDenied => CallError::Refused(remote_error(message)),
+        _ => CallError::Transport(Error::Io(error.to_string())),
     }
+}
+
+/// The engine error a worker refused with, from its display text; a message
+/// with no known prefix is reported as I/O from the worker.
+fn remote_error(message: &str) -> Error {
+    if message == "cancelled" {
+        return Error::Cancelled;
+    }
+    type Kind = fn(String) -> Error;
+    let kinds: [(&str, Kind); 7] = [
+        ("sql parse: ", Error::Parse),
+        ("plan: ", Error::Plan),
+        ("expression eval: ", Error::Eval),
+        ("memory: ", Error::Memory),
+        ("invalid batch: ", Error::InvalidBatch),
+        ("unsupported Arrow type: ", Error::UnsupportedType),
+        ("io: ", Error::Io),
+    ];
+    for (prefix, kind) in kinds {
+        if let Some(rest) = message.strip_prefix(prefix) {
+            return kind(rest.to_string());
+        }
+    }
+    Error::Io(format!("worker refused the request: {message}"))
 }
 
 async fn connect(addr: &str, token: Option<u64>) -> Result<FlightClient> {
@@ -896,6 +1005,101 @@ mod tests {
         assert_eq!(key_generation("q1-p0.g7"), 7);
         assert_eq!(key_generation("q1.g2-p0.g12"), 12);
         assert_eq!(key_generation("q1-p0"), 0);
+    }
+
+    fn numbers(n: i64) -> (SchemaRef, Vec<Batch>) {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = Batch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow::array::Int64Array::from_iter_values(0..n))],
+        )
+        .unwrap();
+        (schema, vec![batch])
+    }
+
+    fn rows(out: &[Batch]) -> usize {
+        out.iter().map(Batch::num_rows).sum()
+    }
+
+    fn two_workers() -> RemoteCluster {
+        let (a, _) = spawn_worker(true, None, None).unwrap();
+        let (b, _) = spawn_worker(true, None, None).unwrap();
+        let cluster =
+            RemoteCluster::connect(vec![a.to_string(), b.to_string()], true, None).unwrap();
+        assert_eq!(cluster.heartbeat(), 2);
+        cluster
+    }
+
+    #[test]
+    fn a_sql_error_goes_to_the_caller_and_leaves_workers_live() {
+        let cluster = two_workers();
+        let (schema, batches) = numbers(4);
+        cluster.register("t", schema, batches).unwrap();
+        let err = cluster.execute_sql("SELECT missing FROM t").unwrap_err();
+        assert!(matches!(err, Error::Plan(_)), "{err:?}");
+        let err = cluster.register("", numbers(1).0, Vec::new()).unwrap_err();
+        assert!(!matches!(err, Error::Fenced(_)), "{err:?}");
+        assert_eq!(cluster.live_workers(), 2);
+        let out = cluster.execute_sql("SELECT a FROM t WHERE a > 1").unwrap();
+        assert_eq!(rows(&out), 2);
+        assert_eq!(cluster.live_workers(), 2);
+    }
+
+    #[test]
+    fn an_empty_table_registers_and_leaves_workers_live() {
+        let cluster = two_workers();
+        let (schema, _) = numbers(0);
+        cluster.register("empty", schema, Vec::new()).unwrap();
+        assert_eq!(cluster.live_workers(), 2);
+        let out = cluster.execute_sql("SELECT a FROM empty").unwrap();
+        assert_eq!(rows(&out), 0);
+        assert_eq!(out[0].schema().field(0).name(), "a");
+    }
+
+    /// Serves a worker on `addr` on a thread until the returned sender fires.
+    fn stoppable_worker(
+        addr: SocketAddr,
+    ) -> (tokio::sync::oneshot::Sender<()>, JoinHandle<Result<()>>) {
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            serve_until(addr, None, None, async {
+                let _ = stopped.await;
+            })
+        });
+        let start = Instant::now();
+        while std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(20)).is_err() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "worker did not bind"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        (stop, handle)
+    }
+
+    #[test]
+    fn a_heartbeat_revives_a_restarted_worker() {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (stop, handle) = stoppable_worker(addr);
+        let (other, _) = spawn_worker(true, None, None).unwrap();
+        let cluster =
+            RemoteCluster::connect(vec![addr.to_string(), other.to_string()], true, None).unwrap();
+        assert_eq!(cluster.heartbeat(), 2);
+        stop.send(()).unwrap();
+        handle.join().unwrap().unwrap();
+        assert_eq!(cluster.heartbeat(), 1, "a stopped worker is marked dead");
+        let (stop, handle) = stoppable_worker(addr);
+        assert_eq!(cluster.heartbeat(), 2, "the restarted worker is live again");
+        let (schema, batches) = numbers(3);
+        cluster.register("t", schema, batches).unwrap();
+        assert_eq!(rows(&cluster.execute_sql("SELECT a FROM t").unwrap()), 3);
+        stop.send(()).unwrap();
+        handle.join().unwrap().unwrap();
     }
 
     #[test]
