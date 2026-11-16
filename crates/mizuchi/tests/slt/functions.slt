@@ -86,3 +86,69 @@ query I
 SELECT abs(a) FROM t WHERE a IS NULL
 ----
 NULL
+
+# CASE and COALESCE evaluate a branch only on the rows that select it, so a
+# guarded error does not fire.
+statement ok
+CREATE TABLE g (x INTEGER)
+
+statement ok
+INSERT INTO g VALUES (0), (2), (NULL), (4)
+
+query II
+SELECT x, CASE WHEN x = 0 THEN 0 ELSE 8 / x END FROM g ORDER BY x NULLS LAST
+----
+0
+0
+2
+4
+4
+2
+NULL
+NULL
+
+query I
+SELECT coalesce(x, 1 / 0) FROM g WHERE x IS NOT NULL ORDER BY 1
+----
+0
+2
+4
+
+query II
+SELECT x, CASE WHEN x IS NULL THEN -1 ELSE CASE WHEN x = 0 THEN 0 ELSE 8 / x END END FROM g ORDER BY x NULLS LAST
+----
+0
+0
+2
+4
+4
+2
+NULL
+-1
+
+query II
+SELECT x, CASE x WHEN 0 THEN 100 WHEN 2 THEN 8 / x END FROM g ORDER BY x NULLS LAST
+----
+0
+100
+2
+4
+4
+NULL
+NULL
+NULL
+
+query II
+SELECT x, coalesce(NULL, x, 9) FROM g ORDER BY x NULLS LAST
+----
+0
+0
+2
+2
+4
+4
+NULL
+9
+
+statement error
+SELECT CASE WHEN x = 2 THEN 1 / 0 ELSE 1 END FROM g
