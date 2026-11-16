@@ -4845,6 +4845,33 @@ mod tests {
         assert_eq!(col_i64(&out, "n"), vec![Some(2)]);
     }
 
+    /// `INSERT *` names the target column it cannot resolve in the source,
+    /// instead of inserting NULL for it.
+    #[test]
+    fn merge_insert_star_rejects_unresolved_target_columns() {
+        let target = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let source = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let mut s = Session::new();
+        s.register("t", target, Vec::new()).unwrap();
+        s.register("s", source, Vec::new()).unwrap();
+        let missing = s
+            .merge_sql("MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT *")
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("column not found: v"), "{missing}");
+        let ambiguous = s
+            .merge_sql(
+                "MERGE INTO t USING (SELECT a.id, b.id AS v, b.id FROM s a, s b) src \
+                 ON t.id = 0 WHEN NOT MATCHED THEN INSERT *",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(ambiguous.contains("ambiguous column: id"), "{ambiguous}");
+    }
+
     #[test]
     fn extract_from_date32_column() {
         let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));

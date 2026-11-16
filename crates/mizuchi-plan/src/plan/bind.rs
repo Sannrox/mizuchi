@@ -524,9 +524,7 @@ fn bind_merge_insert(
                 return Err(Error::Plan("INSERT * does not take a column list".into()));
             }
             for (idx, field) in target.schema.fields().iter().enumerate() {
-                if let Ok(expr) = resolve_name(None, field.name(), source) {
-                    values[idx] = Some(expr);
-                }
+                values[idx] = Some(resolve_name(None, field.name(), source)?);
             }
         }
         MergeInsertKind::Values(vals) => {
