@@ -287,40 +287,39 @@ fn split_jwt(token: &str) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     ))
 }
 
+/// Decodes canonical unpadded base64url (RFC 7515 section 2): no `=`, no `+`
+/// or `/`, no length of 1 modulo 4, and zero unused trailing bits, so every
+/// byte string has exactly one accepted encoding.
 fn b64url_decode(input: &str) -> std::result::Result<Vec<u8>, &'static str> {
-    let mut s = input.replace('-', "+").replace('_', "/");
-    while !s.len().is_multiple_of(4) {
-        s.push('=');
+    let bytes = input.as_bytes();
+    if bytes.len() % 4 == 1 {
+        return Err("invalid base64url length");
     }
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i + 4 <= bytes.len() {
-        let a = b64_val(bytes[i])?;
-        let b = b64_val(bytes[i + 1])?;
-        let c = b64_val(bytes[i + 2])?;
-        let d = b64_val(bytes[i + 3])?;
-        out.push((a << 2) | (b >> 4));
-        if bytes[i + 2] != b'=' {
-            out.push((b << 4) | (c >> 2));
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let mut acc = 0u32;
+        for b in chunk {
+            acc = (acc << 6) | u32::from(b64url_val(*b)?);
         }
-        if bytes[i + 3] != b'=' {
-            out.push((c << 6) | d);
+        acc <<= 6 * (4 - chunk.len());
+        let decoded = acc.to_be_bytes();
+        let n = chunk.len() * 6 / 8;
+        out.extend_from_slice(&decoded[1..=n]);
+        if n < 3 && decoded[1 + n] != 0 {
+            return Err("non-canonical base64url trailing bits");
         }
-        i += 4;
     }
     Ok(out)
 }
 
-fn b64_val(b: u8) -> std::result::Result<u8, &'static str> {
+fn b64url_val(b: u8) -> std::result::Result<u8, &'static str> {
     match b {
         b'A'..=b'Z' => Ok(b - b'A'),
         b'a'..=b'z' => Ok(b - b'a' + 26),
         b'0'..=b'9' => Ok(b - b'0' + 52),
-        b'+' => Ok(62),
-        b'/' => Ok(63),
-        b'=' => Ok(0),
-        _ => Err("invalid base64"),
+        b'-' => Ok(62),
+        b'_' => Ok(63),
+        _ => Err("invalid base64url"),
     }
 }
 
@@ -426,6 +425,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v.verify(&token).unwrap().actor, "job");
+    }
+
+    #[test]
+    fn decoder_accepts_only_canonical_unpadded_base64url() {
+        assert_eq!(b64url_decode("_-8").unwrap(), [0xff, 0xef]);
+        assert_eq!(b64url_decode("").unwrap(), Vec::<u8>::new());
+        for bad in ["_-8=", "/+8", "AAAA=", "A", "AAAAA", "_-9", "AQ=="] {
+            assert!(b64url_decode(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn re_encoded_signature_is_refused() {
+        let v = JwtVerifier::hs256(b"secret").unwrap();
+        let token = mint_hs256(b"secret", &claims()).unwrap();
+        assert!(v.verify(&token).is_ok());
+        // A 32-byte signature leaves two unused bits in its last character.
+        let last = token.chars().last().unwrap();
+        let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let index = alphabet.find(last).unwrap();
+        let altered = alphabet.as_bytes()[index ^ 1] as char;
+        let trailing = format!("{}{altered}", &token[..token.len() - 1]);
+        let padded = format!("{token}=");
+        for forged in [trailing, padded] {
+            assert!(v.verify(&forged).is_err(), "{forged}");
+        }
     }
 
     #[test]
