@@ -112,12 +112,25 @@ fn read_parquet_store_counted(
 
 /// Write `batches` as Parquet objects under `prefix`. Staging objects are
 /// published by rename; a failed job deletes staging and leaves committed
-/// objects unchanged.
+/// objects unchanged. An overwrite that a crashed writer left half published
+/// is rolled back before the next write (see [`recover_store`]).
 pub fn write_parquet_store(
     store: &dyn ObjectStore,
     prefix: &str,
     batches: &[Batch],
     opts: ParquetWriteOptions<'_>,
+) -> Result<()> {
+    write_store_inner(store, prefix, batches, opts, None)
+}
+
+/// [`write_parquet_store`] with a test hook that fails the publish after
+/// `fail_move_after` staged objects.
+fn write_store_inner(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    batches: &[Batch],
+    opts: ParquetWriteOptions<'_>,
+    fail_move_after: Option<usize>,
 ) -> Result<()> {
     crate::write::refuse_encrypted_hive_paths(&opts)?;
     if let Some(batch) = batches.first() {
@@ -134,6 +147,7 @@ pub fn write_parquet_store(
     }
 
     let root = object_path(prefix)?;
+    recover_store(store, &root)?;
     let id = JOB.fetch_add(1, Ordering::Relaxed);
     let staging_prefix = join_path(&root, &format!(".mizuchi-staging-{id}"))?;
 
@@ -145,7 +159,21 @@ pub fn write_parquet_store(
             opts.partition_by,
             opts.encryption,
         )?;
-        publish_store(store, &root, &staging_prefix, &staged, opts.mode, id)?;
+        let published = publish_store(
+            store,
+            &root,
+            &staging_prefix,
+            &staged,
+            opts.mode,
+            id,
+            fail_move_after,
+        );
+        if let Err(e) = published {
+            return Err(match recover_store(store, &root) {
+                Ok(()) => e,
+                Err(r) => Error::Io(format!("{e}; rollback failed: {r}")),
+            });
+        }
         let success = join_path(&root, "_SUCCESS")?;
         block_on(store.put(&success, PutPayload::from(Vec::<u8>::new()))).map_err(store_err)?;
         Ok(())
@@ -199,8 +227,9 @@ fn publish_store(
     staged: &[ObjectPath],
     mode: WriteMode,
     id: u64,
+    fail_move_after: Option<usize>,
 ) -> Result<()> {
-    let old_prefix = join_path(root, &format!(".mizuchi-old-{id}"))?;
+    let old_prefix = join_path(root, &format!("{OLD_PREFIX}{id}"))?;
     if mode == WriteMode::Overwrite {
         // Relocate committed objects first so a failed publish still has the
         // previous dataset under the hidden prefix instead of deleting it.
@@ -209,8 +238,12 @@ fn publish_store(
             let dest = join_path(&old_prefix, &rel)?;
             block_on(store.rename(&loc, &dest)).map_err(store_err)?;
         }
+        put_marker(store, &old_prefix, MOVED_MARKER)?;
     }
-    for src in staged {
+    for (n, src) in staged.iter().enumerate() {
+        if fail_move_after == Some(n) {
+            return Err(Error::Io("injected publish failure".into()));
+        }
         let rel = src
             .as_ref()
             .strip_prefix(staging.as_ref())
@@ -238,7 +271,69 @@ fn publish_store(
         block_on(store.rename(src, &dest)).map_err(store_err)?;
     }
     if mode == WriteMode::Overwrite {
-        let _ = delete_prefix(store, &old_prefix);
+        put_marker(store, &old_prefix, DONE_MARKER)?;
+        let _ = recover_store(store, root);
+    }
+    Ok(())
+}
+
+/// Rollback prefix of an overwrite, `.mizuchi-old-{id}/`. Object stores have
+/// no atomic directory rename, so marker objects inside record the phase:
+/// none while old objects move out, [`MOVED_MARKER`] once every old object
+/// has moved (visible objects are then a partial new dataset), and
+/// [`DONE_MARKER`] once the new objects are complete.
+const OLD_PREFIX: &str = ".mizuchi-old-";
+const MOVED_MARKER: &str = "_MOVED";
+const DONE_MARKER: &str = "_DONE";
+
+fn put_marker(store: &dyn ObjectStore, prefix: &ObjectPath, marker: &str) -> Result<()> {
+    let loc = join_path(prefix, marker)?;
+    block_on(store.put(&loc, PutPayload::from(Vec::<u8>::new()))).map_err(store_err)?;
+    Ok(())
+}
+
+/// Finishes or rolls back every overwrite left under `root` by a failed or
+/// crashed writer. Assumes one writer per dataset: a concurrent overwrite in
+/// progress would be rolled back. Markers go last, so a crash inside recovery
+/// leaves a state the next call still reads correctly.
+fn recover_store(store: &dyn ObjectStore, root: &ObjectPath) -> Result<()> {
+    let metas: Vec<object_store::ObjectMeta> =
+        block_on(store.list(Some(root)).try_collect()).map_err(store_err)?;
+    let mut pending: BTreeMap<String, Vec<ObjectPath>> = BTreeMap::new();
+    for m in metas {
+        let rel = relative_to(&m.location, root.as_ref());
+        if let Some((first, _)) = rel.split_once('/')
+            && first.starts_with(OLD_PREFIX)
+        {
+            pending
+                .entry(first.to_string())
+                .or_default()
+                .push(m.location);
+        }
+    }
+    for (name, objects) in pending {
+        let prefix = join_path(root, &name)?;
+        let done = join_path(&prefix, DONE_MARKER)?;
+        let moved = join_path(&prefix, MOVED_MARKER)?;
+        let delete = |loc: &ObjectPath| block_on(store.delete(loc)).map_err(store_err);
+        if objects.contains(&done) {
+            for loc in objects.iter().filter(|loc| **loc != done) {
+                delete(loc)?;
+            }
+            delete(&done)?;
+            continue;
+        }
+        if objects.contains(&moved) {
+            // Visible objects are a partial new dataset.
+            for loc in list_committed(store, root)? {
+                delete(&loc)?;
+            }
+            delete(&moved)?;
+        }
+        for loc in objects.iter().filter(|loc| **loc != moved) {
+            let rel = relative_to(loc, prefix.as_ref());
+            block_on(store.rename(loc, &join_path(root, &rel)?)).map_err(store_err)?;
+        }
     }
     Ok(())
 }
@@ -530,6 +625,70 @@ mod tests {
         let (out, _scan, fetched) = read_parquet_store_counted(&store, "ds", opts).unwrap();
         assert_eq!(ids(&out), vec![1, 2]);
         assert_eq!(fetched, 1, "year=2021 object must not be fetched");
+    }
+
+    fn objects(store: &InMemory) -> Vec<String> {
+        let metas: Vec<object_store::ObjectMeta> =
+            block_on(store.list(None).try_collect()).unwrap();
+        metas.into_iter().map(|m| m.location.to_string()).collect()
+    }
+
+    /// #240: a failed move of staged objects must not lose the previous
+    /// dataset under the hidden rollback prefix.
+    #[test]
+    fn failed_store_overwrite_keeps_previous_rows() {
+        let store = InMemory::new();
+        write_year(&store, "ds", &[sample()], WriteMode::Overwrite);
+        let cols = [String::from("year")];
+        let err = write_store_inner(
+            &store,
+            "ds",
+            &[sample()],
+            ParquetWriteOptions {
+                partition_by: &cols,
+                mode: WriteMode::Overwrite,
+                encryption: None,
+            },
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("injected publish failure"),
+            "{err}"
+        );
+        let out = read_parquet_store(&store, "ds", ParquetReadOptions::default()).unwrap();
+        assert_eq!(ids(&out), vec![1, 2, 3]);
+        assert!(
+            objects(&store).iter().all(|o| !o.contains(".mizuchi-")),
+            "{:?}",
+            objects(&store)
+        );
+    }
+
+    /// #240: a crash after old objects moved out and part of the new dataset
+    /// landed is rolled back by the next write.
+    #[test]
+    fn next_store_write_recovers_a_crashed_overwrite() {
+        let store = InMemory::new();
+        write_year(&store, "ds", &[sample()], WriteMode::Overwrite);
+        let root = object_path("ds").unwrap();
+        let old = join_path(&root, &format!("{OLD_PREFIX}9")).unwrap();
+        for loc in list_committed(&store, &root).unwrap() {
+            let rel = relative_to(&loc, root.as_ref());
+            block_on(store.rename(&loc, &join_path(&old, &rel).unwrap())).unwrap();
+        }
+        put_marker(&store, &old, MOVED_MARKER).unwrap();
+        let partial = join_path(&root, "year=2020/part-00000.parquet").unwrap();
+        block_on(store.put(&partial, PutPayload::from(b"partial".to_vec()))).unwrap();
+
+        write_year(&store, "ds", &[sample()], WriteMode::Append);
+        let out = read_parquet_store(&store, "ds", ParquetReadOptions::default()).unwrap();
+        assert_eq!(ids(&out), vec![1, 1, 2, 2, 3, 3]);
+        assert!(
+            objects(&store).iter().all(|o| !o.contains(".mizuchi-")),
+            "{:?}",
+            objects(&store)
+        );
     }
 
     #[test]
