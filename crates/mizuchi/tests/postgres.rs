@@ -35,7 +35,7 @@ fn optional_workflow_is_dispatch_only() {
 mod live {
     use std::sync::Arc;
 
-    use arrow::array::{Array, Int64Array};
+    use arrow::array::{Array, Int64Array, StringArray};
     use mizuchi::{
         BinaryOp, Expr, PostgresReadOptions, PostgresSource, Session, SessionConfig,
         postgres_scan_sql, read_postgres,
@@ -144,5 +144,44 @@ mod live {
             n += batch.num_rows() as u64;
         }
         assert_eq!(n, 3);
+    }
+
+    /// #242: selecting a JSON or JSONB column used to panic in the reader.
+    #[test]
+    #[ignore = "needs a PostgreSQL server; not default cargo test"]
+    fn postgres_reads_json_and_jsonb_as_text() {
+        let url = std::env::var("MIZUCHI_POSTGRES_URL").expect("MIZUCHI_POSTGRES_URL");
+        let mut client = Client::connect(&url, NoTls).expect("connect");
+        client
+            .batch_execute(
+                r#"DROP TABLE IF EXISTS mizuchi_json;
+             CREATE TABLE mizuchi_json (id BIGINT, j JSON, jb JSONB);
+             INSERT INTO mizuchi_json VALUES
+               (1, '{"a": 1}', '{"b": [1, 2]}'),
+               (2, NULL, NULL);"#,
+            )
+            .expect("seed");
+        let opts = PostgresReadOptions {
+            query: Some("SELECT j, jb FROM mizuchi_json ORDER BY id"),
+            ..PostgresReadOptions::default()
+        };
+        let batches = read_postgres(&source_from_url(&url), opts).unwrap();
+        let text = |col: usize| -> Vec<Option<String>> {
+            batches
+                .iter()
+                .flat_map(|b| {
+                    let arr = b
+                        .column(col)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .clone();
+                    (0..arr.len()).map(move |i| arr.is_valid(i).then(|| arr.value(i).to_string()))
+                })
+                .collect()
+        };
+        // JSON keeps the text as written; JSONB comes back normalized.
+        assert_eq!(text(0), vec![Some(r#"{"a": 1}"#.to_string()), None]);
+        assert_eq!(text(1), vec![Some(r#"{"b": [1, 2]}"#.to_string()), None]);
     }
 }

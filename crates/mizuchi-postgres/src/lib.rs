@@ -299,32 +299,32 @@ fn run_query(source: &PostgresSource, sql: &str, policy: BatchPolicy) -> Result<
         for (i, kind) in kinds.iter().enumerate() {
             match kind {
                 0 => {
-                    append_opt(&mut bools[b], row.get::<_, Option<bool>>(i));
+                    append_opt(&mut bools[b], cell::<bool>(row, i)?);
                     b += 1;
                 }
                 1 => {
-                    append_opt(&mut i16s[s16], row.get::<_, Option<i16>>(i));
+                    append_opt(&mut i16s[s16], cell::<i16>(row, i)?);
                     s16 += 1;
                 }
                 2 => {
-                    append_opt(&mut i32s[s32], row.get::<_, Option<i32>>(i));
+                    append_opt(&mut i32s[s32], cell::<i32>(row, i)?);
                     s32 += 1;
                 }
                 3 => {
-                    append_opt(&mut i64s[s64], row.get::<_, Option<i64>>(i));
+                    append_opt(&mut i64s[s64], cell::<i64>(row, i)?);
                     s64 += 1;
                 }
                 4 => {
-                    append_opt(&mut f32s[sf32], row.get::<_, Option<f32>>(i));
+                    append_opt(&mut f32s[sf32], cell::<f32>(row, i)?);
                     sf32 += 1;
                 }
                 5 => {
-                    append_opt(&mut f64s[sf64], row.get::<_, Option<f64>>(i));
+                    append_opt(&mut f64s[sf64], cell::<f64>(row, i)?);
                     sf64 += 1;
                 }
                 6 => {
-                    match row.get::<_, Option<String>>(i) {
-                        Some(v) => utf8s[su].append_value(v),
+                    match cell::<PgText>(row, i)? {
+                        Some(PgText(v)) => utf8s[su].append_value(v),
                         None => utf8s[su].append_null(),
                     }
                     su += 1;
@@ -397,6 +397,48 @@ where
     builder.extend(std::iter::once(value));
 }
 
+/// Reads column `i` of `row`. A value the client cannot convert to `T` is an
+/// error, never a panic.
+#[cfg(feature = "client")]
+fn cell<'a, T: postgres::types::FromSql<'a>>(
+    row: &'a postgres::Row,
+    i: usize,
+) -> Result<Option<T>> {
+    row.try_get::<_, Option<T>>(i).map_err(|e| {
+        let column = row.columns()[i].name();
+        Error::Io(format!("PostgreSQL column {column}: {e}"))
+    })
+}
+
+/// Text form of every column [`pg_arrow_type`] maps to `Utf8`; `accepts` is
+/// the one list both sides use. JSON arrives as text, JSONB as a version byte
+/// (1) followed by the JSON text.
+#[cfg(feature = "client")]
+struct PgText(String);
+
+#[cfg(feature = "client")]
+impl<'a> postgres::types::FromSql<'a> for PgText {
+    fn from_sql(
+        ty: &postgres::types::Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let text = match (ty, raw.split_first()) {
+            (&postgres::types::Type::JSONB, Some((1, rest))) => rest,
+            (&postgres::types::Type::JSONB, _) => return Err("unsupported JSONB version".into()),
+            _ => raw,
+        };
+        Ok(Self(std::str::from_utf8(text)?.to_owned()))
+    }
+
+    fn accepts(ty: &postgres::types::Type) -> bool {
+        use postgres::types::Type;
+        matches!(
+            *ty,
+            Type::TEXT | Type::VARCHAR | Type::NAME | Type::JSON | Type::JSONB
+        )
+    }
+}
+
 #[cfg(feature = "client")]
 fn pg_arrow_type(ty: &postgres::types::Type) -> Result<arrow::datatypes::DataType> {
     use arrow::datatypes::DataType;
@@ -408,7 +450,7 @@ fn pg_arrow_type(ty: &postgres::types::Type) -> Result<arrow::datatypes::DataTyp
         Type::INT8 => Ok(DataType::Int64),
         Type::FLOAT4 => Ok(DataType::Float32),
         Type::FLOAT8 => Ok(DataType::Float64),
-        Type::TEXT | Type::VARCHAR | Type::NAME | Type::JSON | Type::JSONB => Ok(DataType::Utf8),
+        _ if <PgText as postgres::types::FromSql>::accepts(ty) => Ok(DataType::Utf8),
         _ => Err(Error::UnsupportedType(format!(
             "PostgreSQL type {}",
             ty.name()
@@ -508,6 +550,18 @@ fn literal_sql(arr: &dyn arrow::array::Array) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "client")]
+    #[test]
+    fn jsonb_text_drops_the_version_byte() {
+        use postgres::types::{FromSql, Type};
+        let PgText(text) = PgText::from_sql(&Type::JSONB, b"\x01{\"a\": 1}").unwrap();
+        assert_eq!(text, r#"{"a": 1}"#);
+        assert!(PgText::from_sql(&Type::JSONB, b"\x02{}").is_err());
+        assert!(PgText::from_sql(&Type::JSONB, b"").is_err());
+        let PgText(text) = PgText::from_sql(&Type::JSON, b"[1]").unwrap();
+        assert_eq!(text, "[1]");
+    }
+
     use super::*;
     use arrow::array::Int64Array;
     use std::sync::Arc;
