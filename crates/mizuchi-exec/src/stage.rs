@@ -354,6 +354,16 @@ fn exchange(
     }
 }
 
+/// `plan` in one partition: as it is when it already has one, else behind a
+/// single-partition exchange.
+fn gathered(plan: PhysicalPlan, next_id: &mut usize) -> PhysicalPlan {
+    if plan.output_partitions() == 1 {
+        plan
+    } else {
+        exchange(plan, Vec::new(), 1, next_id)
+    }
+}
+
 fn ensure_distribution(plan: PhysicalPlan, n: usize, next_id: &mut usize) -> PhysicalPlan {
     match plan {
         PhysicalPlan::Join {
@@ -379,9 +389,12 @@ fn ensure_distribution(plan: PhysicalPlan, n: usize, next_id: &mut usize) -> Phy
                     .and_then(|pred| join::equi_key_pairs(pred, left.schema().fields().len()).ok())
                     .unwrap_or_default();
                 if keys.is_empty() {
+                    // Without equi keys any left row may pair with any right
+                    // row, so both sides meet in one partition; partitioned
+                    // inputs would only compare rows of the same partition.
                     PhysicalPlan::Join {
-                        left: Box::new(left),
-                        right: Box::new(right),
+                        left: Box::new(gathered(left, next_id)),
+                        right: Box::new(gathered(right, next_id)),
                         join_type,
                         on,
                         schema,
@@ -409,13 +422,8 @@ fn ensure_distribution(plan: PhysicalPlan, n: usize, next_id: &mut usize) -> Phy
                 // A global aggregate yields one row, so it runs over a single
                 // partition; over partitioned input it would emit one row per
                 // partition.
-                let input = if input.output_partitions() == 1 {
-                    input
-                } else {
-                    exchange(input, Vec::new(), 1, next_id)
-                };
                 PhysicalPlan::Aggregate {
-                    input: Box::new(input),
+                    input: Box::new(gathered(input, next_id)),
                     group,
                     aggs,
                     schema,
@@ -431,12 +439,7 @@ fn ensure_distribution(plan: PhysicalPlan, n: usize, next_id: &mut usize) -> Phy
             }
         }
         PhysicalPlan::Sort { input, order } => {
-            let input = ensure_distribution(*input, n, next_id);
-            let input = if input.output_partitions() == 1 {
-                input
-            } else {
-                exchange(input, Vec::new(), 1, next_id)
-            };
+            let input = gathered(ensure_distribution(*input, n, next_id), next_id);
             PhysicalPlan::Sort {
                 input: Box::new(input),
                 order,
@@ -451,11 +454,7 @@ fn ensure_distribution(plan: PhysicalPlan, n: usize, next_id: &mut usize) -> Phy
             schema,
         } => {
             let input = ensure_distribution(*input, n, next_id);
-            let input = if input.output_partitions() == 1 {
-                input
-            } else {
-                exchange(input, Vec::new(), 1, next_id)
-            };
+            let input = gathered(input, next_id);
             PhysicalPlan::Window {
                 input: Box::new(input),
                 partition,
@@ -467,11 +466,7 @@ fn ensure_distribution(plan: PhysicalPlan, n: usize, next_id: &mut usize) -> Phy
         }
         PhysicalPlan::Limit { input, skip, fetch } => {
             let input = ensure_distribution(*input, n, next_id);
-            let input = if input.output_partitions() == 1 {
-                input
-            } else {
-                exchange(input, Vec::new(), 1, next_id)
-            };
+            let input = gathered(input, next_id);
             PhysicalPlan::Limit {
                 input: Box::new(input),
                 skip,
@@ -498,14 +493,7 @@ fn ensure_distribution(plan: PhysicalPlan, n: usize, next_id: &mut usize) -> Phy
         } => PhysicalPlan::Union {
             inputs: inputs
                 .into_iter()
-                .map(|p| {
-                    let p = ensure_distribution(p, n, next_id);
-                    if p.output_partitions() == 1 {
-                        p
-                    } else {
-                        exchange(p, Vec::new(), 1, next_id)
-                    }
-                })
+                .map(|p| gathered(ensure_distribution(p, n, next_id), next_id))
                 .collect(),
             schema,
             all,
@@ -518,16 +506,8 @@ fn ensure_distribution(plan: PhysicalPlan, n: usize, next_id: &mut usize) -> Phy
         } => {
             let left = ensure_distribution(*left, n, next_id);
             let right = ensure_distribution(*right, n, next_id);
-            let left = if left.output_partitions() == 1 {
-                left
-            } else {
-                exchange(left, Vec::new(), 1, next_id)
-            };
-            let right = if right.output_partitions() == 1 {
-                right
-            } else {
-                exchange(right, Vec::new(), 1, next_id)
-            };
+            let left = gathered(left, next_id);
+            let right = gathered(right, next_id);
             PhysicalPlan::Intersect {
                 left: Box::new(left),
                 right: Box::new(right),
@@ -543,16 +523,8 @@ fn ensure_distribution(plan: PhysicalPlan, n: usize, next_id: &mut usize) -> Phy
         } => {
             let left = ensure_distribution(*left, n, next_id);
             let right = ensure_distribution(*right, n, next_id);
-            let left = if left.output_partitions() == 1 {
-                left
-            } else {
-                exchange(left, Vec::new(), 1, next_id)
-            };
-            let right = if right.output_partitions() == 1 {
-                right
-            } else {
-                exchange(right, Vec::new(), 1, next_id)
-            };
+            let left = gathered(left, next_id);
+            let right = gathered(right, next_id);
             PhysicalPlan::Except {
                 left: Box::new(left),
                 right: Box::new(right),
@@ -2333,6 +2305,58 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(cells.join("|"), want, "workers={workers} {query}");
+            }
+        }
+    }
+
+    #[test]
+    fn non_equi_join_over_partitioned_inputs_matches_one_worker() {
+        let _g = lock_stage_tests();
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = |values: std::ops::Range<i64>| {
+            Batch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(values.collect::<Vec<i64>>()))],
+            )
+            .unwrap()
+        };
+        // Both sides are equi-join outputs, so they arrive hash-partitioned.
+        let inputs = "WITH l AS (SELECT t.a FROM t JOIN u ON t.a = u.a), \
+                      r AS (SELECT v.a FROM v JOIN w ON v.a = w.a)";
+        let queries = [
+            format!("{inputs} SELECT l.a, r.a FROM l JOIN r ON l.a < r.a"),
+            format!("{inputs} SELECT l.a, r.a FROM l LEFT JOIN r ON l.a + 3 < r.a"),
+        ];
+        let rows = |workers: usize, sql: &str| {
+            let mut s = Session::new().with_workers(workers).unwrap();
+            s.register("t", schema.clone(), vec![batch(0..12)]).unwrap();
+            s.register("u", schema.clone(), vec![batch(0..12)]).unwrap();
+            s.register("v", schema.clone(), vec![batch(4..16)]).unwrap();
+            s.register("w", schema.clone(), vec![batch(4..16)]).unwrap();
+            let mut rows: Vec<String> = Vec::new();
+            for b in s.execute_staged(sql).unwrap() {
+                for r in 0..b.num_rows() {
+                    let cells: Vec<String> = (0..b.num_columns())
+                        .map(|c| {
+                            let col = b.column(c);
+                            if col.is_null(r) {
+                                "NULL".to_string()
+                            } else {
+                                arrow::util::display::array_value_to_string(col, r).unwrap()
+                            }
+                        })
+                        .collect();
+                    rows.push(cells.join("|"));
+                }
+            }
+            rows.sort();
+            rows
+        };
+        for sql in &queries {
+            let want = rows(1, sql);
+            assert!(!want.is_empty(), "{sql}");
+            for workers in [2, 4] {
+                assert_eq!(rows(workers, sql), want, "workers={workers} {sql}");
             }
         }
     }
