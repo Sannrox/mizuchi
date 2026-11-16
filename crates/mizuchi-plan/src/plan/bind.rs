@@ -2067,6 +2067,12 @@ fn literal_u64(expr: &SqlExpr, what: &str) -> Result<u64> {
             op: UnaryOperator::Plus,
             expr,
         } => literal_u64(expr, what),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Minus,
+            ..
+        } => Err(Error::Plan(format!(
+            "{what} must be a non-negative integer"
+        ))),
         _ => Err(Error::Plan(format!("{what} must be a literal integer"))),
     }
 }
