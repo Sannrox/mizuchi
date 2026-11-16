@@ -1934,7 +1934,8 @@ fn execute_physical(
             let (child, node) = execute_physical(input, ctx)?;
             let t0 = Instant::now();
             let copied0 = ctx.pool.copied();
-            let batches = super::sort::ordered(
+            let cancel = ctx.session.exec_token();
+            let rows = super::sort::sorted(
                 child,
                 input.schema().clone(),
                 order,
@@ -1942,12 +1943,12 @@ fn execute_physical(
                 None,
                 &ctx.session.policy,
                 ctx.pool.as_ref(),
-                &ctx.session.exec_token(),
+                &cancel,
             )?;
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
             meter_blocking(
                 "Sort",
-                lowering.scan(batches),
+                rows.lower(lowering, &cancel),
                 vec![node],
                 ctx,
                 ns,
@@ -1962,7 +1963,8 @@ fn execute_physical(
                 let (child, node) = execute_physical(sorted, ctx)?;
                 let t0 = Instant::now();
                 let copied0 = ctx.pool.copied();
-                let batches = super::sort::ordered(
+                let cancel = ctx.session.exec_token();
+                let rows = super::sort::sorted(
                     child,
                     sorted.schema().clone(),
                     order,
@@ -1970,12 +1972,12 @@ fn execute_physical(
                     *fetch,
                     &ctx.session.policy,
                     ctx.pool.as_ref(),
-                    &ctx.session.exec_token(),
+                    &cancel,
                 )?;
                 let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 meter_blocking(
                     "Sort",
-                    lowering.scan(batches),
+                    rows.lower(lowering, &cancel),
                     vec![node],
                     ctx,
                     ns,
