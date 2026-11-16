@@ -450,7 +450,10 @@ fn publish(dest: &Path, staging: &Path, mode: WriteMode, id: u64, ctrl: CommitCt
 
 /// Rollback directory of an overwrite that is still moving old entries out.
 /// Every visible entry of the dataset is still an old one.
-const OVERWRITE_OLD: &str = ".mizuchi-old-";
+///
+/// Older versions used `.mizuchi-old-` without phases; such a leftover cannot
+/// be told apart from a half-published overwrite, so recovery leaves it alone.
+const OVERWRITE_OLD: &str = ".mizuchi-evac-";
 /// Every old entry has moved out; visible entries are this write's new files.
 const OVERWRITE_MOVED: &str = ".mizuchi-moved-";
 /// The new files are published; the directory only waits for removal.
@@ -459,7 +462,7 @@ const OVERWRITE_DONE: &str = ".mizuchi-done-";
 /// Replaces the visible entries of `dest` with the staged files. The old
 /// entries move into a rollback directory whose name records the phase, so
 /// [`recover_overwrite`] can always tell whether to finish or roll back:
-/// `.mizuchi-old-` while evacuating, `.mizuchi-moved-` while publishing,
+/// `.mizuchi-evac-` while evacuating, `.mizuchi-moved-` while publishing,
 /// `.mizuchi-done-` once the new files are complete.
 fn publish_overwrite(
     dest: &Path,
@@ -1043,6 +1046,22 @@ mod tests {
         recover_overwrite(&dest).unwrap();
         assert_eq!(read_ids(&dest), before);
         assert!(!old.exists());
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// A pre-phase `.mizuchi-old-*` leftover has no marker saying how far the
+    /// publish got, so recovery must not move its files into the dataset.
+    #[test]
+    fn recovery_leaves_a_legacy_rollback_directory_alone() {
+        let dest = tmp_dest();
+        write_year(&dest, &[sample_batch()], WriteMode::Overwrite).unwrap();
+        let before = read_ids(&dest);
+        let legacy = dest.join(".mizuchi-old-3");
+        fs::create_dir(&legacy).unwrap();
+        fs::write(legacy.join("part-00000.parquet"), b"stale").unwrap();
+        recover_overwrite(&dest).unwrap();
+        assert_eq!(read_ids(&dest), before);
+        assert!(legacy.join("part-00000.parquet").exists());
         let _ = fs::remove_dir_all(&dest);
     }
 

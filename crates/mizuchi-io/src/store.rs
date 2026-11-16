@@ -277,12 +277,15 @@ fn publish_store(
     Ok(())
 }
 
-/// Rollback prefix of an overwrite, `.mizuchi-old-{id}/`. Object stores have
+/// Rollback prefix of an overwrite, `.mizuchi-rollback-{id}/`. Object stores have
 /// no atomic directory rename, so marker objects inside record the phase:
 /// none while old objects move out, [`MOVED_MARKER`] once every old object
 /// has moved (visible objects are then a partial new dataset), and
 /// [`DONE_MARKER`] once the new objects are complete.
-const OLD_PREFIX: &str = ".mizuchi-old-";
+/// Older versions used `.mizuchi-old-{id}/` without markers; such a leftover
+/// cannot be told apart from a half-published overwrite, so recovery leaves
+/// it alone.
+const OLD_PREFIX: &str = ".mizuchi-rollback-";
 const MOVED_MARKER: &str = "_MOVED";
 const DONE_MARKER: &str = "_DONE";
 
