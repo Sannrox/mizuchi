@@ -36,6 +36,9 @@ const KIND_STRUCT: u32 = 12;
 const STREAM_PRESENT: u32 = 0;
 const STREAM_DATA: u32 = 1;
 const STREAM_LENGTH: u32 = 2;
+/// Most rows one stream byte can describe: a two-byte byte-RLE run repeats a
+/// value 130 times, and a PRESENT stream packs 8 rows into each value.
+const ROWS_PER_DATA_BYTE: usize = 520;
 
 #[derive(Clone, Debug)]
 struct OrcType {
@@ -144,23 +147,24 @@ pub fn read_file(
     }
     let mut record_batches = Vec::new();
     for stripe in &footer.stripes {
-        let start = stripe.offset as usize;
-        let data_start = start + stripe.index_length as usize;
-        let data_end = data_start + stripe.data_length as usize;
-        let sf_end = data_end + stripe.footer_length as usize;
-        if sf_end > bytes.len() {
-            return Err(Error::Io(format!("{}: truncated stripe", path.display())));
-        }
+        let (data_start, data_end, sf_end) = stripe_bounds(stripe)
+            .filter(|(_, _, sf_end)| *sf_end <= footer_start)
+            .ok_or_else(|| Error::Io(format!("{}: truncated stripe", path.display())))?;
+        let limit = row_limit(data_end - data_start);
+        let num_rows = usize::try_from(stripe.number_of_rows)
+            .ok()
+            .filter(|n| *n <= limit)
+            .ok_or_else(|| {
+                Error::Io(format!(
+                    "{}: stripe claims more rows than its data can hold",
+                    path.display()
+                ))
+            })?;
         let sf = decode_stripe_footer(&bytes[data_end..sf_end])?;
         let by_col = split_streams(&bytes[data_start..data_end], &sf)?;
         let mut cols = Vec::with_capacity(selected.len());
         for sub in &selected {
-            cols.push(decode_array(
-                *sub,
-                stripe.number_of_rows as usize,
-                &footer.types,
-                &by_col,
-            )?);
+            cols.push(decode_array(*sub, num_rows, &footer.types, &by_col, limit)?);
         }
         let rb = RecordBatch::try_new(schema.clone(), cols)
             .map_err(|e| Error::InvalidBatch(e.to_string()))?;
@@ -180,6 +184,22 @@ pub fn read_file(
         out.push(Batch::empty(schema)?);
     }
     Ok(out)
+}
+
+/// Byte ranges of a stripe as `(data start, data end, stripe footer end)`, or
+/// `None` when a size from the file overflows.
+fn stripe_bounds(stripe: &StripeInfo) -> Option<(usize, usize, usize)> {
+    let start = usize::try_from(stripe.offset).ok()?;
+    let data_start = start.checked_add(usize::try_from(stripe.index_length).ok()?)?;
+    let data_end = data_start.checked_add(usize::try_from(stripe.data_length).ok()?)?;
+    let sf_end = data_end.checked_add(usize::try_from(stripe.footer_length).ok()?)?;
+    Some((data_start, data_end, sf_end))
+}
+
+/// Most rows a stripe with `data_length` bytes of streams can describe. Row
+/// counts from the file are checked against it before anything is allocated.
+fn row_limit(data_length: usize) -> usize {
+    data_length.saturating_mul(ROWS_PER_DATA_BYTE)
 }
 
 fn schema_to_types(schema: &Schema) -> Result<Vec<OrcType>> {
@@ -503,6 +523,7 @@ fn decode_array(
     num_rows: usize,
     types: &[OrcType],
     by_col: &ColumnStreams,
+    row_limit: usize,
 ) -> Result<ArrayRef> {
     let ty = types
         .get(col as usize)
@@ -593,15 +614,18 @@ fn decode_array(
                 int_rle_decode(&stream_bytes(by_col.get(&col), STREAM_LENGTH), false)?,
                 n_valid,
             )?;
-            let total: usize = lengths
+            let total = lengths
                 .iter()
-                .map(|n| usize::try_from(*n).unwrap_or(0))
-                .sum();
+                .try_fold(0usize, |acc, n| acc.checked_add(usize::try_from(*n).ok()?))
+                .filter(|total| *total <= row_limit)
+                .ok_or_else(|| {
+                    Error::Io("ORC LIST claims more rows than its data can hold".into())
+                })?;
             let child_id = *ty
                 .subtypes
                 .first()
                 .ok_or_else(|| Error::Io("ORC LIST missing child".into()))?;
-            let values = decode_array(child_id, total, types, by_col)?;
+            let values = decode_array(child_id, total, types, by_col, row_limit)?;
             let mut offsets = Vec::with_capacity(num_rows + 1);
             offsets.push(0i32);
             let mut li = 0;
@@ -610,7 +634,12 @@ fn decode_array(
                     let n = i32::try_from(lengths[li])
                         .map_err(|_| Error::Io("ORC LIST length overflow".into()))?;
                     li += 1;
-                    offsets.last().copied().unwrap_or(0) + n
+                    offsets
+                        .last()
+                        .copied()
+                        .unwrap_or(0)
+                        .checked_add(n)
+                        .ok_or_else(|| Error::Io("ORC LIST offset overflow".into()))?
                 } else {
                     offsets.last().copied().unwrap_or(0)
                 };
@@ -635,7 +664,7 @@ fn decode_array(
             let mut child_cols = Vec::new();
             for (name, sub) in ty.field_names.iter().zip(ty.subtypes.iter()) {
                 child_fields.push(Field::new(name, orc_to_arrow(*sub, types)?, true));
-                child_cols.push(decode_array(*sub, num_rows, types, by_col)?);
+                child_cols.push(decode_array(*sub, num_rows, types, by_col, row_limit)?);
             }
             let nulls = if present.iter().all(|b| *b) {
                 None
@@ -1214,6 +1243,96 @@ mod tests {
             &[1, 2]
         );
         let _ = fs::remove_file(path);
+    }
+
+    fn one_column_file() -> std::path::PathBuf {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batch =
+            Batch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
+        let path = tmp("crafted.orc");
+        write_file(&path, std::slice::from_ref(&batch)).unwrap();
+        path
+    }
+
+    /// Rewrites the single stripe entry of an ORC file written by `write_file`.
+    fn rewrite_stripe(path: &Path, edit: impl FnOnce(&mut StripeInfo)) {
+        let bytes = fs::read(path).unwrap();
+        let ps_len = usize::from(*bytes.last().unwrap());
+        let ps_start = bytes.len() - 1 - ps_len;
+        let ps = decode_postscript(&bytes[ps_start..bytes.len() - 1]).unwrap();
+        let footer_start = ps_start - ps.footer_length as usize;
+        let FileFooter { types, stripes } =
+            decode_file_footer(&bytes[footer_start..ps_start]).unwrap();
+        let mut stripe = stripes.into_iter().next().unwrap();
+        edit(&mut stripe);
+        let mut body = bytes[..footer_start].to_vec();
+        let file_footer = encode_file_footer(
+            MAGIC.len() as u64,
+            0,
+            &types,
+            stripe.offset,
+            stripe.data_length,
+            stripe.footer_length,
+            stripe.number_of_rows,
+        );
+        body.extend_from_slice(&file_footer);
+        let postscript = encode_postscript(file_footer.len() as u64);
+        body.extend_from_slice(&postscript);
+        body.push(postscript.len() as u8);
+        fs::write(path, body).unwrap();
+    }
+
+    fn read_error(path: &Path) -> String {
+        let err = read_file(path, None, BatchPolicy::default()).unwrap_err();
+        let _ = fs::remove_file(path);
+        err.to_string()
+    }
+
+    #[test]
+    fn stripe_offset_near_the_end_of_the_address_space_is_an_error() {
+        let path = one_column_file();
+        rewrite_stripe(&path, |s| s.offset = u64::MAX - 2);
+        assert!(read_error(&path).contains("truncated stripe"));
+    }
+
+    #[test]
+    fn stripe_length_past_end_of_file_is_an_error() {
+        let path = one_column_file();
+        rewrite_stripe(&path, |s| s.data_length = u64::MAX / 2);
+        assert!(read_error(&path).contains("truncated stripe"));
+    }
+
+    #[test]
+    fn stripe_row_count_beyond_its_data_is_refused_before_allocating() {
+        let path = one_column_file();
+        rewrite_stripe(&path, |s| s.number_of_rows = 10_000_000);
+        assert!(read_error(&path).contains("more rows than its data can hold"));
+    }
+
+    #[test]
+    fn list_lengths_beyond_the_stripe_data_are_refused() {
+        let types = vec![
+            OrcType {
+                kind: KIND_STRUCT,
+                subtypes: vec![1],
+                field_names: vec!["tags".into()],
+            },
+            OrcType {
+                kind: KIND_LIST,
+                subtypes: vec![2],
+                field_names: Vec::new(),
+            },
+            primitive(KIND_LONG),
+        ];
+        let lengths = int_rle_encode(&[i64::from(i32::MAX), i64::from(i32::MAX)], false);
+        let mut by_col = ColumnStreams::new();
+        by_col.entry(1).or_default().push((STREAM_LENGTH, lengths));
+        let limit = row_limit(64);
+        let err = decode_array(1, 2, &types, &by_col, limit).unwrap_err();
+        assert!(
+            err.to_string().contains("more rows than its data can hold"),
+            "{err}"
+        );
     }
 
     #[test]
