@@ -19,12 +19,14 @@ mizuchi-flight = { path = "../mizuchi-flight", version = "0.2.0", optional = tru
 mizuchi-io = { workspace = true }
 mizuchi-plan = { workspace = true }
 mizuchi-postgres = { workspace = true }
+# Only for the live `tests/postgres.rs` seed client; enabled by `postgres`.
+postgres = { workspace = true, optional = true }
 
 [features]
 default = []
 s3 = ["mizuchi-io/s3", "mizuchi-exec/s3"]
 sandbox = []
-postgres = ["mizuchi-postgres/client", "mizuchi-exec/postgres"]
+postgres = ["mizuchi-postgres/client", "mizuchi-exec/postgres", "dep:postgres"]
 flight = ["dep:mizuchi-flight"]
 
 [[bin]]

@@ -1616,6 +1616,7 @@ dependencies = [
  "mizuchi-postgres",
  "object_store",
  "parquet",
+ "postgres",
  "tokio",
 ]
 
