@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Write and check the release CycloneDX 1.5 SBOM.
 
-    scripts/release-sbom.py OUT          # from `cargo metadata --locked`
-    scripts/release-sbom.py --check OUT  # schema + SPDX check; needs
+    scripts/release/sbom.py OUT          # from `cargo metadata --locked`
+    scripts/release/sbom.py --check OUT  # schema + SPDX check; needs
                                          # cyclonedx-python-lib[json-validation]
-    scripts/release-sbom.py --self-test
 
 The SBOM covers what the release ships: the library workspace with all
 features (the image enables `flight`) and the separate `python/` workspace
@@ -21,7 +20,7 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 WORKSPACES = [ROOT, ROOT / "python"]
 SPEC_VERSION = "1.5"
 
@@ -132,68 +131,15 @@ def check(path: Path) -> None:
     print(f"{path}: valid CycloneDX {SPEC_VERSION}, {len(bom['components'])} components")
 
 
-def self_test() -> None:
-    def pkg(name: str, version: str, source: str | None, license: str | None) -> dict:
-        pid = f"{source or 'path+file:///w'}#{name}@{version}"
-        return {"id": pid, "name": name, "version": version, "source": source, "license": license}
-
-    registry = "registry+https://github.com/rust-lang/crates.io-index"
-    root = pkg("mizuchi", "0.1.0", None, "Apache-2.0")
-    libc = pkg("libc", "0.2.0", registry, "MIT/Apache-2.0")
-    keys = pkg("sekai-keys", "0.1.0", "git+https://example.invalid/k.git?rev=ab#ab", None)
-    dev = pkg("proptest", "1.0.0", registry, "MIT OR Apache-2.0")
-    meta = {
-        "workspace_members": [root["id"]],
-        "packages": [root, libc, keys, dev],
-        "resolve": {
-            "nodes": [
-                {
-                    "id": root["id"],
-                    "deps": [
-                        {"pkg": libc["id"], "dep_kinds": [{"kind": None}]},
-                        {"pkg": keys["id"], "dep_kinds": [{"kind": "build"}]},
-                        {"pkg": dev["id"], "dep_kinds": [{"kind": "dev"}]},
-                    ],
-                },
-                {"id": libc["id"], "deps": []},
-                {"id": keys["id"], "deps": []},
-                {"id": dev["id"], "deps": []},
-            ]
-        },
-    }
-    wheel = pkg("mizuchi-py", "0.1.0", None, "Apache-2.0")
-    python_meta = {
-        "workspace_members": [wheel["id"]],
-        "packages": [wheel, root, libc],
-        "resolve": {
-            "nodes": [
-                {"id": wheel["id"], "deps": [{"pkg": root["id"], "dep_kinds": [{"kind": None}]}]},
-                {"id": root["id"], "deps": [{"pkg": libc["id"], "dep_kinds": [{"kind": None}]}]},
-                {"id": libc["id"], "deps": []},
-            ]
-        },
-    }
-    bom = bom_from_metadata([meta, python_meta])
-    by_name = {item["name"]: item for item in bom["components"]}
-    assert sorted(by_name) == ["libc", "mizuchi-py", "sekai-keys"], by_name
-    assert by_name["libc"]["licenses"] == [{"expression": "MIT OR Apache-2.0"}]
-    assert by_name["sekai-keys"]["purl"].startswith("pkg:cargo/sekai-keys@0.1.0?vcs_url=git%2Bhttps")
-    assert bom["metadata"]["component"]["type"] == "application"
-    assert bom["serialNumber"] == bom_from_metadata([meta, python_meta])["serialNumber"]
-    print("release-sbom self-test passed")
-
-
 def main(argv: list[str]) -> None:
-    if argv == ["--self-test"]:
-        self_test()
-    elif len(argv) == 2 and argv[0] == "--check":
+    if len(argv) == 2 and argv[0] == "--check":
         check(Path(argv[1]))
     elif len(argv) == 1 and not argv[0].startswith("-"):
         bom = bom_from_metadata([cargo_metadata(workspace) for workspace in WORKSPACES])
         Path(argv[0]).write_text(json.dumps(bom, indent=2) + "\n")
         print(argv[0])
     else:
-        raise SystemExit("usage: release-sbom.py OUT | --check OUT | --self-test")
+        raise SystemExit("usage: sbom.py OUT | --check OUT")
 
 
 if __name__ == "__main__":

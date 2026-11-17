@@ -1,4 +1,5 @@
-//! Default-test contract for the release ADR and publishing workflow.
+//! Default-test contract for the release ADR and the release metadata.
+//! The release workflows are checked by `tests/release/` (parsed YAML).
 
 use std::fs;
 use std::path::PathBuf;
@@ -32,41 +33,6 @@ fn adr_records_surface_semver_and_deprecation() {
     ] {
         assert!(text.contains(needle), "ADR missing {needle}");
     }
-}
-
-// A v* tag push only dispatches release.yml on main; scripts/validate-release.sh
-// asserts the full main-run contract.
-#[test]
-fn release_workflow_publishes_on_tag() {
-    let dispatch = read(".github/workflows/release-dispatch.yml");
-    assert!(dispatch.contains("tags: [\"v*\"]"));
-    assert!(dispatch.contains("gh workflow run release.yml --ref main -f tag=\"$TAG\""));
-    let yml = read(".github/workflows/release.yml");
-    assert!(yml.contains("workflow_dispatch"));
-    assert!(
-        !yml.contains("\n  push:"),
-        "release.yml runs from main, not on a tag push"
-    );
-    assert!(
-        !yml.contains("pull_request"),
-        "release workflow must not run on pull_request"
-    );
-    assert!(yml.contains("bash scripts/package-source.sh dist"));
-    assert!(yml.contains("needs: [verify-tag, source, wheels, image, attest]"));
-    assert!(yml.contains("--draft --verify-tag"));
-    assert!(yml.contains("gh release edit \"$TAG\" --draft=false"));
-    for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {
-        assert!(yml.contains(os), "wheels matrix missing {os}");
-    }
-    assert!(yml.contains("maturin build"));
-    assert!(yml.contains("gh release create"));
-    assert!(yml.contains("attest-build-provenance"));
-    assert!(yml.contains("SHA256SUMS"));
-    assert!(yml.contains("ghcr.io/sannrox/mizuchi"));
-    assert!(
-        !yml.contains(":latest"),
-        "release must not push a latest image tag"
-    );
 }
 
 #[test]

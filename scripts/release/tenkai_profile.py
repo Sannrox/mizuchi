@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Render and check the Tenkai compatibility profile mizuchi publishes.
 
-    scripts/tenkai-profile.py --render --version V --digest sha256:<hex> --out FILE
-    scripts/tenkai-profile.py --check
+    scripts/release/tenkai_profile.py --render --version V --digest sha256:<hex> --out FILE
+    scripts/release/tenkai_profile.py --check
 
 `deploy/tenkai.toml` is the committed template and carries no
 `[compatibility]` block: a tagged commit cannot hold the digest of the image
@@ -40,7 +40,7 @@ PROFILE_VERSION = 2
 MAX_EVIDENCE_AGE_MS = 86_400_000
 
 IMAGE = "ghcr.io/sannrox/mizuchi"
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 TEMPLATE = ROOT / "deploy" / "tenkai.toml"
 README = ROOT / "deploy" / "README.md"
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -67,7 +67,7 @@ def render(template: str, version: str, digest: str) -> str:
         fail(f"the template must set {tagged.strip()} exactly once")
     template = template.replace(tagged, f"IMG={IMAGE}@{digest}\n")
     block = f"""
-# Rendered by scripts/tenkai-profile.py at release; not in the source tree.
+# Rendered by scripts/release/tenkai_profile.py at release; not in the source tree.
 [compatibility]
 version = {PROFILE_VERSION}
 max_evidence_age_ms = {MAX_EVIDENCE_AGE_MS}

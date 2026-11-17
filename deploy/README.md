@@ -12,7 +12,7 @@ only when the embedder sets `MIZUCHI_ALLOW_NETWORK` (ADR 0008, ADR 0011).
   tag for Tenkai.
 - Tenkai contract: the Flight worker provides `mizuchi.query` at `1.0.0`,
   which products that use mizuchi as an engine declare as a requirement.
-  The version lives in `scripts/tenkai-profile.py` and is not the crate
+  The version lives in `scripts/release/tenkai_profile.py` and is not the crate
   version: the major bumps when the query surface (accepted SQL, result
   schema, Flight endpoints) breaks, the minor when it grows compatibly.
   The committed `deploy/tenkai.toml` has no `[compatibility]` block; the

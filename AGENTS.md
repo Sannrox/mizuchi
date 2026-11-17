@@ -52,6 +52,8 @@ cargo clippy --locked --workspace --all-targets --exclude mizuchi-flight -- -D w
 cargo test --locked --workspace --exclude mizuchi-flight
 bash scripts/validate-workflow-skills.sh
 python3 scripts/adr-index.py --check
+bash scripts/check-workflows.sh
+python3 -m unittest discover -s tests -t .
 ```
 
 - `cargo fmt --all` formats before review.
@@ -61,6 +63,13 @@ python3 scripts/adr-index.py --check
 - `python3 scripts/adr-index.py --check` fails when the decision index in
   `docs/decisions/README.md` is stale; without `--check` it rewrites it. Never
   edit the index by hand.
+- `scripts/check-workflows.sh` lints `.github/workflows/` with pinned
+  actionlint and zizmor (CI `Lint workflows`).
+- `python3 -m unittest discover -s tests -t .` runs the release tests in
+  `tests/release/` (CI `Release tests`). Install
+  `tests/requirements.txt` with `--require-hashes` and
+  `cyclonedx-python-lib[json-validation]` first; `RELEASING.md` lists the
+  commands.
 
 There is no Makefile yet. When one is added, its targets become the source of
 truth for these commands and this section must point to them.
@@ -130,6 +139,7 @@ Rows beyond `## Testing Guidelines`:
 | dependency pins (arrow, parquet, sqlparser) | `Cargo.lock` diff reviewed; the pinned tag exists upstream; upstream release notes read |
 | runtime image / Python packages | image builds; package set matches the documented policy |
 | docs, templates, Skills | `bash scripts/validate-workflow-skills.sh`; `python3 scripts/adr-index.py --check` for decision records |
+| workflows, release path | `bash scripts/check-workflows.sh`; `python3 -m unittest discover -s tests -t .` |
 
 ### Release audit
 
@@ -258,7 +268,9 @@ planned work with neither is not a running lane.
 
 Parallel lanes must not collide. Collision surfaces in this repository are the
 public engine API, the logical plan format, the memory and spill manager,
-and the Arrow/Parquet/sqlparser pins. Lanes that would
+the Arrow/Parquet/sqlparser pins, and the release path
+(`.github/workflows/release*.yml`, `scripts/release/`, `tests/release/`,
+`RELEASING.md`). Lanes that would
 both change one of these surfaces run in sequence, not in parallel.
 
 A lane publishes its first Verified commit to the claim branch as a draft Pull
@@ -315,6 +327,13 @@ Use sqllogictest files for SQL behavior. Benchmarks and comparisons against
 reference engines live outside the default test run, with their data
 prerequisites documented. Offline `cargo test` must stay green without large
 datasets or network access.
+
+Release and CI logic lives in scripts, not in workflow `run:` blocks. Release
+entry points are in `scripts/release/`, each with a stdlib `unittest` file in
+`tests/release/`; a release invariant is enforced in the script at the step
+it protects. Workflow invariants no linter expresses get a test on the parsed
+YAML (`tests/release/test_workflows.py`) that asserts structure, never step
+names or wording. Never grep raw workflow text.
 
 ## Commit & Pull Request Guidelines
 
