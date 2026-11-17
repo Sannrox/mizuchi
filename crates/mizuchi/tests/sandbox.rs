@@ -2,13 +2,15 @@
 //! typed errors. OS limits belong to the embedding runner; this crate has no
 //! sandbox backend.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arrow::array::Int64Array;
+use mizuchi::exec::{CpuLowering, Lowering, Operator};
 use mizuchi::{
-    Batch, DataType, Error, Field, ParquetReadOptions, ParquetWriteOptions, RecordBatch, Schema,
-    SchemaRef, Session, SessionConfig,
+    Batch, CancelToken, DataType, Error, Field, ParquetReadOptions, ParquetWriteOptions,
+    RecordBatch, Schema, SchemaRef, Session, SessionConfig,
 };
 
 fn schema() -> SchemaRef {
@@ -143,15 +145,67 @@ fn os_denied_read_is_io() {
     assert!(matches!(err, Err(Error::Io(_))), "{err:?}");
 }
 
+/// Files below `dir`, at any depth.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .flat_map(|e| {
+            let path = e.path();
+            if path.is_dir() {
+                files_under(&path)
+            } else {
+                vec![path]
+            }
+        })
+        .collect()
+}
+
+/// Scan that records whether a spill file exists under `spill` while the
+/// sort above it is still pulling input.
+struct SpillProbe {
+    inner: Box<dyn Operator>,
+    spill: PathBuf,
+    seen: Arc<AtomicBool>,
+}
+
+impl Operator for SpillProbe {
+    fn next_batch(&mut self, cancel: &CancelToken) -> mizuchi::Result<Option<Batch>> {
+        if !files_under(&self.spill).is_empty() {
+            self.seen.store(true, Ordering::SeqCst);
+        }
+        self.inner.next_batch(cancel)
+    }
+}
+
+struct SpillProbeLowering {
+    spill: PathBuf,
+    seen: Arc<AtomicBool>,
+}
+
+impl Lowering for SpillProbeLowering {
+    fn scan(&self, batches: Vec<Batch>) -> mizuchi::Result<Box<dyn Operator>> {
+        Ok(Box::new(SpillProbe {
+            inner: Lowering::scan(&CpuLowering, batches)?,
+            spill: self.spill.clone(),
+            seen: self.seen.clone(),
+        }))
+    }
+}
+
 #[test]
 fn spill_stays_in_configured_dir() {
     let (schema, batches) = numbered_batches(12, 32);
+    let rows: usize = batches.iter().map(Batch::num_rows).sum();
     // Small enough to spill, large enough for the merge to hold two chunks.
     let cap = 4 * batches[0].as_arrow().get_array_memory_size() as u64;
     let spill = tmp("spill");
     let other = tmp("other");
     std::fs::create_dir_all(&spill).unwrap();
     std::fs::create_dir_all(&other).unwrap();
+    let seen = Arc::new(AtomicBool::new(false));
     let mut s = Session::from_config(SessionConfig {
         memory_limit: Some(cap),
         workers: Some(1),
@@ -160,14 +214,22 @@ fn spill_stays_in_configured_dir() {
         allowed_write_paths: vec![spill.clone(), other.clone()],
         ..SessionConfig::default()
     })
-    .unwrap();
+    .unwrap()
+    .with_lowering(Arc::new(SpillProbeLowering {
+        spill: spill.clone(),
+        seen: seen.clone(),
+    }));
     s.register("t", schema, batches).unwrap();
     let out = s.execute_sql("SELECT a FROM t ORDER BY a").unwrap();
-    assert!(!out.is_empty());
     let spill_left = leftover(&spill);
     let other_left = leftover(&other);
     let _ = std::fs::remove_dir_all(&spill);
     let _ = std::fs::remove_dir_all(&other);
+    assert!(
+        seen.load(Ordering::SeqCst),
+        "the sort never spilled into the configured dir"
+    );
+    assert_eq!(out.iter().map(Batch::num_rows).sum::<usize>(), rows);
     assert!(spill_left.is_empty(), "{spill_left:?}");
     assert!(other_left.is_empty(), "{other_left:?}");
 }

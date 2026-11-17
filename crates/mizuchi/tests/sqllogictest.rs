@@ -107,9 +107,14 @@ impl Record {
     fn run(self, db: &mut Db) -> Result<(), String> {
         match self {
             Record::Skip => Ok(()),
-            Record::StatementOk(sql) => exec_statement(db, &sql),
+            Record::StatementOk(sql) => exec_statement(db, &sql).map_err(|f| match f {
+                Failure::Engine(e) | Failure::Harness(e) => e,
+            }),
+            // Only an engine error satisfies `statement error`; the harness
+            // failing to parse its own CREATE/INSERT subset checks nothing.
             Record::StatementError(sql) => match exec_statement(db, &sql) {
-                Err(_) => Ok(()),
+                Err(Failure::Engine(_)) => Ok(()),
+                Err(Failure::Harness(e)) => Err(format!("harness error, not engine: {e}")),
                 Ok(()) => Err(format!("expected error from {sql}")),
             },
             Record::Query {
@@ -261,36 +266,45 @@ fn take_expected(lines: &[&str], mut i: usize) -> (Vec<String>, usize) {
     (expected, i)
 }
 
-fn exec_statement(db: &mut Db, sql: &str) -> Result<(), String> {
+/// Why a statement failed: the engine rejected it, or the harness could not
+/// run it (its own CREATE/INSERT parsing, or reading a MERGE result back).
+enum Failure {
+    Engine(String),
+    Harness(String),
+}
+
+fn exec_statement(db: &mut Db, sql: &str) -> Result<(), Failure> {
     let trimmed = sql.trim();
     let upper = trimmed.to_ascii_uppercase();
     if upper.starts_with("CREATE TABLE") {
-        create_table(db, trimmed)
+        create_table(db, trimmed).map_err(Failure::Harness)
     } else if upper.starts_with("INSERT INTO") {
-        insert_into(db, trimmed)
+        insert_into(db, trimmed).map_err(Failure::Harness)
     } else if upper.starts_with("MERGE") {
         merge_into(db, trimmed)
     } else {
         db.session()
             .execute_sql(trimmed)
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| Failure::Engine(e.to_string()))
     }
 }
 
-fn merge_into(db: &mut Db, sql: &str) -> Result<(), String> {
+fn merge_into(db: &mut Db, sql: &str) -> Result<(), Failure> {
     let mut session = db.session();
-    let stats = session.merge_sql(sql).map_err(|e| e.to_string())?;
+    let stats = session
+        .merge_sql(sql)
+        .map_err(|e| Failure::Engine(e.to_string()))?;
     let (schema, batches) = session
         .table_data(&stats.table)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Failure::Harness(e.to_string()))?;
     let key = db
         .tables
         .keys()
         .find(|k| k.eq_ignore_ascii_case(&stats.table))
         .cloned()
         .unwrap_or_else(|| stats.table.clone());
-    let rows = batches_to_rows(&schema, &batches)?;
+    let rows = batches_to_rows(&schema, &batches).map_err(Failure::Harness)?;
     db.tables.insert(key, (schema, rows));
     Ok(())
 }
@@ -534,6 +548,13 @@ fn rows_to_batch(schema: SchemaRef, rows: &[Vec<Cell>]) -> Batch {
 fn format_result(batches: &[Batch], types: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for batch in batches {
+        if batch.num_columns() != types.len() {
+            return Err(format!(
+                "type string {types:?} names {} columns, result has {}",
+                types.len(),
+                batch.num_columns()
+            ));
+        }
         for row in 0..batch.num_rows() {
             for (col, ty) in types.chars().enumerate() {
                 out.push(format_cell(batch, col, row, ty)?);

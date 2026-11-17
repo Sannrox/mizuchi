@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, ListBuilder, StringArray, StringBuilder, StructArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
+use arrow::util::display::{ArrayFormatter, FormatOptions};
 use mizuchi::{
     AvroReadOptions, Batch, JsonReadOptions, OrcReadOptions, Session, SessionConfig, read_avro,
     read_json, read_orc, write_avro, write_json, write_orc,
@@ -53,23 +54,46 @@ fn tmp(suffix: &str) -> std::path::PathBuf {
     ))
 }
 
-fn ids(batches: &[Batch]) -> Vec<i64> {
-    let mut out = Vec::new();
-    for batch in batches {
-        let col = batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        for i in 0..col.len() {
-            if col.is_valid(i) {
-                out.push(col.value(i));
-            }
-        }
-    }
-    out
+/// The `id` column across batches, nulls included, so a reader that
+/// turns values into nulls does not pass.
+fn ids(batches: &[Batch]) -> Vec<Option<i64>> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let col = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            col.iter().collect::<Vec<_>>()
+        })
+        .collect()
 }
+
+/// A column rendered row by row, so nested values compare across readers
+/// whose list or struct field metadata differs from the written schema.
+fn rendered(batches: &[Batch], name: &str) -> Vec<String> {
+    let opts = FormatOptions::default().with_null("NULL");
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let col = batch.column_by_name(name).unwrap();
+            let fmt = ArrayFormatter::try_new(col.as_ref(), &opts).unwrap();
+            (0..col.len())
+                .map(|i| fmt.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Asserts that `nested` and `tags` read back with the written values.
+fn assert_nested_values(out: &[Batch]) {
+    assert_eq!(rendered(out, "nested"), ["{name: a}", "{name: b}"]);
+    assert_eq!(rendered(out, "tags"), TAGS);
+}
+
+const TAGS: [&str; 2] = ["[x, y]", "[z]"];
 
 #[test]
 fn json_ndjson_nested_round_trip_and_projection() {
@@ -77,9 +101,8 @@ fn json_ndjson_nested_round_trip_and_projection() {
     let path = tmp("nested.json");
     write_json(&path, &[batch]).unwrap();
     let out = read_json(&path, JsonReadOptions::default()).unwrap();
-    assert_eq!(ids(&out), vec![1, 2]);
-    assert!(out[0].column_by_name("nested").is_some());
-    assert!(out[0].column_by_name("tags").is_some());
+    assert_eq!(ids(&out), [Some(1), Some(2)]);
+    assert_nested_values(&out);
     let names = ["id".to_string(), "tags".to_string()];
     let projected = read_json(
         &path,
@@ -91,6 +114,7 @@ fn json_ndjson_nested_round_trip_and_projection() {
     .unwrap();
     assert_eq!(projected[0].num_columns(), 2);
     assert!(projected[0].column_by_name("nested").is_none());
+    assert_eq!(rendered(&projected, "tags"), TAGS);
     let _ = std::fs::remove_file(path);
 }
 
@@ -100,8 +124,8 @@ fn avro_ocf_nested_round_trip_and_projection() {
     let path = tmp("nested.avro");
     write_avro(&path, &[batch]).unwrap();
     let out = read_avro(&path, AvroReadOptions::default()).unwrap();
-    assert_eq!(ids(&out), vec![1, 2]);
-    assert!(out[0].column_by_name("nested").is_some());
+    assert_eq!(ids(&out), [Some(1), Some(2)]);
+    assert_nested_values(&out);
     let names = ["id".to_string()];
     let projected = read_avro(
         &path,
@@ -112,7 +136,7 @@ fn avro_ocf_nested_round_trip_and_projection() {
     )
     .unwrap();
     assert_eq!(projected[0].num_columns(), 1);
-    assert_eq!(ids(&projected), vec![1, 2]);
+    assert_eq!(ids(&projected), [Some(1), Some(2)]);
     let _ = std::fs::remove_file(path);
 }
 
@@ -122,9 +146,8 @@ fn orc_nested_round_trip_and_projection() {
     let path = tmp("nested.orc");
     write_orc(&path, &[batch]).unwrap();
     let out = read_orc(&path, OrcReadOptions::default()).unwrap();
-    assert_eq!(ids(&out), vec![1, 2]);
-    assert!(out[0].column_by_name("nested").is_some());
-    assert!(out[0].column_by_name("tags").is_some());
+    assert_eq!(ids(&out), [Some(1), Some(2)]);
+    assert_nested_values(&out);
     let names = ["id".to_string(), "tags".to_string()];
     let projected = read_orc(
         &path,
@@ -136,6 +159,7 @@ fn orc_nested_round_trip_and_projection() {
     .unwrap();
     assert_eq!(projected[0].num_columns(), 2);
     assert!(projected[0].column_by_name("nested").is_none());
+    assert_eq!(rendered(&projected, "tags"), TAGS);
     let _ = std::fs::remove_file(path);
 }
 
