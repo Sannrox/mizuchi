@@ -387,6 +387,43 @@ fn run_bin(args: &[&str]) -> (bool, String) {
     )
 }
 
+/// #292: a coordinator that fails after taking the lease hands it back, so
+/// a standby leads at once rather than after the TTL.
+#[test]
+fn a_failed_coordinator_releases_its_lease() {
+    use mizuchi::{DirLeaseStore, Leadership};
+
+    let lease = lease_dir();
+    let dir = lease.to_str().unwrap();
+    let (a1, _h1) = spawn_worker(true, None, Some(lease.clone())).unwrap();
+    let (a2, _h2) = spawn_worker(true, None, None).unwrap();
+    let workers = format!("{a1},{a2}");
+    // The coordinator takes the lease, then fails on SQL naming no column.
+    let out = Command::new(env!("CARGO_BIN_EXE_mizuchi"))
+        .args(["coordinator", "--workers", &workers, "--lease-dir", dir])
+        .args(["--holder", "failing", "--sql", "SELECT nope FROM t"])
+        .env("MIZUCHI_LEASE_TTL_MS", "600000")
+        .env("MIZUCHI_ALLOW_NETWORK", "1")
+        .env_remove("MIZUCHI_WORKERS")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("leader token=1"), "{stdout}{stderr}");
+    assert!(stderr.contains("nope"), "{stderr}");
+    let standby = Leadership::new(
+        Box::new(DirLeaseStore::new(&lease).unwrap()),
+        "standby",
+        Duration::from_secs(600),
+    );
+    // Within the 600 s TTL: only a release lets the standby lead now.
+    let token = standby.try_lead().unwrap();
+    assert!(token.is_some_and(|t| t > 1), "{token:?}");
+    let _ = std::fs::remove_dir_all(lease);
+}
+
 /// #238: a trailing `--lease-dir` used to read as omitted and start an
 /// unfenced worker or a coordinator that never took the lease.
 #[test]

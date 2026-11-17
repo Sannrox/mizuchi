@@ -93,6 +93,11 @@ fn coordinator(args: &[String]) -> Result<(), String> {
     let _alive = leadership
         .as_ref()
         .map(|leadership| leadership.keep_alive(lease_ttl() / 3));
+    // Every exit from here on, error or panic included, hands the lease back
+    // so a standby takes over at once instead of after the TTL. Declared
+    // after the renewal guard, so it drops first: the release fences the
+    // leadership, and renewal cannot take the lease back.
+    let _release = ReleaseOnExit(leadership.clone());
     cluster.heartbeat();
     if cluster.live_workers() < 2 {
         return Err("need two live workers".into());
@@ -123,6 +128,18 @@ fn coordinator(args: &[String]) -> Result<(), String> {
         leadership.release().map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Releases the coordinator lease when dropped. A second release, after the
+/// success path already released and reported its error, does nothing.
+struct ReleaseOnExit(Option<Arc<Leadership>>);
+
+impl Drop for ReleaseOnExit {
+    fn drop(&mut self) {
+        if let Some(leadership) = &self.0 {
+            let _ = leadership.release();
+        }
+    }
 }
 
 fn lease_ttl() -> Duration {

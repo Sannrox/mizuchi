@@ -463,7 +463,9 @@ impl Leadership {
             let stop = stop.clone();
             std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    std::thread::sleep(every);
+                    // Parked rather than asleep, so dropping the guard wakes
+                    // it at once; an early wake only renews early.
+                    std::thread::park_timeout(every);
                     if stop.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
                     }
@@ -516,6 +518,7 @@ impl Drop for KeepAlive {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
             let _ = handle.join();
         }
     }
@@ -790,6 +793,27 @@ mod tests {
         // Without renewal the lease lapses and the standby takes over.
         std::thread::sleep(ttl * 2);
         assert_eq!(standby.try_lead().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn dropping_keep_alive_does_not_wait_out_the_renewal_interval() {
+        let store = MemoryLeaseStore::default();
+        let leader = std::sync::Arc::new(Leadership::new(
+            Box::new(store),
+            "a",
+            Duration::from_secs(600),
+        ));
+        assert_eq!(leader.try_lead().unwrap(), Some(1));
+        let alive = leader.keep_alive(Duration::from_secs(200));
+        // Let the renewal thread reach its wait before the guard drops.
+        std::thread::sleep(Duration::from_millis(50));
+        let start = Instant::now();
+        drop(alive);
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
