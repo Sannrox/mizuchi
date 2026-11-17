@@ -183,6 +183,7 @@ fn kill_and_restart_matches_batch_reference() {
         "late rows must not land in the sink: {expected:?}"
     );
 
+    let mut killed_seeds = 0;
     for seed in 0..SEEDS {
         let root = unique(&format!("s{seed}"));
         let mut attempt = 0;
@@ -221,5 +222,14 @@ fn kill_and_restart_matches_batch_reference() {
         let got = sink_rows(&root);
         assert_eq!(got, expected, "seed {seed} after {attempt} kills");
         let _ = fs::remove_dir_all(&root);
+        if attempt > 0 {
+            killed_seeds += 1;
+        }
     }
+    // A run where every child finished on its first spawn proved nothing
+    // about restart; locally about a third of the seeds are killed.
+    assert!(
+        killed_seeds > 0,
+        "no seed was killed mid-run, so restart was never exercised"
+    );
 }

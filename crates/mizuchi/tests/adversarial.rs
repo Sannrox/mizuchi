@@ -404,23 +404,18 @@ fn cancel_during_spill_removes_spill_files_and_keeps_session() {
     assert_still_usable(&s);
 }
 
+/// Deep input fails with `Error::Parse` before planning; wide input that
+/// stays shallow runs.
 #[test]
 fn executed_parse_pathology_fails_typed() {
     let data = table(1, 8);
     let s = capped(cap(batch_bytes(&data.1) * 64), &data);
     let n = 20_000;
-    let cases = [
+    let deep = [
         format!("SELECT {}1{} AS x", "(".repeat(n), ")".repeat(n)),
         format!("SELECT {} AS x FROM t", vec!["a"; n].join(" + ")),
         format!("SELECT a FROM t WHERE {}", vec!["a = 1"; n].join(" OR ")),
         format!("SELECT a FROM t WHERE {}a > 0", "NOT ".repeat(n)),
-        format!(
-            "SELECT {} FROM t",
-            (0..n)
-                .map(|i| format!("a AS c{i}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
         format!(
             "SELECT {}a{} AS x FROM t",
             "CASE WHEN a > 0 THEN ".repeat(n / 10),
@@ -431,25 +426,58 @@ fn executed_parse_pathology_fails_typed() {
             "(SELECT a FROM ".repeat(n / 10),
             ")".repeat(n / 10)
         ),
-        format!("SELECT '{}' AS x", "\u{1F600}".repeat(1 << 20)),
         // Deep enough that dropping the tree on a 2 MiB stack would abort,
         // whether it is rejected for depth or by a later syntax error.
         format!("SELECT {} AS x FROM t", vec!["a"; 10 * n].join(" + ")),
         format!("SELECT {} AS x FROM )", vec!["a"; 10 * n].join(" + ")),
     ];
-    for sql in &cases {
+    for sql in &deep {
         let res = s.execute_sql(sql);
         assert!(
-            matches!(
-                res,
-                Ok(_) | Err(Error::Parse(_) | Error::Plan(_) | Error::Memory(_))
-            ),
+            matches!(res, Err(Error::Parse(_))),
             "{}: {}",
             &sql[..60],
             outcome(&res)
         );
     }
+    let wide = [
+        format!(
+            "SELECT {} FROM t",
+            (0..n)
+                .map(|i| format!("a AS c{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        format!("SELECT '{}' AS x", "\u{1F600}".repeat(1 << 20)),
+    ];
+    for sql in &wide {
+        let res = s.execute_sql(sql);
+        assert!(res.is_ok(), "{}: {}", &sql[..60], outcome(&res));
+    }
     assert_still_usable(&s);
+}
+
+/// Chains the parser builds without its own recursion limit fail with
+/// `Error::Parse` just past [`mizuchi::sql::MAX_EXPR_DEPTH`].
+#[test]
+fn nesting_just_over_the_limit_fails_parse() {
+    let data = table(1, 8);
+    let s = capped(cap(batch_bytes(&data.1) * 64), &data);
+    let d = mizuchi::sql::MAX_EXPR_DEPTH + 2;
+    let cases = [
+        format!("SELECT {} AS x FROM t", vec!["a"; d].join(" + ")),
+        format!("SELECT a FROM t WHERE {}", vec!["a = 1"; d].join(" OR ")),
+        format!("SELECT a FROM t WHERE {}", vec!["a >= 0"; d].join(" AND ")),
+    ];
+    for sql in &cases {
+        let res = s.execute_sql(sql);
+        assert!(
+            matches!(&res, Err(Error::Parse(m)) if m.contains("nesting")),
+            "{}: {}",
+            &sql[..60],
+            outcome(&res)
+        );
+    }
 }
 
 /// Just under the nesting limit, chains the parser builds without its own

@@ -28,12 +28,14 @@ fn grammar_cases_pull_match_two_workers() {
     for sql in CASES {
         let pull = session();
         let staged = session().with_workers(2).unwrap();
-        match (pull.execute_sql(sql), staged.execute_sql(sql)) {
-            (Ok(a), Ok(b)) => assert_eq!(rows(&a), rows(&b), "{sql}"),
-            (Err(_), Err(_)) => {}
-            (Ok(_), Err(e)) => panic!("workers=2 failed {sql}: {e}"),
-            (Err(e), Ok(_)) => panic!("pull failed {sql}: {e}"),
-        }
+        // Every case is valid SQL, so both modes must succeed.
+        let a = pull
+            .execute_sql(sql)
+            .unwrap_or_else(|e| panic!("pull failed {sql}: {e}"));
+        let b = staged
+            .execute_sql(sql)
+            .unwrap_or_else(|e| panic!("workers=2 failed {sql}: {e}"));
+        assert_eq!(rows(&a), rows(&b), "{sql}");
     }
 }
 
