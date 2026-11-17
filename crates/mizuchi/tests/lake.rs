@@ -440,6 +440,7 @@ fn merge_update_star_uses_source_and_fails_closed() {
     assert!(err.to_string().contains("column not found"), "{err}");
 }
 
+#[cfg(unix)]
 #[test]
 fn merge_delta_conflict_restores_session_table() {
     use std::os::unix::fs::PermissionsExt;
