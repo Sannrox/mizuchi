@@ -201,11 +201,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Pushes the staging tag only; publish moves the version tag to this
+      # digest after attestation and the draft, so a re-run cannot move it.
       - name: Build, push, and save
         id: push
         env:
           TAG: ${{ needs.verify-tag.outputs.tag }}
-        run: bash scripts/release/image.sh "$TAG" dist >>"$GITHUB_OUTPUT"
+        run: bash scripts/release/image.sh push "$TAG" dist >>"$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: container-image
@@ -338,6 +340,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -385,6 +388,18 @@ jobs:
           bash scripts/release/github-release.sh draft "$TAG" "$SHA" dist/RELEASE_NOTES.md
           dist/*.tar.gz dist/*.whl dist/mizuchi.cdx.json dist/mizuchi-release.json
           dist/mizuchi-tenkai.toml dist/SHA256SUMS
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The version tag names the attested digest only once the draft exists,
+      # and image.sh refuses to move it to another digest.
+      - name: Tag the attested image
+        env:
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: bash scripts/release/image.sh promote "$TAG" "$DIGEST"
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

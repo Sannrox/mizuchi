@@ -175,6 +175,28 @@ class Release(unittest.TestCase):
             self.assertEqual(steps[i]["env"]["SHA"], VERIFIED_SHA)
             self.assertIn('"$TAG" "$SHA"', steps[i]["run"])
 
+    def test_version_tag_is_applied_only_after_attestation_and_the_draft(self):
+        push = [
+            (name, s) for name, job in self.jobs.items() for s in job["steps"]
+            if "scripts/release/image.sh push" in runs(s)
+        ]
+        self.assertEqual([name for name, _ in push], ["image"])
+        promote = [
+            (name, i) for name, job in self.jobs.items() for i, s in enumerate(job["steps"])
+            if "scripts/release/image.sh promote" in runs(s)
+        ]
+        self.assertEqual([name for name, _ in promote], ["publish"])
+        self.assertLessEqual({"image", "attest"}, needs(self.jobs["publish"]))
+        steps = self.jobs["publish"]["steps"]
+        [(_, tag)] = promote
+        draft = index(steps, lambda s: "github-release.sh draft" in runs(s))
+        publish = index(steps, lambda s: "github-release.sh publish" in runs(s))
+        self.assertLess(draft, tag)
+        self.assertLess(tag, publish)
+        self.assertEqual(steps[tag]["env"]["TAG"], VERIFIED_TAG)
+        self.assertEqual(steps[tag]["env"]["DIGEST"], "${{ needs.image.outputs.digest }}")
+        self.assertIn('promote "$TAG" "$DIGEST"', runs(steps[tag]))
+
     def test_publish_runs_last_after_every_asset_job(self):
         self.assertLessEqual({"source", "wheels", "image", "attest"}, needs(self.jobs["publish"]))
         self.assertFalse(any("publish" in needs(job) for job in self.jobs.values()))
@@ -204,7 +226,7 @@ class Release(unittest.TestCase):
         }
         self.assertEqual(
             {name: perms for name, perms in writers.items() if perms},
-            {"image": {"packages"}, "attest": {"id-token", "attestations"}, "publish": {"contents"}},
+            {"image": {"packages"}, "attest": {"id-token", "attestations"}, "publish": {"contents", "packages"}},
         )
 
 
