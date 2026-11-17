@@ -1,11 +1,13 @@
 //! Per-owner memory and worker shares on one engine.
 //!
-//! Shares are reserved when a session is opened. Under contention each owner
-//! is capped at its share, so concurrent owners cannot starve each other.
+//! Shares are reserved when a session is opened and released when the last
+//! session of that owner (and every clone of it) is dropped. Under contention
+//! each owner is capped at its share, so concurrent owners cannot starve
+//! each other.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::Session;
 use crate::memory::Budget;
@@ -15,7 +17,9 @@ use mizuchi_core::error::{Error, Result};
 struct Owner {
     memory: u64,
     workers: usize,
-    budget: Arc<Budget>,
+    /// Held strongly only by the owner's sessions, so the share is reserved
+    /// exactly while one of them is alive.
+    budget: Weak<Budget>,
 }
 
 #[derive(Debug)]
@@ -55,8 +59,11 @@ impl Engine {
 
     /// Open a session for `owner` with a reserved memory and worker share.
     ///
-    /// Repeating the same owner and shares reuses the budget. A second owner
-    /// whose shares would exceed the engine totals fails closed.
+    /// While a session of `owner` is alive, repeating the same shares reuses
+    /// its budget and different shares fail. Once every session of the owner
+    /// is dropped its share returns to the engine, and the owner may come
+    /// back with any share. An owner whose shares would exceed the engine
+    /// totals fails closed.
     pub fn session(
         &self,
         owner: impl Into<String>,
@@ -80,14 +87,18 @@ impl Engine {
                 .owners
                 .lock()
                 .map_err(|_| Error::Plan("engine lock poisoned".into()))?;
-            if let Some(existing) = owners.get(&owner) {
+            // Owners with no live session hold no share.
+            owners.retain(|_, o| o.budget.strong_count() > 0);
+            if let Some(existing) = owners.get(&owner)
+                && let Some(budget) = existing.budget.upgrade()
+            {
                 if existing.memory != memory || existing.workers != workers {
                     return Err(Error::Plan(format!(
                         "owner {owner} already has memory {} workers {}",
                         existing.memory, existing.workers
                     )));
                 }
-                existing.budget.clone()
+                budget
             } else {
                 let used_mem: u64 = owners.values().map(|o| o.memory).sum();
                 let used_workers: usize = owners.values().map(|o| o.workers).sum();
@@ -114,7 +125,7 @@ impl Engine {
                     Owner {
                         memory,
                         workers,
-                        budget: budget.clone(),
+                        budget: Arc::downgrade(&budget),
                     },
                 );
                 budget
@@ -169,11 +180,30 @@ mod tests {
     #[test]
     fn shares_that_exceed_engine_fail_closed() {
         let engine = Engine::new(1000, 2).unwrap();
-        engine.session("a", 600, 1).unwrap();
+        let _a = engine.session("a", 600, 1).unwrap();
         let err = engine.session("b", 500, 1).unwrap_err();
         assert!(matches!(err, Error::Memory(_)), "{err:?}");
         let err = engine.session("c", 100, 2).unwrap_err();
         assert!(matches!(err, Error::Plan(_)), "{err:?}");
+    }
+
+    #[test]
+    fn dropped_owners_return_their_shares() {
+        let engine = Engine::new(1000, 2).unwrap();
+        for n in 0..50 {
+            let session = engine.session(format!("owner-{n}"), 600, 1).unwrap();
+            let clone = session.clone();
+            drop(session);
+            // A clone still holds the share.
+            let err = engine.session("other", 600, 1).unwrap_err();
+            assert!(matches!(err, Error::Memory(_)), "{err:?}");
+            drop(clone);
+        }
+        // Every share came back: one owner can take the whole engine.
+        let all = engine.session("all", 1000, 2).unwrap();
+        drop(all);
+        // A returning owner is not tied to its old share.
+        engine.session("owner-0", 1000, 2).unwrap();
     }
 
     #[test]
@@ -219,8 +249,8 @@ mod tests {
     #[test]
     fn same_owner_reuses_share() {
         let engine = Engine::new(1000, 2).unwrap();
-        let _ = engine.session("a", 400, 1).unwrap();
-        let _ = engine.session("a", 400, 1).unwrap();
+        let _first = engine.session("a", 400, 1).unwrap();
+        let _second = engine.session("a", 400, 1).unwrap();
         let err = engine.session("a", 500, 1).unwrap_err();
         assert!(matches!(err, Error::Plan(_)), "{err:?}");
     }
