@@ -24,7 +24,7 @@ pub use bind::{bind_merge_at, plan_sql_at, unix_micros_now};
 pub use catalog::normalize_name;
 pub use catalog::{
     AlterTable, Catalog, CatalogProvider, DEFAULT_CATALOG, DEFAULT_NAMESPACE, Ddl, NamespaceIdent,
-    TableIdent, TableMeta, apply_alter,
+    SkippedEntry, TableIdent, TableMeta, apply_alter,
 };
 pub use iceberg_rest::{IcebergRestCatalog, spawn_memory_server};
 pub use stats::{ColumnStats, TableStats, inner_equi_rows, table_stats_from_batches};
