@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Start a local S3-compatible emulator and create $MIZUCHI_S3_BUCKET.
 # Docker Hub no longer serves minio/minio; alpine/minio is a public rebuild.
+#
+# The port is published only on the endpoint's host (loopback by default).
+# Rerunning replaces the container named $MIZUCHI_S3_CONTAINER; give parallel
+# runs on one machine distinct names and endpoint ports.
 set -euo pipefail
 
 endpoint="${MIZUCHI_S3_ENDPOINT:-http://127.0.0.1:9000}"
@@ -10,8 +14,18 @@ secret="${MIZUCHI_S3_SECRET_KEY:-minioadmin}"
 host="${endpoint#http://}"
 host="${host#https://}"
 host="${host%/}"
+name="${MIZUCHI_S3_CONTAINER:-mizuchi-s3-emulator}"
+bind="${host%:*}"
+port="${host##*:}"
+if [ "$bind" = "$host" ]; then
+  port=80
+fi
+if [ "$bind" = localhost ]; then
+  bind=127.0.0.1
+fi
 
-docker run -d --name minio -p 9000:9000 \
+docker rm -f "$name" >/dev/null 2>&1 || true
+docker run -d --name "$name" -p "${bind}:${port}:9000" \
   -e MINIO_ROOT_USER="$access" \
   -e MINIO_ROOT_PASSWORD="$secret" \
   alpine/minio:RELEASE.2025-10-15T17-29-55Z server /home/minio/data
