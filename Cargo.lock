@@ -1617,6 +1617,7 @@ dependencies = [
  "object_store",
  "parquet",
  "postgres",
+ "serde_json",
  "tokio",
 ]
 
