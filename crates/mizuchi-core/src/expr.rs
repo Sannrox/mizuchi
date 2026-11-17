@@ -395,6 +395,10 @@ fn align_numeric(array: &ArrayRef, dt: &DataType) -> Result<ArrayRef> {
     }
 }
 
+/// Casts both comparison operands to a common numeric type, the way
+/// `numeric_arith_type` does for arithmetic: float pairs to Float64, decimal
+/// pairs to their common decimal, mixed integer widths to Int64. A UInt64
+/// above `i64::MAX` fails the strict cast rather than compare wrongly.
 fn align_cmp(left: &ArrayRef, right: &ArrayRef) -> Result<(ArrayRef, ArrayRef)> {
     let l = left.data_type();
     let r = right.data_type();
@@ -405,6 +409,8 @@ fn align_cmp(left: &ArrayRef, right: &ArrayRef) -> Result<(ArrayRef, ArrayRef)> 
         DataType::Float64
     } else if let Some(dt) = widen_decimal(l, r) {
         dt?
+    } else if l.is_integer() && r.is_integer() {
+        DataType::Int64
     } else {
         // Dictionary Utf8 versus Utf8 (and other equal-width pairs) go to
         // Arrow comparison kernels as-is. Arrow 60 compares those without
@@ -565,6 +571,7 @@ fn eval_case(
                     )
                     .map_err(eval_err)?
                 };
+                let (op, when_array) = align_cmp(&op, &when_array)?;
                 Arc::new(eq(&op, &when_array).map_err(eval_err)?) as ArrayRef
             }
             None => when_array,
@@ -1152,6 +1159,52 @@ mod tests {
         assert_eq!(
             i64_values(&coalesced.eval(&batch).unwrap()),
             vec![Some(1), Some(99), Some(3)]
+        );
+    }
+
+    #[test]
+    fn comparisons_and_simple_case_align_integer_widths() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let batch = Batch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3), None])),
+                Arc::new(Int64Array::from(vec![Some(2), Some(2), Some(2), Some(2)])),
+            ],
+        )
+        .unwrap();
+        let cmp = |op| {
+            let e = Expr::Binary(op, Box::new(Expr::column("a")), Box::new(Expr::column("b")));
+            bool_values(&e.eval(&batch).unwrap())
+        };
+        let (t, f) = (Some(true), Some(false));
+        assert_eq!(cmp(BinaryOp::Eq), vec![f, t, f, None]);
+        assert_eq!(cmp(BinaryOp::NotEq), vec![t, f, t, None]);
+        assert_eq!(cmp(BinaryOp::Lt), vec![t, f, f, None]);
+        assert_eq!(cmp(BinaryOp::LtEq), vec![t, t, f, None]);
+        assert_eq!(cmp(BinaryOp::Gt), vec![f, f, t, None]);
+        assert_eq!(cmp(BinaryOp::GtEq), vec![f, t, t, None]);
+
+        // Int32 operand against Int64 WHEN values.
+        let simple_case = Expr::Case {
+            operand: Some(Box::new(Expr::column("a"))),
+            when_then: vec![
+                (Expr::lit_i64(1), Expr::lit_utf8("one")),
+                (Expr::column("b"), Expr::lit_utf8("b")),
+            ],
+            else_expr: Some(Box::new(Expr::lit_utf8("other"))),
+        };
+        assert_eq!(
+            utf8_values(&simple_case.eval(&batch).unwrap()),
+            vec![
+                Some("one".into()),
+                Some("b".into()),
+                Some("other".into()),
+                Some("other".into())
+            ]
         );
     }
 
