@@ -9,7 +9,7 @@ use arrow::datatypes::SchemaRef;
 
 use super::key::{Scalar, extract_key};
 use super::memory::{self, MemoryPool};
-use super::{Session, collect, filter_batch, physical};
+use super::{CancelToken, Session, collect, filter_batch, physical};
 use mizuchi_core::batch::Batch;
 use mizuchi_core::error::{Error, Result};
 use mizuchi_core::expr::Expr;
@@ -49,7 +49,7 @@ pub(super) fn run(session: &Session, plan: &MergePlan) -> Result<(Vec<Batch>, Me
     let work = memory::batch_bytes(&target).saturating_add(memory::batch_bytes(&source));
     let _work_hold = pool.try_reserve(work)?;
     let matched_schema = join_schema(&plan.target_schema, &plan.source_schema);
-    let rows = match_rows(&target, &source, &plan.on_ts)?;
+    let rows = match_rows(&target, &source, &plan.on_ts, &pool, &session.exec_token())?;
 
     let mut stats = MergeStats {
         table: plan.target.clone(),
@@ -150,8 +150,19 @@ struct RowMatch {
     s_un: Vec<u32>,
 }
 
-fn match_rows(target: &Batch, source: &Batch, on: &Expr) -> Result<RowMatch> {
+/// Pairs target and source rows that satisfy `on`. Equality keys, when `on`
+/// has them, narrow each target row to its hash candidates; without them
+/// every source row is a candidate. Either way `on` is evaluated once per
+/// target row over all its candidates, not once per pair.
+fn match_rows(
+    target: &Batch,
+    source: &Batch,
+    on: &Expr,
+    pool: &MemoryPool,
+    cancel: &CancelToken,
+) -> Result<RowMatch> {
     let n_t = target.num_columns();
+    let schema = join_schema(&target.schema(), &source.schema());
     let pairs = super::join::equi_key_pairs(on, n_t)?;
     let mut t_hit = vec![false; target.num_rows()];
     let mut s_hit = vec![false; source.num_rows()];
@@ -160,12 +171,8 @@ fn match_rows(target: &Batch, source: &Batch, on: &Expr) -> Result<RowMatch> {
 
     if pairs.is_empty() {
         for trow in 0..target.num_rows() {
-            let mut hits = Vec::new();
-            for srow in 0..source.num_rows() {
-                if pair_matches(target, source, trow, srow, on)? {
-                    hits.push(srow as u32);
-                }
-            }
+            cancel.check()?;
+            let hits = row_matches(target, source, trow, None, &schema, on, pool)?;
             push_match(
                 trow as u32,
                 &hits,
@@ -193,16 +200,13 @@ fn match_rows(target: &Batch, source: &Batch, on: &Expr) -> Result<RowMatch> {
             table.entry(key).or_default().push(srow as u32);
         }
         for trow in 0..target.num_rows() {
+            cancel.check()?;
             let key = extract_key(&tkeys, trow)?;
             let mut hits = Vec::new();
             if !key.iter().any(|s| matches!(s, Scalar::Null))
                 && let Some(cands) = table.get(&key)
             {
-                for &srow in cands {
-                    if pair_matches(target, source, trow, srow as usize, on)? {
-                        hits.push(srow);
-                    }
-                }
+                hits = row_matches(target, source, trow, Some(cands), &schema, on, pool)?;
             }
             push_match(
                 trow as u32,
@@ -251,24 +255,62 @@ fn push_match(
     Ok(())
 }
 
-fn pair_matches(
+/// Source rows among `candidates` (all of them for `None`) that satisfy
+/// `on` with target row `trow`. Builds one batch of the target row repeated
+/// beside the candidates and evaluates `on` over it; the arrays built for it
+/// are reserved from `pool` while it lives.
+fn row_matches(
     target: &Batch,
     source: &Batch,
     trow: usize,
-    srow: usize,
+    candidates: Option<&[u32]>,
+    schema: &SchemaRef,
     on: &Expr,
-) -> Result<bool> {
-    let schema = join_schema(&target.schema(), &source.schema());
-    let joined = match take_join(target, source, &[trow as u32], &[srow as u32], schema)? {
-        Some(b) => b,
-        None => return Ok(false),
+    pool: &MemoryPool,
+) -> Result<Vec<u32>> {
+    let n = candidates.map_or(source.num_rows(), <[u32]>::len);
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let take_all = |batch: &Batch, idx: &UInt32Array| -> Result<Vec<ArrayRef>> {
+        batch
+            .as_arrow()
+            .columns()
+            .iter()
+            .map(|c| take(c.as_ref(), idx, None).map_err(|e| Error::Eval(e.to_string())))
+            .collect()
     };
+    let mut cols = take_all(target, &UInt32Array::from(vec![trow as u32; n]))?;
+    let mut built = cols.len();
+    match candidates {
+        Some(rows) => {
+            cols.extend(take_all(source, &UInt32Array::from(rows.to_vec()))?);
+            built = cols.len();
+        }
+        None => cols.extend(source.as_arrow().columns().iter().cloned()),
+    }
+    let bytes = cols[..built]
+        .iter()
+        .map(|c| c.get_array_memory_size() as u64)
+        .fold(0u64, u64::saturating_add);
+    let _hold = pool.try_reserve(bytes)?;
+    let joined = Batch::try_new(schema.clone(), cols)?;
     let mask = on.eval(&joined)?;
     let bools = mask
         .as_any()
         .downcast_ref::<BooleanArray>()
         .ok_or_else(|| Error::Eval("MERGE ON is not boolean".into()))?;
-    Ok(!bools.is_null(0) && bools.value(0))
+    if bools.len() != n && bools.len() != 1 {
+        return Err(Error::Eval(
+            "MERGE ON returned the wrong number of rows".into(),
+        ));
+    }
+    // A constant condition may come back as a single value for every row.
+    let at = |i: usize| if bools.len() == 1 { 0 } else { i };
+    Ok((0..n)
+        .filter(|&i| bools.is_valid(at(i)) && bools.value(at(i)))
+        .map(|i| candidates.map_or(i as u32, |rows| rows[i]))
+        .collect())
 }
 
 fn take_join(

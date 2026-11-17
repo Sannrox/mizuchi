@@ -86,3 +86,59 @@ SELECT id, v FROM ti
 ----
 1
 10
+
+# An ON without equality keys matches each target row against every source row.
+
+statement ok
+CREATE TABLE tr (id INT, v INT)
+
+statement ok
+INSERT INTO tr VALUES (1, 10), (5, 50), (9, 90)
+
+statement ok
+CREATE TABLE sr (lo INT, hi INT, v INT)
+
+statement ok
+INSERT INTO sr VALUES (0, 3, 11), (4, 6, 55), (20, 30, 0)
+
+statement ok
+MERGE INTO tr USING sr ON tr.id >= sr.lo AND tr.id <= sr.hi
+WHEN MATCHED THEN UPDATE SET v = sr.v
+WHEN NOT MATCHED THEN INSERT (id, v) VALUES (sr.lo, sr.v)
+WHEN NOT MATCHED BY SOURCE THEN DELETE
+
+query II rowsort
+SELECT id, v FROM tr
+----
+1
+11
+20
+0
+5
+55
+
+# An equality key with a residual condition checks the residual per candidate.
+
+statement ok
+CREATE TABLE tq (id INT, v INT)
+
+statement ok
+INSERT INTO tq VALUES (1, 10), (2, 20)
+
+statement ok
+CREATE TABLE sq (id INT, v INT)
+
+statement ok
+INSERT INTO sq VALUES (1, 5), (1, 15), (2, 1)
+
+statement ok
+MERGE INTO tq USING sq ON tq.id = sq.id AND sq.v > tq.v
+WHEN MATCHED THEN UPDATE SET v = sq.v
+
+query II rowsort
+SELECT id, v FROM tq
+----
+1
+15
+2
+20

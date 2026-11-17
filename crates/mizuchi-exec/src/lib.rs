@@ -5926,6 +5926,35 @@ mod tests {
         assert!(matches!(err, Err(Error::Cancelled)), "{err:?}");
     }
 
+    /// A MERGE whose ON has no equality keys compares every target row with
+    /// every source row; cancelling it stops it between target rows.
+    #[test]
+    fn cancel_stops_a_merge_without_equality_keys() {
+        let token = CancelToken::new();
+        let (schema, target) = numbered_batches(50, 1000, 0);
+        let (_, source) = numbered_batches(50, 1000, 0);
+        let mut s = Session::new();
+        s.register("t", schema.clone(), target).unwrap();
+        s.register("s", schema, source).unwrap();
+        let mut s = s.with_cancel(token.clone());
+        let started = std::time::Instant::now();
+        let handle = std::thread::spawn(move || {
+            s.merge_sql(
+                "MERGE INTO t USING s ON t.a > s.a + 1000000 \
+                 WHEN NOT MATCHED THEN INSERT *",
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        token.cancel();
+        let result = handle.join().expect("merge thread");
+        let elapsed = started.elapsed();
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "cancel took {elapsed:?}"
+        );
+    }
+
     #[test]
     fn cancel_stops_a_running_query() {
         let token = CancelToken::new();
