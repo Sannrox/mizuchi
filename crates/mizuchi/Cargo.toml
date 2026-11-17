@@ -44,6 +44,7 @@ arrow = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
+serde_json = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

@@ -14,6 +14,33 @@ fn read(rel: &str) -> String {
     fs::read_to_string(root().join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
 }
 
+/// Body of the `## <name> ...` section: the heading's first word must equal
+/// `name`, and the body ends at the next `## ` heading (`###` stays inside).
+fn section<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let is_h2 = |line: &str| line.starts_with("## ");
+    let mut offset = 0;
+    let mut start = None;
+    for line in text.split_inclusive('\n') {
+        let end = offset + line.len();
+        if is_h2(line) {
+            if start.is_some() {
+                return start.map(|s| &text[s..offset]);
+            }
+            if line[3..].split_whitespace().next() == Some(name) {
+                start = Some(end);
+            }
+        }
+        offset = end;
+    }
+    start.map(|s| &text[s..])
+}
+
+/// The top-level `workers` count of a bench baseline, if it is an integer.
+fn baseline_workers(json: &str) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    value.get("workers")?.as_u64()
+}
+
 #[test]
 fn methodology_records_hardware_and_method() {
     let text = read("docs/bench/methodology.md");
@@ -56,11 +83,7 @@ fn results_table_covers_sf1_and_sf10() {
         );
     }
     assert!(text.contains("ratio"), "results missing ratio column");
-    let sf1 = text
-        .split("## sf1")
-        .nth(1)
-        .and_then(|rest| rest.split("## ").next())
-        .expect("sf1 section");
+    let sf1 = section(&text, "sf1").expect("sf1 section");
     for q in ["tpch_q1", "tpch_q3", "tpch_q6", "tpcds_store_sales"] {
         let line = sf1
             .lines()
@@ -174,10 +197,10 @@ fn harness_and_optional_workflow_exist() {
         check.contains("workers > 1"),
         "regression check must reject a 1-worker mizuchi run"
     );
-    let baseline = read("docs/bench/baseline.json");
+    let workers = baseline_workers(&read("docs/bench/baseline.json"));
     assert!(
-        baseline.contains("\"workers\": 2") || baseline.contains("\"workers\":2"),
-        "baseline.json must record workers > 1"
+        workers.is_some_and(|w| w > 1),
+        "baseline.json must record workers > 1, got {workers:?}"
     );
     let profile = read("scripts/profile-suite.sh");
     assert!(profile.contains("gb_bench"));
@@ -235,4 +258,22 @@ fn regression_check_rejects_single_worker_mizuchi_run() {
         err.contains("parallel path") || err.contains("workers > 1"),
         "stderr: {err}"
     );
+}
+
+#[test]
+fn baseline_workers_reads_the_top_level_count() {
+    let baseline = |workers: &str| format!(r#"{{"workers": {workers}, "tiny": {{"workers": 9}}}}"#);
+    assert_eq!(baseline_workers(&baseline("4")), Some(4));
+    assert_eq!(baseline_workers(&baseline("1")), Some(1));
+    assert_eq!(baseline_workers(&baseline("20")), Some(20));
+    assert_eq!(baseline_workers(r#"{"tiny": {"workers": 4}}"#), None);
+}
+
+#[test]
+fn section_matches_the_exact_heading_and_keeps_subsections() {
+    let text = "## sf10 (big)\nten\n## sf1 (small)\none\n### detail\nmore\n## next\nafter\n";
+    assert_eq!(section(text, "sf1"), Some("one\n### detail\nmore\n"));
+    assert_eq!(section(text, "sf10"), Some("ten\n"));
+    assert_eq!(section(text, "next"), Some("after\n"));
+    assert_eq!(section(text, "sf"), None);
 }
