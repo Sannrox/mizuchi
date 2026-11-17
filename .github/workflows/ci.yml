@@ -42,6 +42,11 @@ jobs:
       # it cannot rot unnoticed.
       - name: Check live PostgreSQL test
         run: cargo check --locked -p mizuchi --test postgres --features postgres
+      # mizuchi-flight is outside the default members and its cluster tests
+      # (fencing, resume) only run on dispatch in flight.yml; compile the
+      # crate and every flight-gated target here so they cannot rot unnoticed.
+      - name: Check Flight crate and tests
+        run: cargo check --locked -p mizuchi -p mizuchi-flight --all-targets --features mizuchi/flight
 
   fmt:
     name: Rustfmt
