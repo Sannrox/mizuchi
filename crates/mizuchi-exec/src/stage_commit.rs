@@ -183,22 +183,26 @@ impl StageCommits {
     }
 
     /// Publishes `contents` at `target` with an exclusive hard link from a
-    /// synced staging file. False when `target` already exists.
+    /// synced staging file. False when `target` already exists. The staging
+    /// file is removed on every exit; its name is unique to this call.
     fn publish(&self, target: &Path, contents: &str) -> Result<bool> {
         let staged = self
             .root
             .join(format!(".{}.tmp", writer_id(self.generation)));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staged)
-            .map_err(|e| io(&staged, e))?;
-        file.write_all(contents.as_bytes())
-            .and_then(|()| file.sync_all())
-            .map_err(|e| io(&staged, e))?;
-        let linked = std::fs::hard_link(&staged, target);
+        let linked = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged)
+                .map_err(|e| io(&staged, e))?;
+            file.write_all(contents.as_bytes())
+                .and_then(|()| fault(Fault::Publish))
+                .and_then(|()| file.sync_all())
+                .map_err(|e| io(&staged, e))?;
+            Ok(std::fs::hard_link(&staged, target))
+        })();
         let _ = std::fs::remove_file(&staged);
-        match linked {
+        match linked? {
             Ok(()) => sync_dir(&self.root).map(|()| true),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
             Err(e) => Err(io(target, e)),
@@ -258,6 +262,7 @@ impl StageCommits {
 
     /// Writes `batches` as `stage`'s output for `definition` and commits it
     /// for this generation. A commit this generation already made stands.
+    /// The output file is removed unless this call's record names it.
     pub fn commit(&self, stage: usize, definition: &str, batches: &[Batch]) -> Result<()> {
         let (output, digest) = match batches.first() {
             None => ("empty".to_string(), "empty".to_string()),
@@ -268,22 +273,61 @@ impl StageCommits {
                     writer_id(self.generation)
                 );
                 let path = self.root.join(&output);
-                write_spill(&path, first.schema(), batches)?;
-                std::fs::File::open(&path)
-                    .and_then(|file| file.sync_all())
-                    .map_err(|e| io(&path, e))?;
-                let bytes = std::fs::read(&path).map_err(|e| io(&path, e))?;
-                (output, hex(&Sha256::digest(&bytes)))
+                let digest = write_spill(&path, first.schema(), batches).and_then(|()| {
+                    std::fs::File::open(&path)
+                        .and_then(|file| fault(Fault::Output).and_then(|()| file.sync_all()))
+                        .and_then(|()| std::fs::read(&path))
+                        .map(|bytes| hex(&Sha256::digest(&bytes)))
+                        .map_err(|e| io(&path, e))
+                });
+                match digest {
+                    Ok(digest) => (output, digest),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&path);
+                        return Err(e);
+                    }
+                }
             }
         };
         let record = self.root.join(Self::record_name(stage, self.generation));
         let defined = hex(&Sha256::digest(definition.as_bytes()));
-        if !self.publish(&record, &format!("{output}\n{digest}\n{defined}\n"))? && output != "empty"
-        {
+        let published = self.publish(&record, &format!("{output}\n{digest}\n{defined}\n"));
+        // A publish that failed after its link (syncing the directory) may
+        // still have published this output; keep it whenever the record
+        // names it, and remove it otherwise.
+        let ours = match &published {
+            Ok(linked) => *linked,
+            Err(_) => std::fs::read_to_string(&record)
+                .is_ok_and(|text| text.lines().next() == Some(output.as_str())),
+        };
+        if !ours && output != "empty" {
             let _ = std::fs::remove_file(self.root.join(&output));
         }
-        Ok(())
+        published.map(|_| ())
     }
+}
+
+/// Points where a test injects a write failure.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Fault {
+    Publish,
+    Output,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAULT: std::cell::Cell<Option<Fault>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fails with an injected error at `point` when a test on this thread asked
+/// for it; always succeeds outside tests.
+fn fault(point: Fault) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAULT.with(std::cell::Cell::get) == Some(point) {
+        return Err(std::io::Error::other(format!("injected {point:?} failure")));
+    }
+    let _ = point;
+    Ok(())
 }
 
 /// Unique per process, call and moment, so staging files never collide.
@@ -494,5 +538,53 @@ mod tests {
             assert!(StageCommits::open(&dir, id, 1).is_err(), "{id:?}");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every file name in a query directory.
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_staging_or_output_file() {
+        for point in [Fault::Publish, Fault::Output] {
+            let spill = spill();
+            let commits = StageCommits::open(&spill, "q", 1).unwrap();
+            let root = spill.join("queries").join("q");
+            let before = listing(&root);
+            FAULT.with(|f| f.set(Some(point)));
+            let err = commits.commit(0, "scan", &batches(&[1, 2]));
+            FAULT.with(|f| f.set(None));
+            assert!(err.is_err(), "{point:?}");
+            assert_eq!(listing(&root), before, "{point:?}");
+            assert_eq!(
+                commits.committed(0, "scan").unwrap().map(|b| values(&b)),
+                None
+            );
+            // The stage commits normally once the fault clears.
+            commits.commit(0, "scan", &batches(&[1, 2])).unwrap();
+            let out = commits.committed(0, "scan").unwrap().unwrap();
+            assert_eq!(values(&out), vec![1, 2]);
+            let _ = std::fs::remove_dir_all(&spill);
+        }
+    }
+
+    #[test]
+    fn a_losing_commit_removes_its_output() {
+        let spill = spill();
+        let commits = StageCommits::open(&spill, "q", 1).unwrap();
+        commits.commit(0, "scan", &batches(&[1])).unwrap();
+        let root = spill.join("queries").join("q");
+        let before = listing(&root);
+        commits.commit(0, "scan", &batches(&[2])).unwrap();
+        assert_eq!(listing(&root), before);
+        let out = commits.committed(0, "scan").unwrap().unwrap();
+        assert_eq!(values(&out), vec![1]);
+        let _ = std::fs::remove_dir_all(&spill);
     }
 }
