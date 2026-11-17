@@ -50,12 +50,11 @@ pub fn estimate_rows(plan: &LogicalPlan) -> Option<f64> {
         LogicalPlan::Project { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Window { input, .. } => estimate_rows(input),
-        LogicalPlan::Limit { input, fetch, .. } => {
-            let rows = estimate_rows(input)?;
-            Some(match fetch {
-                Some(n) => rows.min(*n as f64),
-                None => rows,
-            })
+        LogicalPlan::Limit { input, skip, fetch } => {
+            // OFFSET drops rows before FETCH caps what is left.
+            let rows = (estimate_rows(input)? - *skip as f64).max(0.0);
+            let rows = fetch.map_or(rows, |n| rows.min(n as f64));
+            Some(rows.max(1.0))
         }
         LogicalPlan::Join {
             left,
@@ -2702,6 +2701,23 @@ mod tests {
             join_type,
             on,
         }
+    }
+
+    #[test]
+    fn limit_estimate_subtracts_the_offset() {
+        let est = |skip, fetch| {
+            let plan = LogicalPlan::Limit {
+                input: Box::new(stats_scan("t", 100, 10)),
+                skip,
+                fetch,
+            };
+            estimate_rows(&plan).unwrap()
+        };
+        assert_eq!(est(0, Some(10)), 10.0);
+        assert_eq!(est(95, Some(10)), 5.0);
+        assert_eq!(est(95, None), 5.0);
+        // Past the end the estimate floors at one row like the others.
+        assert_eq!(est(500, Some(10)), 1.0);
     }
 
     #[test]
