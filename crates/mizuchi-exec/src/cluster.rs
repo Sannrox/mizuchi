@@ -59,7 +59,37 @@ impl Default for ClusterConfig {
 
 struct Slot {
     id: usize,
-    idle: bool,
+    /// Live sessions sized from this slot. Release and scale-down take
+    /// only slots with no holders.
+    holders: usize,
+}
+
+/// The slots one [`Cluster::session`] was sized from. The session (and its
+/// clones) keep them busy; dropping the last copy makes them idle again.
+pub(crate) struct SlotHold {
+    cluster: Cluster,
+    ids: Vec<usize>,
+}
+
+impl std::fmt::Debug for SlotHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlotHold").field("ids", &self.ids).finish()
+    }
+}
+
+impl Drop for SlotHold {
+    fn drop(&mut self) {
+        // A poisoned lock still holds valid counts; releasing is always safe.
+        let mut slots = self
+            .cluster
+            .inner
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for slot in slots.iter_mut().filter(|s| self.ids.contains(&s.id)) {
+            slot.holders = slot.holders.saturating_sub(1);
+        }
+    }
 }
 
 struct Inner {
@@ -117,7 +147,7 @@ impl Cluster {
         }
         let mut slots = Vec::with_capacity(cfg.workers);
         for id in 0..cfg.workers {
-            slots.push(Slot { id, idle: true });
+            slots.push(Slot { id, holders: 0 });
         }
         Ok(Self {
             inner: Arc::new(Inner {
@@ -176,7 +206,7 @@ impl Cluster {
             .map_err(|_| Error::Plan("cluster lock poisoned".into()))?;
         let id = *next;
         *next += 1;
-        slots.push(Slot { id, idle: true });
+        slots.push(Slot { id, holders: 0 });
         Ok(WorkerResources {
             id,
             threads: self.inner.threads_per_worker,
@@ -189,12 +219,13 @@ impl Cluster {
         })
     }
 
-    /// Release idle workers down to `min_workers`. Returns how many left.
+    /// Release idle workers down to `min_workers`; slots held by a live
+    /// session stay. Returns how many left.
     pub fn release_idle(&self) -> Result<usize> {
         let mut slots = self.lock_slots()?;
         let mut released = 0usize;
         while slots.len() > self.inner.min_workers {
-            if let Some(i) = slots.iter().rposition(|s| s.idle) {
+            if let Some(i) = slots.iter().rposition(|s| s.holders == 0) {
                 slots.remove(i);
                 released += 1;
             } else {
@@ -204,7 +235,8 @@ impl Cluster {
         Ok(released)
     }
 
-    /// Grow or shrink toward `n`, honoring min/max.
+    /// Grow or shrink toward `n`, honoring min/max. Shrinking never takes a
+    /// slot held by a live session, so the result may stay above `n`.
     pub fn scale_to(&self, n: usize) -> Result<usize> {
         let n = n.clamp(self.inner.min_workers, self.inner.max_workers);
         while self.worker_count()? < n {
@@ -213,7 +245,7 @@ impl Cluster {
         if self.worker_count()? > n {
             let mut slots = self.lock_slots()?;
             while slots.len() > n {
-                if let Some(i) = slots.iter().rposition(|s| s.idle) {
+                if let Some(i) = slots.iter().rposition(|s| s.holders == 0) {
                     slots.remove(i);
                 } else {
                     break;
@@ -224,8 +256,19 @@ impl Cluster {
     }
 
     /// Open a session whose threads and memory equal the live worker grants.
+    /// The session holds those slots until it and its clones are dropped.
     pub fn session(&self) -> Result<Session> {
-        let n = self.worker_count()?;
+        let hold = {
+            let mut slots = self.lock_slots()?;
+            for slot in slots.iter_mut() {
+                slot.holders += 1;
+            }
+            SlotHold {
+                cluster: self.clone(),
+                ids: slots.iter().map(|s| s.id).collect(),
+            }
+        };
+        let n = hold.ids.len();
         let threads = n.saturating_mul(self.inner.threads_per_worker).max(1);
         let memory = (n as u64)
             .saturating_mul(self.inner.memory_per_worker)
@@ -236,7 +279,9 @@ impl Cluster {
         if let Some(dir) = &self.inner.spill_dir {
             session = session.with_spill_dir(dir.clone());
         }
-        Ok(session.with_speculate(self.inner.speculate))
+        let mut session = session.with_speculate(self.inner.speculate);
+        session.slot_hold = Some(Arc::new(hold));
+        Ok(session)
     }
 }
 
@@ -342,5 +387,32 @@ mod tests {
         assert_eq!(c.workers().unwrap().len(), 3);
         let s = c.session().unwrap();
         assert_eq!(s.workers(), 6);
+    }
+
+    #[test]
+    fn a_live_session_keeps_its_slots() {
+        let c = Cluster::standalone(ClusterConfig {
+            workers: 3,
+            min_workers: 1,
+            max_workers: 4,
+            ..ClusterConfig::default()
+        })
+        .unwrap();
+        let s = c.session().unwrap();
+        let copy = s.clone();
+        assert_eq!(c.release_idle().unwrap(), 0);
+        assert_eq!(c.scale_to(1).unwrap(), 3);
+        // A slot added after the session opened is not held by it.
+        c.add_worker().unwrap();
+        assert_eq!(c.release_idle().unwrap(), 1);
+        assert_eq!(c.worker_count().unwrap(), 3);
+        drop(s);
+        assert_eq!(
+            c.release_idle().unwrap(),
+            0,
+            "a clone still holds the slots"
+        );
+        drop(copy);
+        assert_eq!(c.scale_to(1).unwrap(), 1);
     }
 }
