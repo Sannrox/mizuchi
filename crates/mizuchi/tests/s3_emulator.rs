@@ -53,11 +53,13 @@ mod emulator {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use arrow::array::{Array, Int64Array};
-    use futures::TryStreamExt;
+    use arrow::array::{Array, Int64Array, StringArray};
     use futures::executor::block_on;
     use futures::stream::BoxStream;
+    use futures::{StreamExt, TryStreamExt};
     use mizuchi::{
         Batch, BinaryOp, DataType, Expr, Field, ObjectStore, ParquetReadOptions,
         ParquetWriteOptions, Schema, WriteMode, read_parquet_store, read_parquet_store_reported,
@@ -104,6 +106,57 @@ mod emulator {
         }
     }
 
+    /// A name unique to this process and call, so concurrent runs against one
+    /// bucket or catalog never share objects or tables.
+    fn unique(base: &str) -> String {
+        static SEQ: AtomicU64 = AtomicU64::new(1);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!(
+            "{base}_{}_{nanos}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// A per-run object prefix. Drop deletes every object under it, and on a
+    /// passing test asserts nothing is left.
+    struct RunPrefix {
+        store: Arc<dyn ObjectStore>,
+        name: String,
+    }
+
+    impl RunPrefix {
+        fn new(store: &Arc<dyn ObjectStore>, base: &str) -> Self {
+            Self {
+                store: Arc::clone(store),
+                name: unique(base),
+            }
+        }
+
+        fn as_str(&self) -> &str {
+            &self.name
+        }
+    }
+
+    impl Drop for RunPrefix {
+        fn drop(&mut self) {
+            let root = ObjectPath::from(self.name.as_str());
+            let locations = self.store.list(Some(&root)).map_ok(|m| m.location).boxed();
+            let deleted = block_on(self.store.delete_stream(locations).try_collect::<Vec<_>>());
+            if !std::thread::panicking() {
+                deleted.expect("delete run prefix");
+                assert!(
+                    list_keys(self.store.as_ref(), &self.name).is_empty(),
+                    "{} not cleaned up",
+                    self.name
+                );
+            }
+        }
+    }
+
     fn sample() -> Batch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("year", DataType::Int64, true),
@@ -133,6 +186,28 @@ mod emulator {
                     out.push(col.value(i));
                 }
             }
+        }
+        out.sort();
+        out
+    }
+
+    /// Sorted `(id, name)` rows.
+    fn id_names(batches: &[Batch]) -> Vec<(i64, String)> {
+        let mut out = Vec::new();
+        for b in batches {
+            let id = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let name = b
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            out.extend((0..b.num_rows()).map(|i| (id.value(i), name.value(i).to_string())));
         }
         out.sort();
         out
@@ -280,8 +355,10 @@ mod emulator {
     fn s3_emulator_round_trip_and_prune() {
         let live = connect();
         let store = live.store.as_ref();
-        write_year(store, "mizuchi-emu", &[sample()], WriteMode::Overwrite);
-        let out = read_parquet_store(store, "mizuchi-emu", ParquetReadOptions::default()).unwrap();
+        let prefix = RunPrefix::new(&live.store, "mizuchi-emu");
+        let prefix = prefix.as_str();
+        write_year(store, prefix, &[sample()], WriteMode::Overwrite);
+        let out = read_parquet_store(store, prefix, ParquetReadOptions::default()).unwrap();
         assert_eq!(ids(&out), vec![1, 2]);
 
         let pred = Expr::Binary(
@@ -293,11 +370,11 @@ mod emulator {
             filters: Some(std::slice::from_ref(&pred)),
             ..ParquetReadOptions::default()
         };
-        let (pruned, scan) = read_parquet_store_reported(store, "mizuchi-emu", opts).unwrap();
+        let (pruned, scan) = read_parquet_store_reported(store, prefix, opts).unwrap();
         assert_eq!(ids(&pruned), vec![1]);
         assert_eq!(scan.partitions, vec!["year=2020".to_string()]);
         assert!(
-            list_keys(store, "mizuchi-emu")
+            list_keys(store, prefix)
                 .iter()
                 .all(|k| !k.contains(".mizuchi-staging-")),
             "successful write must delete staging objects"
@@ -309,12 +386,11 @@ mod emulator {
     fn s3_emulator_failed_commit_cleans_staging() {
         let live = connect();
         let store = live.store.as_ref();
-        write_year(store, "mizuchi-emu-fail", &[sample()], WriteMode::Overwrite);
+        let prefix = RunPrefix::new(&live.store, "mizuchi-emu-fail");
+        let prefix = prefix.as_str();
+        write_year(store, prefix, &[sample()], WriteMode::Overwrite);
         let before =
-            ids(
-                &read_parquet_store(store, "mizuchi-emu-fail", ParquetReadOptions::default())
-                    .unwrap(),
-            );
+            ids(&read_parquet_store(store, prefix, ParquetReadOptions::default()).unwrap());
         assert_eq!(before, vec![1, 2]);
 
         let failing = FailPuts {
@@ -324,7 +400,7 @@ mod emulator {
         let cols = [String::from("year")];
         let err = write_parquet_store(
             &failing,
-            "mizuchi-emu-fail",
+            prefix,
             &[sample()],
             ParquetWriteOptions {
                 partition_by: &cols,
@@ -338,14 +414,10 @@ mod emulator {
             "{err}"
         );
 
-        let after =
-            ids(
-                &read_parquet_store(store, "mizuchi-emu-fail", ParquetReadOptions::default())
-                    .unwrap(),
-            );
+        let after = ids(&read_parquet_store(store, prefix, ParquetReadOptions::default()).unwrap());
         assert_eq!(after, before);
         assert!(
-            list_keys(store, "mizuchi-emu-fail")
+            list_keys(store, prefix)
                 .iter()
                 .all(|k| !k.contains(".mizuchi-staging-")),
             "failed write must delete staging objects"
@@ -362,6 +434,8 @@ mod emulator {
 
         let live = connect();
         let store = live.store.as_ref();
+        let delta = RunPrefix::new(&live.store, "emu-delta");
+        let ice = RunPrefix::new(&live.store, "emu-ice");
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, true),
             Field::new("name", DataType::Utf8, true),
@@ -374,41 +448,40 @@ mod emulator {
             ],
         )
         .unwrap();
+        let expected = vec![(1, "a".to_string()), (2, "b".to_string())];
         write_delta_store(
             store,
-            "emu-delta",
+            delta.as_str(),
             std::slice::from_ref(&batch),
             WriteMode::Overwrite,
         )
         .unwrap();
-        let got = read_delta_store(store, "emu-delta", TimeTravel::Latest).unwrap();
-        assert!(!got.is_empty());
-        write_iceberg_store(store, "emu-ice", &[batch], WriteMode::Overwrite).unwrap();
-        let got = read_iceberg_store(store, "emu-ice", TimeTravel::Latest).unwrap();
-        assert!(!got.is_empty());
+        let got = read_delta_store(store, delta.as_str(), TimeTravel::Latest).unwrap();
+        assert_eq!(id_names(&got), expected);
+        write_iceberg_store(store, ice.as_str(), &[batch], WriteMode::Overwrite).unwrap();
+        let got = read_iceberg_store(store, ice.as_str(), TimeTravel::Latest).unwrap();
+        assert_eq!(id_names(&got), expected);
 
-        let rest = std::env::var("MIZUCHI_ICEBERG_REST").ok();
-        if let Some(base) = rest {
-            let mut cat = IcebergRestCatalog::connect(&base, true).expect("rest catalog");
-            cat.create_table(TableMeta {
-                ident: TableIdent::parse("emu").unwrap(),
-                schema,
-                stats: mizuchi::TableStats::default(),
-            })
-            .unwrap();
-            assert!(CatalogProvider::get_table(&cat, &TableIdent::parse("emu").unwrap()).is_ok());
-        } else {
-            let (port, _h) = mizuchi::plan::spawn_memory_server().expect("rest listener");
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            let mut cat =
-                IcebergRestCatalog::connect(&format!("http://127.0.0.1:{port}"), true).unwrap();
-            cat.create_table(TableMeta {
-                ident: TableIdent::parse("emu").unwrap(),
-                schema,
-                stats: mizuchi::TableStats::default(),
-            })
-            .unwrap();
-            assert!(CatalogProvider::get_table(&cat, &TableIdent::parse("emu").unwrap()).is_ok());
-        }
+        // An external catalog outlives the run, so the table name is unique
+        // and dropped at the end; otherwise use an in-process memory server.
+        let (base, _server) = match std::env::var("MIZUCHI_ICEBERG_REST") {
+            Ok(base) => (base, None),
+            Err(_) => {
+                let (port, h) = mizuchi::plan::spawn_memory_server().expect("rest listener");
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                (format!("http://127.0.0.1:{port}"), Some(h))
+            }
+        };
+        let mut cat = IcebergRestCatalog::connect(&base, true).expect("rest catalog");
+        let ident = TableIdent::parse(&unique("emu")).unwrap();
+        cat.create_table(TableMeta {
+            ident: ident.clone(),
+            schema,
+            stats: mizuchi::TableStats::default(),
+        })
+        .unwrap();
+        assert!(CatalogProvider::get_table(&cat, &ident).is_ok());
+        cat.drop_table(&ident, false).unwrap();
+        assert!(CatalogProvider::get_table(&cat, &ident).is_err());
     }
 }
