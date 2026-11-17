@@ -67,6 +67,7 @@ fn worker(args: &[String]) -> Result<(), String> {
 
 fn coordinator(args: &[String]) -> Result<(), String> {
     let args = Flags::parse(args, &["--workers", "--lease-dir", "--holder", "--sql"])?;
+    let ttl = lease_ttl(env::var("MIZUCHI_LEASE_TTL_MS").ok().as_deref())?;
     let workers = args
         .get("--workers")
         .or_else(|| env::var("MIZUCHI_WORKERS").ok())
@@ -83,7 +84,7 @@ fn coordinator(args: &[String]) -> Result<(), String> {
         .or_else(|| env::var("MIZUCHI_LEASE_DIR").ok())
     {
         Some(dir) => {
-            let leadership = Arc::new(lead(&dir, &args)?);
+            let leadership = Arc::new(lead(&dir, &args, ttl)?);
             cluster = cluster.with_leadership(leadership.clone());
             Some(leadership)
         }
@@ -92,7 +93,7 @@ fn coordinator(args: &[String]) -> Result<(), String> {
     // Renew in the background while this coordinator runs.
     let _alive = leadership
         .as_ref()
-        .map(|leadership| leadership.keep_alive(lease_ttl() / 3));
+        .map(|leadership| leadership.keep_alive(ttl / 3));
     // Every exit from here on, error or panic included, hands the lease back
     // so a standby takes over at once instead of after the TTL. Declared
     // after the renewal guard, so it drops first: the release fences the
@@ -142,21 +143,37 @@ impl Drop for ReleaseOnExit {
     }
 }
 
-fn lease_ttl() -> Duration {
-    env::var("MIZUCHI_LEASE_TTL_MS")
-        .ok()
-        .and_then(|ms| ms.parse::<u64>().ok())
-        .map_or(Duration::from_secs(10), Duration::from_millis)
+/// Smallest accepted lease TTL. Leader polling and renewal run every
+/// `ttl / 3`, so a shorter TTL would make those loops spin.
+const MIN_LEASE_TTL: Duration = Duration::from_millis(30);
+
+/// Lease TTL from the raw `MIZUCHI_LEASE_TTL_MS` value: unset is 10 s; a value
+/// that is not a millisecond count of at least `MIN_LEASE_TTL` is an error.
+fn lease_ttl(raw: Option<&str>) -> Result<Duration, String> {
+    let Some(raw) = raw else {
+        return Ok(Duration::from_secs(10));
+    };
+    let ttl = raw
+        .trim()
+        .parse::<u64>()
+        .map(Duration::from_millis)
+        .map_err(|e| format!("MIZUCHI_LEASE_TTL_MS={raw:?}: {e}"))?;
+    if ttl < MIN_LEASE_TTL {
+        return Err(format!(
+            "MIZUCHI_LEASE_TTL_MS={raw:?}: must be at least {} ms",
+            MIN_LEASE_TTL.as_millis()
+        ));
+    }
+    Ok(ttl)
 }
 
 /// Waits as a standby until this coordinator holds the lease in `dir`.
-fn lead(dir: &str, args: &Flags) -> Result<Leadership, String> {
+fn lead(dir: &str, args: &Flags, ttl: Duration) -> Result<Leadership, String> {
     let holder = args
         .get("--holder")
         .or_else(|| env::var("MIZUCHI_HOLDER").ok())
         .or_else(|| env::var("HOSTNAME").ok())
         .unwrap_or_else(|| format!("coordinator-{}", process::id()));
-    let ttl = lease_ttl();
     let store = DirLeaseStore::new(dir).map_err(|e| e.to_string())?;
     let leadership = Leadership::new(Box::new(store), holder, ttl);
     let token = leadership.lead(ttl / 3).map_err(|e| e.to_string())?;
@@ -196,5 +213,21 @@ impl Flags {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lease_ttl_defaults_parses_and_refuses_bad_values() {
+        assert_eq!(lease_ttl(None), Ok(Duration::from_secs(10)));
+        assert_eq!(lease_ttl(Some("600000")), Ok(Duration::from_secs(600)));
+        assert_eq!(lease_ttl(Some("30")), Ok(MIN_LEASE_TTL));
+        for bad in ["", "abc", "-5", "1.5", "0", "2", "29"] {
+            let err = lease_ttl(Some(bad)).unwrap_err();
+            assert!(err.starts_with("MIZUCHI_LEASE_TTL_MS="), "{bad}: {err}");
+        }
     }
 }
