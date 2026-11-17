@@ -136,7 +136,8 @@ impl IcebergRestCatalog {
                     "overwrite": true,
                     "metadata-location": meta_loc,
                 });
-                let register_path = format!("/v1/namespaces/{}/register", ident.namespace);
+                let register_path =
+                    format!("/v1/namespaces/{}/register", segment(&ident.namespace));
                 if http_json(http, "POST", &register_path, Some(&register)).is_ok() {
                     return Ok(());
                 }
@@ -267,7 +268,7 @@ impl CatalogProvider for IcebergRestCatalog {
                 Ok(out)
             }
             RestInner::Http(http) => {
-                let path = format!("/v1/namespaces/{}/tables", ns.namespace);
+                let path = format!("/v1/namespaces/{}/tables", segment(&ns.namespace));
                 let body = http_json(http, "GET", &path, None)?;
                 let mut out = Vec::new();
                 if let Some(arr) = body.get("identifiers").and_then(Value::as_array) {
@@ -311,7 +312,7 @@ impl CatalogProvider for IcebergRestCatalog {
                 Ok(())
             }
             RestInner::Http(http) => {
-                let ns_path = format!("/v1/namespaces/{}", meta.ident.namespace);
+                let ns_path = format!("/v1/namespaces/{}", segment(&meta.ident.namespace));
                 let _ = http_json(
                     http,
                     "POST",
@@ -461,7 +462,44 @@ fn table_key(ident: &TableIdent) -> String {
 }
 
 fn table_path(ident: &TableIdent) -> String {
-    format!("/v1/namespaces/{}/tables/{}", ident.namespace, ident.table)
+    format!(
+        "/v1/namespaces/{}/tables/{}",
+        segment(&ident.namespace),
+        segment(&ident.table)
+    )
+}
+
+/// Percent-encode one request path segment: every byte outside the RFC 3986
+/// unreserved set, so `/`, `?`, `#`, `%` and spaces in a name stay data.
+fn segment(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Decode a percent-encoded request path. `None` for a malformed escape or a
+/// result that is not UTF-8.
+fn decode_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 fn empty_metadata(meta: &TableMeta) -> Result<Value> {
@@ -927,7 +965,11 @@ fn handle_http_stream(state: &Mutex<RestState>, stream: &mut TcpStream) -> Resul
     } else {
         serde_json::from_slice::<Value>(&body).ok()
     };
-    let (status, payload) = dispatch(state, method, path, body_val.as_ref());
+    // Identifiers never contain `/`, so routing on the decoded path is safe.
+    let (status, payload) = match decode_path(path) {
+        Some(path) => dispatch(state, method, &path, body_val.as_ref()),
+        None => (400, json!({"error": "malformed path"})),
+    };
     let body = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
     let resp = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1537,6 +1579,28 @@ mod tests {
         cat.alter_table(&ident, StdArc::new(renamed)).unwrap();
         let md = cat.load_metadata(&ident).unwrap();
         assert_eq!(current_ids(&md), vec![("key".to_string(), 1)]);
+    }
+
+    #[test]
+    fn http_names_with_reserved_characters_round_trip() {
+        let (port, _server) = spawn_memory_server().unwrap();
+        let mut cat =
+            IcebergRestCatalog::connect(&format!("http://127.0.0.1:{port}"), true).unwrap();
+        let ident = TableIdent::from_parts(DEFAULT_CATALOG, "ns 1%", "t?#% x").unwrap();
+        let meta = TableMeta {
+            ident: ident.clone(),
+            ..sample_meta("t")
+        };
+        cat.create_table(meta).unwrap();
+        let got = CatalogProvider::get_table(&cat, &ident).unwrap();
+        assert_eq!(got.ident, ident);
+        let ns = NamespaceIdent {
+            catalog: DEFAULT_CATALOG.into(),
+            namespace: ident.namespace.clone(),
+        };
+        assert_eq!(cat.list_tables(&ns).unwrap(), vec![ident.table.clone()]);
+        cat.drop_table(&ident, false).unwrap();
+        assert!(CatalogProvider::get_table(&cat, &ident).is_err());
     }
 
     #[test]
