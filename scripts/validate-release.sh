@@ -26,7 +26,8 @@ grep -qF 'actions: write' "$dispatcher" || fail "${dispatcher} must be able to d
 if grep -qE '^[[:space:]]*(-[[:space:]]+)?uses:|workflow_dispatch|pull_request|contents: write' "$dispatcher"; then
   fail "${dispatcher} must only dispatch: no actions, other triggers, or write access"
 fi
-dispatch_runs="$(grep -E '^[[:space:]]*(-[[:space:]]+)?run:' "$dispatcher")"
+# grep exits 1 on no match; `|| true` keeps set -e from hiding the fail below.
+dispatch_runs="$(grep -E '^[[:space:]]*(-[[:space:]]+)?run:' "$dispatcher" || true)"
 [[ "$dispatch_runs" =~ ^[[:space:]]*run:\ gh\ workflow\ run\ release\.yml\ --ref\ main\ -f\ tag=\"\$TAG\"$ ]] \
   || fail "${dispatcher} must run only: gh workflow run release.yml --ref main -f tag=\"\$TAG\""
 
@@ -50,9 +51,11 @@ grep -qF 'RELEASE_TAG_FINGERPRINTS="${MAIN_TREE}/security/release-tag-fingerprin
 grep -qF 'git merge-base --is-ancestor "$sha" refs/remotes/origin/main' "$workflow" || fail "${workflow} must require the tagged commit on main"
 
 # Every later job builds the tagged commit, never the event SHA or ref name.
-checkouts="$(grep -c 'uses: actions/checkout@' "$workflow")"
-sha_checkouts="$(grep -c 'ref: ${{ needs.verify-tag.outputs.sha }}' "$workflow")"
-head_checks="$(grep -c 'test "$(git rev-parse HEAD)" = "$SHA"' "$workflow")"
+# grep -c prints 0 but exits 1 on no match; `|| true` lets the counts reach
+# the invariant checks instead of stopping the script without a message.
+checkouts="$(grep -c 'uses: actions/checkout@' "$workflow" || true)"
+sha_checkouts="$(grep -c 'ref: ${{ needs.verify-tag.outputs.sha }}' "$workflow" || true)"
+head_checks="$(grep -c 'test "$(git rev-parse HEAD)" = "$SHA"' "$workflow" || true)"
 [[ "$checkouts" -eq $((sha_checkouts + 2)) ]] || fail "${workflow} must check out the release commit in every job after verify-tag"
 [[ "$head_checks" -eq "$sha_checkouts" ]] || fail "${workflow} must check HEAD after every release-commit checkout"
 if grep -qE 'github\.sha|github\.ref_name|GITHUB_SHA|GITHUB_REF|github\.event_name' "$workflow"; then
