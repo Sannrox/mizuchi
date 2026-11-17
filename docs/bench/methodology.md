@@ -62,8 +62,11 @@ this method and the committed results table are in git.
 6. mizuchi clones the session per trial so the result cache cannot reuse a
    previous answer.
 
-Ratio in the results table is `reference_ms / mizuchi_ms` (same convention as
-`tests/engine_compare.rs`). Values below 1 mean the reference finished faster.
+Ratio in the results table is `reference_ms / mizuchi_ms`. Values below 1
+mean the reference finished faster. `tests/engine_compare.rs` reports an
+`amortized_time_ratio` instead: it times each reference CLI as one whole
+process (startup and CSV load included) split evenly across queries, so it
+checks results, not speed.
 
 ## Constrained profile
 
