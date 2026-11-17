@@ -1309,6 +1309,25 @@ mod tests {
         }
     }
 
+    /// The trait contract every backend follows: a second create of the
+    /// same table fails and leaves the first one in place.
+    fn second_create_is_an_error(cat: &mut dyn CatalogProvider) {
+        cat.create_table(sample_meta("sales.t")).unwrap();
+        let err = cat.create_table(sample_meta("sales.t")).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        let ident = TableIdent::parse("sales.t").unwrap();
+        assert_eq!(cat.get_table(&ident).unwrap().schema.fields().len(), 1);
+    }
+
+    #[test]
+    fn create_table_on_an_existing_table_fails_on_every_catalog() {
+        second_create_is_an_error(&mut crate::plan::Catalog::new());
+        second_create_is_an_error(&mut IcebergRestCatalog::memory());
+        let (port, _server) = spawn_memory_server().unwrap();
+        let url = format!("http://127.0.0.1:{port}");
+        second_create_is_an_error(&mut IcebergRestCatalog::connect(&url, true).unwrap());
+    }
+
     #[test]
     fn memory_rest_catalog_create_load_drop() {
         let mut cat = IcebergRestCatalog::memory();
