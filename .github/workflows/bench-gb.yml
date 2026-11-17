@@ -26,6 +26,8 @@ jobs:
           python-version: "3.12"
       - name: Install reference engines
         run: python -m pip install duckdb==2.0.0 datafusion==55.0.0 pyarrow==26.0.0
+      - name: Gate self-test
+        run: bash scripts/check-bench-regression.test.sh
       - name: Run tiny suite
         run: bash scripts/bench-gb.sh tiny
       - name: Publish ratios and fail on regression

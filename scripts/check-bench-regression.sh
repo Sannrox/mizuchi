@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Compare a gb_bench JSON run to the committed baseline and publish ratios.
 # Fails when any query is more than 20% slower than the baseline mizuchi
-# time, or when docs/bench/results.md SF1 DuckDB ratios are below 0.33.
+# time, when a baseline query is missing from the mizuchi run, or when the
+# baseline has no entries for the scale or the run has no queries. Exits 2
+# on a usage error. SF1 DuckDB ratios in docs/bench/results.md below 0.33
+# are reported as notes.
 #
 # Usage:
 #   scripts/check-bench-regression.sh --mizuchi PATH [--duckdb PATH]
@@ -43,7 +46,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -z "${SCALE}" ]; then
+if [ -z "${SCALE}" ] || [ -z "${MIZUCHI}" ]; then
   echo "usage: $0 --scale tiny|sf1 --mizuchi PATH" >&2
   exit 2
 fi
@@ -79,16 +82,17 @@ def load_queries(path):
         out[q["id"]] = float(q["reported_ms"])
     return out
 
-mizuchi_path = os.environ.get("MIZUCHI") or ""
-if mizuchi_path:
-    mz_run = load_run(mizuchi_path)
-    workers = int(mz_run.get("workers") or 0)
-    if workers <= 1:
-        sys.exit(
-            f"{mizuchi_path} used workers={workers}; "
-            "tpcds_store_sales must time the parallel path (workers > 1)"
-        )
-mizuchi = load_queries(mizuchi_path) if mizuchi_path else {}
+mizuchi_path = os.environ["MIZUCHI"]
+mz_run = load_run(mizuchi_path)
+workers = int(mz_run.get("workers") or 0)
+if workers <= 1:
+    sys.exit(
+        f"{mizuchi_path} used workers={workers}; "
+        "tpcds_store_sales must time the parallel path (workers > 1)"
+    )
+mizuchi = load_queries(mizuchi_path)
+if not mizuchi:
+    sys.exit(f"{mizuchi_path} has no queries")
 duckdb = load_queries(os.environ.get("DUCKDB") or "")
 datafusion = load_queries(os.environ.get("DATAFUSION") or "")
 
@@ -105,7 +109,9 @@ if base_workers <= 1:
 factor = float(baseline.get("regression_factor", 1.20))
 min_ratio = float(baseline.get("min_sf1_duckdb_ratio", 0.33))
 min_abs_ms = float(baseline.get("min_abs_ms", 5.0))
-base_scale = baseline.get(scale, {})
+base_scale = baseline.get(scale) or {}
+if not base_scale:
+    sys.exit(f"{os.environ['BASELINE']} has no entries for scale {scale}")
 
 errors = []
 lines = [
@@ -115,8 +121,7 @@ lines = [
     "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
 ]
 
-ids = list(base_scale.keys()) or list(mizuchi.keys())
-for qid in ids:
+for qid in base_scale:
     mz = mizuchi.get(qid)
     dk = duckdb.get(qid)
     df = datafusion.get(qid)
@@ -129,7 +134,9 @@ for qid in ids:
     lines.append(
         f"| {qid} | {fmt(mz)} | {fmt(dk)} | {fmt(dk_ratio)} | {fmt(df)} | {fmt(df_ratio)} | {fmt(base)} | {fmt(vs, 2)} |"
     )
-    if mz is not None and base:
+    if mz is None:
+        errors.append(f"{qid}: missing from the mizuchi run")
+    elif base:
         if max(mz, base) >= min_abs_ms and mz > base * factor:
             errors.append(
                 f"{qid}: mizuchi {mz:.3f} ms is >{factor:.0%} of baseline {base:.3f} ms"
