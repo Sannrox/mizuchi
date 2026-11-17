@@ -41,6 +41,9 @@ fn public_cluster_scales_and_runs() {
     session.register("t", schema, batches).unwrap();
     let out = session.execute_sql("SELECT COUNT(*) AS c FROM t").unwrap();
     assert!(!out.is_empty());
+    // The live session holds both workers; dropping it frees them.
+    assert_eq!(cluster.release_idle().unwrap(), 0);
+    drop(session);
     assert_eq!(cluster.release_idle().unwrap(), 1);
     assert_eq!(cluster.worker_count().unwrap(), 1);
 }

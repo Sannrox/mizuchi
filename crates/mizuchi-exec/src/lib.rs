@@ -131,6 +131,8 @@ pub struct Session {
     query_policy: Option<PolicyContext>,
     /// Caller-supplied unwrap grant for table files and query spills.
     encryption: Option<mizuchi_io::EncryptionSession>,
+    /// Cluster slots this session was sized from; shared by clones.
+    slot_hold: Option<Arc<cluster::SlotHold>>,
 }
 
 impl Default for Session {
@@ -162,6 +164,7 @@ impl Default for Session {
             governed: false,
             query_policy: None,
             encryption: None,
+            slot_hold: None,
         }
     }
 }
@@ -197,6 +200,7 @@ impl Clone for Session {
             governed: self.governed,
             query_policy: self.query_policy.clone(),
             encryption: self.encryption.clone(),
+            slot_hold: self.slot_hold.clone(),
         }
     }
 }
