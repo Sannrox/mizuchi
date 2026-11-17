@@ -3,8 +3,10 @@
 #[allow(dead_code)]
 mod ds_common;
 
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -39,15 +41,48 @@ fn col(out: &[Batch]) -> Vec<i64> {
         .collect()
 }
 
-fn spill() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("mizuchi-flight-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+/// Scratch directory owned by one test: the process id and a counter keep
+/// tests and concurrent runs apart, and drop removes it even on panic.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static SEQ: AtomicU64 = AtomicU64::new(1);
+        let path = std::env::temp_dir().join(format!(
+            "mizuchi-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A worker process that is killed and reaped when dropped, so a panicking
+/// test does not leave it running.
+struct WorkerProcess(Child);
+
+impl Drop for WorkerProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 #[test]
 fn three_workers_execute_and_shuffle() {
-    let dir = spill();
+    let scratch = TempDir::new("flight");
+    let dir = scratch.path().to_path_buf();
     let (a1, _h1) = spawn_worker(true, Some(dir.clone()), None).unwrap();
     let (a2, _h2) = spawn_worker(true, Some(dir.clone()), None).unwrap();
     let (a3, _h3) = spawn_worker(true, Some(dir.clone()), None).unwrap();
@@ -106,7 +141,8 @@ fn compose_layout_and_optional_workflow() {
 #[ignore = "process workers; optional flight workflow"]
 fn three_workers_kill_mid_query_decision_support() {
     let bin = env!("CARGO_BIN_EXE_mizuchi");
-    let dir = spill();
+    let scratch = TempDir::new("flight-kill");
+    let dir = scratch.path().to_path_buf();
     let mut kids = Vec::new();
     let mut addrs = Vec::new();
     for _ in 0..3 {
@@ -125,7 +161,7 @@ fn three_workers_kill_mid_query_decision_support() {
             .spawn()
             .unwrap();
         addrs.push(addr.to_string());
-        kids.push(child);
+        kids.push(WorkerProcess(child));
     }
     let start = std::time::Instant::now();
     for addr in &addrs {
@@ -149,11 +185,10 @@ fn three_workers_kill_mid_query_decision_support() {
             .register(&name, batch.schema(), vec![batch])
             .unwrap();
     }
-    let mut first = kids.remove(0);
+    let first = kids.remove(0);
     let killer = thread::spawn(move || {
         thread::sleep(Duration::from_millis(80));
-        let _ = first.kill();
-        let _ = first.wait();
+        drop(first);
     });
     let first_sql = ds_common::QUERIES[0].sql;
     let out = cluster
@@ -167,21 +202,6 @@ fn three_workers_kill_mid_query_decision_support() {
             .unwrap_or_else(|e| panic!("{}: {e}", spec.id));
         let _ = out;
     }
-    for mut kid in kids {
-        let _ = kid.kill();
-        let _ = kid.wait();
-    }
-}
-
-fn lease_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "mizuchi-lease-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
 }
 
 /// #161: the leader dies mid-query, the standby takes the lease with a higher
@@ -190,7 +210,8 @@ fn lease_dir() -> std::path::PathBuf {
 fn a_standby_takes_over_and_the_old_leaders_work_is_refused() {
     use mizuchi::{DirLeaseStore, Error, Leadership, MemoryLeaseStore};
 
-    let lease = lease_dir();
+    let lease_guard = TempDir::new("lease");
+    let lease = lease_guard.path().to_path_buf();
     let (a1, _h1) = spawn_worker(true, None, Some(lease.clone())).unwrap();
     let (a2, _h2) = spawn_worker(true, None, None).unwrap();
     let addrs = vec![a1.to_string(), a2.to_string()];
@@ -279,7 +300,6 @@ fn a_standby_takes_over_and_the_old_leaders_work_is_refused() {
     assert!(status.leader);
     assert_eq!(status.token, token);
     assert!(status.lease_age.is_some());
-    let _ = std::fs::remove_dir_all(lease);
 }
 
 /// #162: the leader dies between stages; the standby resumes the batch query
@@ -289,7 +309,8 @@ fn a_standby_takes_over_and_the_old_leaders_work_is_refused() {
 fn a_standby_resumes_a_batch_query_from_its_last_committed_stage() {
     use mizuchi::{DirLeaseStore, Leadership, Stage};
 
-    let lease = lease_dir();
+    let lease_guard = TempDir::new("lease");
+    let lease = lease_guard.path().to_path_buf();
     let spill = lease.join("spill");
     std::fs::create_dir_all(&spill).unwrap();
     let (a1, _h1) = spawn_worker(true, Some(spill.clone()), Some(lease.clone())).unwrap();
@@ -367,7 +388,6 @@ fn a_standby_resumes_a_batch_query_from_its_last_committed_stage() {
         matches!(&damaged, Err(mizuchi::Error::Io(message)) if message.contains("cannot resume")),
         "{damaged:?}"
     );
-    let _ = std::fs::remove_dir_all(lease);
 }
 
 /// Runs the binary with no lease, network, or worker settings from the
@@ -393,7 +413,8 @@ fn run_bin(args: &[&str]) -> (bool, String) {
 fn a_failed_coordinator_releases_its_lease() {
     use mizuchi::{DirLeaseStore, Leadership};
 
-    let lease = lease_dir();
+    let lease_guard = TempDir::new("lease");
+    let lease = lease_guard.path().to_path_buf();
     let dir = lease.to_str().unwrap();
     let (a1, _h1) = spawn_worker(true, None, Some(lease.clone())).unwrap();
     let (a2, _h2) = spawn_worker(true, None, None).unwrap();
@@ -421,7 +442,6 @@ fn a_failed_coordinator_releases_its_lease() {
     // Within the 600 s TTL: only a release lets the standby lead now.
     let token = standby.try_lead().unwrap();
     assert!(token.is_some_and(|t| t > 1), "{token:?}");
-    let _ = std::fs::remove_dir_all(lease);
 }
 
 /// #238: a trailing `--lease-dir` used to read as omitted and start an
