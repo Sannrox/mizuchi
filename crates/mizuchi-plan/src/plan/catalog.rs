@@ -15,7 +15,7 @@ use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::FileWriter;
 use serde_json::{Value, json};
 
-use super::stats::TableStats;
+use super::stats::{ColumnStats, TableStats};
 use mizuchi_core::error::{Error, Result};
 use mizuchi_core::schema::from_arrow_schema;
 
@@ -118,6 +118,17 @@ pub trait CatalogProvider {
 pub struct Catalog {
     tables: BTreeMap<String, CatalogTable>,
     file_dir: Option<PathBuf>,
+    skipped: Vec<SkippedEntry>,
+}
+
+/// A file catalog entry that [`Catalog::open_file`] could not read and left
+/// out, so one torn or corrupt entry does not hide the rest of the catalog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedEntry {
+    /// The entry's `.json` file.
+    pub path: PathBuf,
+    /// Why it could not be loaded.
+    pub reason: String,
 }
 
 #[derive(Clone, Debug)]
@@ -139,19 +150,28 @@ impl Catalog {
         Self {
             tables: self.tables.clone(),
             file_dir: None,
+            skipped: Vec::new(),
         }
     }
 
-    /// Load a file catalog, creating `dir` when it does not exist.
+    /// Load a file catalog, creating `dir` when it does not exist. An entry
+    /// that cannot be read is left out and listed in [`Self::skipped_entries`];
+    /// an unreadable directory is still an error.
     pub fn open_file(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
         let mut cat = Self {
             tables: BTreeMap::new(),
             file_dir: Some(dir.clone()),
+            skipped: Vec::new(),
         };
         load_dir(&dir, &mut cat)?;
         Ok(cat)
+    }
+
+    /// Entries [`Self::open_file`] could not read and left out.
+    pub fn skipped_entries(&self) -> &[SkippedEntry] {
+        &self.skipped
     }
 
     /// Register `name` with an Arrow schema. Names are matched case-insensitively.
@@ -389,29 +409,114 @@ fn entry_paths(dir: &Path, ident: &TableIdent) -> (PathBuf, PathBuf) {
     )
 }
 
+/// Write both files of an entry atomically: each goes to a temp file in the
+/// same directory, is synced, and is renamed into place, the `.json` last.
+/// A reader sees each file old or new, never torn.
+///
+/// The `.json` keeps the top-level `row_count` and partition fields older
+/// readers use, and adds `stats`: the full statistics, or `null` when none
+/// were recorded, so reload does not invent a row count.
 fn write_entry(dir: &Path, table: &CatalogTable) -> Result<()> {
     let (json_path, arrow_path) = entry_paths(dir, &table.ident);
-    if let Some(parent) = json_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-    }
-    let file = File::create(&arrow_path).map_err(|e| io_err(&arrow_path, e))?;
-    let mut writer =
-        FileWriter::try_new(file, table.schema.as_ref()).map_err(|e| Error::Io(e.to_string()))?;
+    let parent = json_path
+        .parent()
+        .ok_or_else(|| Error::Io(format!("{}: no parent directory", json_path.display())))?;
+    fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+    let mut schema_bytes = Vec::new();
+    let mut writer = FileWriter::try_new(&mut schema_bytes, table.schema.as_ref())
+        .map_err(|e| Error::Io(e.to_string()))?;
     writer.finish().map_err(|e| Error::Io(e.to_string()))?;
-    let stats = table.stats.clone().unwrap_or_default();
-    let body = json!({
+    drop(writer);
+    let mut body = json!({
         "catalog": table.ident.catalog,
         "namespace": table.ident.namespace,
         "table": table.ident.table,
+        "stats": table.stats.as_ref().map(stats_json),
+    });
+    if let Some(stats) = &table.stats {
+        body["partition_columns"] = json!(stats.partition_columns);
+        body["partitions"] = json!(stats.partitions);
+        body["row_count"] = json!(stats.row_count);
+    }
+    let json_bytes = serde_json::to_vec_pretty(&body).map_err(|e| Error::Io(e.to_string()))?;
+    replace_file(&arrow_path, &schema_bytes)?;
+    replace_file(&json_path, &json_bytes)?;
+    File::open(parent)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| io_err(parent, e))
+}
+
+/// Replace `path` with `bytes` through a synced temp file and a rename.
+fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| Error::Io(format!("{}: invalid file name", path.display())))?;
+    let tmp = path.with_file_name(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = File::create(&tmp)
+        .and_then(|mut f| {
+            f.write_all(bytes)?;
+            f.sync_all()
+        })
+        .and_then(|()| fs::rename(&tmp, path));
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(io_err(path, e));
+    }
+    Ok(())
+}
+
+fn stats_json(stats: &TableStats) -> Value {
+    let columns: serde_json::Map<String, Value> = stats
+        .columns
+        .iter()
+        .map(|(name, c)| {
+            (
+                name.clone(),
+                json!({
+                    "ndv": c.ndv,
+                    "min_i64": c.min_i64,
+                    "max_i64": c.max_i64,
+                    "null_count": c.null_count,
+                }),
+            )
+        })
+        .collect();
+    json!({
+        "row_count": stats.row_count,
+        "columns": columns,
         "partition_columns": stats.partition_columns,
         "partitions": stats.partitions,
-        "row_count": stats.row_count,
-    });
-    fs::write(
-        &json_path,
-        serde_json::to_vec_pretty(&body).map_err(|e| Error::Io(e.to_string()))?,
-    )
-    .map_err(|e| io_err(&json_path, e))
+    })
+}
+
+fn stats_from_json(v: &Value) -> Result<TableStats> {
+    let bad = |what: &str| Error::Io(format!("catalog json stats {what}"));
+    let mut columns = BTreeMap::new();
+    for (name, c) in v["columns"].as_object().ok_or_else(|| bad("columns"))? {
+        columns.insert(
+            name.clone(),
+            ColumnStats {
+                ndv: c["ndv"].as_u64(),
+                min_i64: c["min_i64"].as_i64(),
+                max_i64: c["max_i64"].as_i64(),
+                null_count: c["null_count"].as_u64().ok_or_else(|| bad("null_count"))?,
+            },
+        );
+    }
+    Ok(TableStats {
+        row_count: v["row_count"].as_u64().ok_or_else(|| bad("row_count"))?,
+        columns,
+        partition_columns: json_string_vec(&v["partition_columns"]),
+        partitions: json_string_vec(&v["partitions"]),
+    })
 }
 
 fn remove_files(dir: &Path, ident: &TableIdent) -> Result<()> {
@@ -446,7 +551,12 @@ fn load_dir(dir: &Path, cat: &mut Catalog) -> Result<()> {
                 if path.extension().and_then(|e| e.to_str()) != Some("json") {
                     continue;
                 }
-                load_entry(cat, &path)?;
+                if let Err(e) = load_entry(cat, &path) {
+                    cat.skipped.push(SkippedEntry {
+                        path,
+                        reason: e.to_string(),
+                    });
+                }
             }
         }
     }
@@ -469,23 +579,33 @@ fn load_entry(cat: &mut Catalog, json_path: &Path) -> Result<()> {
     )?;
     let arrow_path = json_path.with_extension("arrow");
     let schema = read_schema(&arrow_path)?;
-    let partitions = json_string_vec(&v["partitions"]);
-    let partition_columns = json_string_vec(&v["partition_columns"]);
-    let row_count = v["row_count"].as_u64().unwrap_or(0);
+    let stats = match v.get("stats") {
+        Some(Value::Null) => None,
+        Some(stats) => Some(stats_from_json(stats)?),
+        None => legacy_stats(&v),
+    };
     cat.tables.insert(
         ident.key(),
         CatalogTable {
             ident: ident.clone(),
             schema,
-            stats: Some(TableStats {
-                row_count,
-                partition_columns,
-                partitions,
-                ..TableStats::default()
-            }),
+            stats,
         },
     );
     Ok(())
+}
+
+/// Stats from an entry written before `stats` existed. Those always wrote a
+/// `row_count`, `0` when none was recorded, so an entry with no rows and no
+/// partitions loads as unknown rather than as an empty table.
+fn legacy_stats(v: &Value) -> Option<TableStats> {
+    let stats = TableStats {
+        row_count: v["row_count"].as_u64().unwrap_or(0),
+        partition_columns: json_string_vec(&v["partition_columns"]),
+        partitions: json_string_vec(&v["partitions"]),
+        ..TableStats::default()
+    };
+    (stats != TableStats::default()).then_some(stats)
 }
 
 fn json_string_vec(v: &Value) -> Vec<String> {
@@ -650,6 +770,99 @@ mod tests {
             loaded.partitions(ident).unwrap(),
             vec!["year=2020".to_string(), "year=2021".to_string()]
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// One torn entry is skipped and reported; the rest of the catalog loads.
+    #[test]
+    fn open_file_skips_a_torn_entry() {
+        let dir = tmp("torn");
+        let mut c = Catalog::open_file(&dir).unwrap();
+        c.register("good", schema()).unwrap();
+        c.register("torn", schema()).unwrap();
+        drop(c);
+        let (json_path, arrow_path) = entry_paths(&dir, &TableIdent::parse("torn").unwrap());
+        File::create(&arrow_path).unwrap();
+        let loaded = Catalog::open_file(&dir).unwrap();
+        assert_eq!(loaded.list_tables(None).unwrap(), vec!["good".to_string()]);
+        let skipped = loaded.skipped_entries();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].path, json_path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Table and column stats come back exactly as written.
+    #[test]
+    fn file_catalog_round_trips_column_stats() {
+        let dir = tmp("stats");
+        let stats = TableStats {
+            row_count: 42,
+            columns: BTreeMap::from([(
+                "id".to_string(),
+                ColumnStats {
+                    ndv: Some(40),
+                    min_i64: Some(-3),
+                    max_i64: Some(99),
+                    null_count: 2,
+                },
+            )]),
+            partition_columns: vec!["year".into()],
+            partitions: vec!["year=2020".into()],
+        };
+        let mut c = Catalog::open_file(&dir).unwrap();
+        c.register("t", schema()).unwrap();
+        c.set_stats("t", stats.clone()).unwrap();
+        drop(c);
+        let loaded = Catalog::open_file(&dir).unwrap();
+        assert_eq!(loaded.stats("t"), Some(&stats));
+        assert!(loaded.skipped_entries().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A table reloaded without recorded stats has an unknown size, not one row.
+    #[test]
+    fn reloaded_table_without_stats_has_unknown_rows() {
+        let dir = tmp("unknown");
+        let mut c = Catalog::open_file(&dir).unwrap();
+        c.register("t", schema()).unwrap();
+        drop(c);
+        let loaded = Catalog::open_file(&dir).unwrap();
+        assert_eq!(loaded.stats("t"), None);
+        let plan = crate::plan::plan_sql("SELECT id FROM t", &loaded).unwrap();
+        assert_eq!(crate::opt::estimate_rows(&plan), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Entries written before `stats` existed still load.
+    #[test]
+    fn legacy_entry_loads_row_count_and_partitions() {
+        let dir = tmp("legacy");
+        let mut c = Catalog::open_file(&dir).unwrap();
+        c.register("t", schema()).unwrap();
+        c.register("u", schema()).unwrap();
+        drop(c);
+        for (table, body) in [
+            (
+                "t",
+                json!({"catalog": DEFAULT_CATALOG, "namespace": DEFAULT_NAMESPACE, "table": "t",
+                "partition_columns": ["year"], "partitions": ["year=2020"], "row_count": 7}),
+            ),
+            (
+                "u",
+                json!({"catalog": DEFAULT_CATALOG, "namespace": DEFAULT_NAMESPACE, "table": "u",
+                "partition_columns": [], "partitions": [], "row_count": 0}),
+            ),
+        ] {
+            let (json_path, _) = entry_paths(&dir, &TableIdent::parse(table).unwrap());
+            fs::write(json_path, body.to_string()).unwrap();
+        }
+        let loaded = Catalog::open_file(&dir).unwrap();
+        let t = loaded.stats("t").unwrap();
+        assert_eq!(
+            (t.row_count, t.partitions.clone()),
+            (7, vec!["year=2020".to_string()])
+        );
+        assert_eq!(loaded.stats("u"), None);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -67,8 +67,8 @@ pub use mizuchi_io::{
 pub use mizuchi_plan::{
     AlterTable, Catalog, CatalogProvider, ColumnStats, DEFAULT_CATALOG, DEFAULT_NAMESPACE, Ddl,
     IcebergRestCatalog, JoinType, LogicalPlan, MergeActionPlan, MergeClausePlan, MergeMatch,
-    MergePlan, NamespaceIdent, TableIdent, TableMeta, TableStats, apply_alter, bind_ddl,
-    bind_merge, estimate_rows, merge_target_table, optimize, parse_sql, plan_sql,
+    MergePlan, NamespaceIdent, SkippedEntry, TableIdent, TableMeta, TableStats, apply_alter,
+    bind_ddl, bind_merge, estimate_rows, merge_target_table, optimize, parse_sql, plan_sql,
     plan_sql_with_udafs, table_stats_from_batches,
 };
 pub use mizuchi_postgres::{PostgresReadOptions, PostgresSource, postgres_scan_sql, read_postgres};
