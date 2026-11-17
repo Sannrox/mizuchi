@@ -8,6 +8,63 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+## [0.3.0] - 2026-11-17
+
+### Upgrade
+
+- The query result cache is bounded at 64 MiB by default. Sessions that cached more now recompute evicted results; raise the budget with `with_result_cache_bytes`. (#347)
+- An engine owner's share is released when its sessions drop. Keep a session alive to keep the reservation. (#348)
+- SQL text longer than 8 MiB (`MAX_SQL_BYTES`) returns `Error::Parse`. Split larger statements, or load data with `register` or a file scan. (#365)
+- `CatalogProvider::create_table` on an existing table is an error on every catalog. Drop the table first, or call `Catalog::register`. (#367)
+- The `mizuchi coordinator` binary exits at startup when `MIZUCHI_LEASE_TTL_MS` is not a millisecond count or is below 30 ms, even without a lease directory. Unset it or set a valid value. (#400)
+
+### Security
+
+- ORC stripe offsets and row counts are bounded by the file size. (#289)
+- JWT segments are decoded with a strict base64url decoder. (#290)
+- File access opens the resolved path that the allow-list check approved. (#291)
+
+### Changed
+
+- `MERGE` evaluates its `ON` condition per target row, not per row pair. (#350)
+- The release image is pushed under a staging tag; the version tag is applied only after attestation. A release run that fails after tagging needs a new version. (#407)
+
+### Fixed
+
+- SQL and expressions:
+  - `CASE` and `COALESCE` evaluate each branch only on the rows that select it. (#336)
+  - Comparisons and simple `CASE` widen mixed integer widths. (#397)
+  - `SUBSTRING` counts characters and honours a start of 0 or less. (#337)
+  - `ABS` of the integer minimum reports overflow. (#339)
+  - `MERGE INSERT *` fails on unresolved target columns. (#338)
+  - Row estimates: `LIMIT` subtracts `OFFSET`, and semi, anti and outer joins are estimated by type. (#364, #349)
+- Execution and memory:
+  - Spilled sorts stream a reserved k-way merge. (#332)
+  - Global aggregates and non-equi joins gather their partitioned input to one partition. (#331, #335)
+  - Partitioned scans return every row. (#340)
+  - A merged `CancelToken` has its own flag. (#396)
+  - `Batch::gather` returns an error for out-of-range indices instead of panicking. (#406)
+  - Query history is appended instead of rewritten per query. (#346)
+- Storage and catalogs:
+  - A failed or crashed overwrite publish rolls back; a failed stage commit removes its staging and output files. (#328, #353)
+  - Staging ids are unique across processes, and appends do not clobber. (#344)
+  - File catalog writes are atomic, and loading tolerates one bad entry. (#341)
+  - Iceberg REST and lake writes keep recorded field ids across schema changes; REST path segments are percent-encoded. (#342, #402, #398)
+  - The ORC writer encodes `LargeUtf8` and `LargeBinary` columns. (#405)
+  - PostgreSQL JSON and JSONB columns read as text, and source queries may end in a comment or semicolon. (#330, #399)
+- Distributed:
+  - Workers stay live on request errors and revive on heartbeat; blocking work stays off the async runtime threads. (#333, #345)
+  - Shuffle spill fails closed on write errors and missing files. (#334)
+  - Live sessions keep their cluster slots. (#363)
+  - A failed coordinator releases its lease. (#355)
+  - Flight refuses names longer than 255 bytes instead of misframing the payload. (#403)
+  - `spawn_worker` serves on its bound port and reports setup errors. (#366)
+- The binaries reject a flag with no value or an unknown flag, and resolve relative script paths against the caller's directory. (#325, #354)
+
+### Internal
+
+- Tests, benchmarks, CI workflows and release scripts were tightened: workflow token permissions and timeouts, pinned workflow linting, release manifest and changelog checks, isolated scratch for cluster, S3 and sandbox tests, and stricter assertions. (#329, #351, #356–#362, #368–#373, #376, #380, #384, #386, #387, #388, #404, #408, #409)
+
 ## [0.2.0] - 2026-11-12
 
 ### Upgrade
