@@ -45,7 +45,19 @@ fn tmp(label: &str) -> std::path::PathBuf {
     ))
 }
 
-/// Restrict this process to `root` (read-write) plus common read-only system
+/// Removes its directories on drop. The filesystem limit applies only to the
+/// thread that set it, so the unrestricted test thread can still delete them.
+struct TempDirs(Vec<std::path::PathBuf>);
+
+impl Drop for TempDirs {
+    fn drop(&mut self) {
+        for dir in &self.0 {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Restrict the calling thread (and threads it spawns) to `root` (read-write) plus common read-only system
 /// paths the runtime already needs. Returns whether the kernel enforced it.
 fn restrict_to(root: &Path) -> bool {
     let abi = ABI::V1;
@@ -73,6 +85,7 @@ fn restrict_to(root: &Path) -> bool {
 fn os_fs_limits_denied_path_is_io() {
     let root = tmp("ok");
     let denied = tmp("no");
+    let _dirs = TempDirs(vec![root.clone(), denied.clone()]);
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir_all(&denied).unwrap();
     let (schema, batches) = numbered(4);
@@ -87,22 +100,25 @@ fn os_fs_limits_denied_path_is_io() {
     )
     .unwrap();
 
-    if !restrict_to(&root) {
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&denied);
-        return;
-    }
-
-    // Empty allow-list: the OS fence is the grant. The engine stays generic.
-    let mut s = Session::from_config(SessionConfig {
-        spill_dir: Some(root.join("spill")),
-        ..SessionConfig::default()
-    })
-    .unwrap();
-    s.register_parquet("ok", root.join("data"), ParquetReadOptions::default())
+    // Restrict a thread spawned after setup, so this thread can still remove
+    // the directories when `_dirs` drops, whether the test passes or panics.
+    std::thread::spawn(move || {
+        if !restrict_to(&root) {
+            return;
+        }
+        // Empty allow-list: the OS fence is the grant. The engine stays generic.
+        let mut s = Session::from_config(SessionConfig {
+            spill_dir: Some(root.join("spill")),
+            ..SessionConfig::default()
+        })
         .unwrap();
-    let rows = s.execute_sql("SELECT COUNT(*) AS c FROM ok").unwrap();
-    assert!(!rows.is_empty());
-    let err = s.register_parquet("no", denied.join("data"), ParquetReadOptions::default());
-    assert!(matches!(err, Err(Error::Io(_))), "{err:?}");
+        s.register_parquet("ok", root.join("data"), ParquetReadOptions::default())
+            .unwrap();
+        let rows = s.execute_sql("SELECT COUNT(*) AS c FROM ok").unwrap();
+        assert!(!rows.is_empty());
+        let err = s.register_parquet("no", denied.join("data"), ParquetReadOptions::default());
+        assert!(matches!(err, Err(Error::Io(_))), "{err:?}");
+    })
+    .join()
+    .unwrap();
 }
