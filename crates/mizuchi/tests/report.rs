@@ -129,9 +129,23 @@ fn store_pruned_scan_report_matches_fetched_partitions() {
         filters: Some(std::slice::from_ref(&pred)),
         ..ParquetReadOptions::default()
     };
-    let (_batches, scan) = read_parquet_store_reported(&store, "ds", opts).unwrap();
+    let (batches, scan) = read_parquet_store_reported(&store, "ds", opts).unwrap();
     assert_eq!(scan.partitions, vec!["year=2020"]);
     assert_eq!(scan.dataset, "ds");
+    let years: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name("year")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        })
+        .map(Option::unwrap)
+        .collect();
+    assert_eq!(years, vec![2020, 2020]);
 }
 
 #[test]
