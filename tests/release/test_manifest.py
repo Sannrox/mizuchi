@@ -23,13 +23,18 @@ class GateFlags(unittest.TestCase):
         {"number": 9, "labels": []},
     ]
 
-    def test_maps_gate_labels_of_squash_commits_and_ignores_others(self):
-        subjects = ["feat!: drop x (#7)", "fix: y (#8)", "docs: z (#9)", "direct push"]
-        self.assertEqual(manifest.gate_flags(subjects, self.PRS), ["breaking", "migration"])
+    def test_maps_gate_labels_of_squash_commits(self):
+        commits = [("a1", "feat!: drop x (#7)"), ("a2", "fix: y (#8)"), ("a3", "docs: z (#9)")]
+        self.assertEqual(manifest.gate_flags(commits, self.PRS), ["breaking", "migration"])
 
     def test_a_pull_request_without_labels_fails(self):
         with self.assertRaisesRegex(SystemExit, "#10"):
-            manifest.gate_flags(["fix: lost (#10)"], self.PRS)
+            manifest.gate_flags([("a1", "fix: lost (#10)")], self.PRS)
+
+    def test_a_commit_naming_no_pull_request_fails_and_names_the_commit(self):
+        commits = [("a1", "fix: y (#8)"), ("deadbeef", "Merge branch 'x'")]
+        with self.assertRaisesRegex(SystemExit, "deadbeef"):
+            manifest.gate_flags(commits, self.PRS)
 
 
 class Images(unittest.TestCase):
