@@ -26,3 +26,24 @@ query I
 SELECT 1 + 2
 ----
 3
+
+# Mixed integer widths compare and match a simple CASE after widening.
+query IT rowsort
+SELECT a, CASE WHEN CAST(a AS SMALLINT) < CAST(2 AS BIGINT) THEN 'lt' ELSE 'ge' END FROM t WHERE a IS NOT NULL
+----
+1
+lt
+2
+ge
+3
+ge
+
+query IT rowsort
+SELECT a, CASE CAST(a AS SMALLINT) WHEN CAST(2 AS BIGINT) THEN 'two' ELSE 'other' END FROM t WHERE a IS NOT NULL
+----
+1
+other
+2
+two
+3
+other
