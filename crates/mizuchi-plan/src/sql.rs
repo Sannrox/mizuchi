@@ -14,17 +14,24 @@ use mizuchi_core::error::{Error, Result};
 
 /// Parse `sql` into statements using [`PostgreSqlDialect`].
 ///
-/// Empty input, syntax errors, and expressions nested deeper than
-/// [`MAX_EXPR_DEPTH`] return [`Error::Parse`].
+/// Empty input, input longer than [`MAX_SQL_BYTES`], syntax errors, and
+/// expressions nested deeper than [`MAX_EXPR_DEPTH`] return [`Error::Parse`].
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
+    if sql.len() > MAX_SQL_BYTES {
+        return Err(Error::Parse(format!(
+            "SQL input of {} bytes exceeds {MAX_SQL_BYTES} bytes",
+            sql.len()
+        )));
+    }
     if sql.len() <= INLINE_PARSE_BYTES {
         return parse_checked(sql);
     }
     // The parser builds operator chains (`a + a + ...`) in a loop, but
     // dropping one, rejected here or on a later syntax error inside the
     // parser, recurses once per level. Every level costs at least two bytes
-    // of input, so a stack sized to the input holds the whole tree.
-    let stack = PARSE_STACK_BASE.saturating_add(sql.len().saturating_mul(PARSE_STACK_PER_BYTE));
+    // of input, so a stack sized to the input holds the whole tree. The
+    // length cap above bounds it at about 1 GiB of reserved address space.
+    let stack = PARSE_STACK_BASE + sql.len() * PARSE_STACK_PER_BYTE;
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("mizuchi-parse".into())
@@ -35,6 +42,10 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             .map_err(|_| Error::Parse("parser panicked".into()))?
     })
 }
+
+/// Longest SQL text [`parse_sql`] accepts, in bytes. It bounds the parse
+/// thread's stack, which grows with the input.
+pub const MAX_SQL_BYTES: usize = 8 * 1024 * 1024;
 
 /// Inputs this short parse on the caller's thread: their deepest possible
 /// tree drops within a few hundred KiB of stack.
@@ -119,6 +130,21 @@ mod tests {
     fn empty_input_is_parse() {
         assert!(matches!(parse_sql("").unwrap_err(), Error::Parse(_)));
         assert!(matches!(parse_sql("   ").unwrap_err(), Error::Parse(_)));
+    }
+
+    #[test]
+    fn input_over_the_length_cap_fails_parse() {
+        let pad = |len: usize| {
+            let mut sql = String::from("SELECT 1");
+            sql.push_str(&" ".repeat(len - sql.len()));
+            sql
+        };
+        parse_sql(&pad(MAX_SQL_BYTES)).expect("at the cap");
+        let err = parse_sql(&pad(MAX_SQL_BYTES + 1)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Parse(m) if m.contains(&MAX_SQL_BYTES.to_string())),
+            "{err:?}"
+        );
     }
 
     #[test]
