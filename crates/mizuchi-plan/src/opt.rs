@@ -60,37 +60,10 @@ pub fn estimate_rows(plan: &LogicalPlan) -> Option<f64> {
         LogicalPlan::Join {
             left,
             right,
-            join_type: JoinType::Inner,
-            on: Some(on),
+            join_type,
+            on,
             ..
-        } => {
-            let lrows = estimate_rows(left)?;
-            let rrows = estimate_rows(right)?;
-            let ln = left.schema().fields().len();
-            let mut rows = f64::MAX;
-            let mut any = false;
-            for (a, b) in eq_nth_pairs(on) {
-                let (l_idx, r_idx) = if a < ln && b >= ln {
-                    (a, b - ln)
-                } else if b < ln && a >= ln {
-                    (b, a - ln)
-                } else {
-                    continue;
-                };
-                any = true;
-                let lndv = col_ndv(left, l_idx).unwrap_or(lrows);
-                let rndv = col_ndv(right, r_idx).unwrap_or(rrows);
-                rows = rows.min(inner_equi_rows(lrows, rrows, lndv, rndv));
-            }
-            if any && rows.is_finite() {
-                Some(rows.max(1.0))
-            } else {
-                Some(lrows.min(rrows).max(1.0))
-            }
-        }
-        LogicalPlan::Join { left, right, .. } => {
-            Some((estimate_rows(left)? * estimate_rows(right)?).max(1.0))
-        }
+        } => join_rows(left, right, *join_type, on.as_ref()),
         LogicalPlan::Aggregate { input, group, .. } => {
             let rows = estimate_rows(input)?;
             if group.is_empty() {
@@ -120,6 +93,96 @@ pub fn estimate_rows(plan: &LogicalPlan) -> Option<f64> {
         LogicalPlan::WorkScan { .. } => None,
         LogicalPlan::Scalar { .. } => Some(1.0),
     }
+}
+
+/// Estimated rows of a join, bounded by what its type guarantees: never
+/// above the cross product, a semi or anti join never above its left input,
+/// and an outer join never below the side(s) it preserves.
+fn join_rows(
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    join_type: JoinType,
+    on: Option<&Expr>,
+) -> Option<f64> {
+    let lrows = estimate_rows(left)?;
+    let rrows = estimate_rows(right)?;
+    let cross = lrows * rrows;
+    let keys = on.map(|on| equi_join_keys(left, right, lrows, rrows, on));
+    // Inner rows; a non-equi condition guesses the smaller input, as before.
+    let inner = match &keys {
+        None => cross,
+        Some(keys) => keys.inner.unwrap_or(lrows.min(rrows)),
+    };
+    // Fractions of each side with a match. Unknown without equality keys;
+    // a guess of "all match" keeps semi at its left bound and adds nothing
+    // to an outer join beyond the inner rows.
+    let left_matched = keys.as_ref().and_then(|k| k.left_matched).unwrap_or(1.0);
+    let right_matched = keys.as_ref().and_then(|k| k.right_matched).unwrap_or(1.0);
+    let (rows, floor) = match join_type {
+        JoinType::Inner | JoinType::Cross => (inner, 1.0),
+        JoinType::Semi => ((lrows * left_matched).min(lrows), 1.0),
+        JoinType::Anti | JoinType::NullAwareAnti => match &keys {
+            Some(k) if k.left_matched.is_some() => (lrows * (1.0 - left_matched), 1.0),
+            _ => (lrows, 1.0),
+        },
+        JoinType::Left => (inner + lrows * (1.0 - left_matched), lrows),
+        JoinType::Right => (inner + rrows * (1.0 - right_matched), rrows),
+        JoinType::Full => (
+            inner + lrows * (1.0 - left_matched) + rrows * (1.0 - right_matched),
+            lrows.max(rrows),
+        ),
+    };
+    let ceiling = match join_type {
+        JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti => lrows,
+        _ => cross,
+    };
+    Some(rows.max(floor).min(ceiling).max(1.0))
+}
+
+/// What the equality keys of a join condition say about its rows.
+struct EquiKeys {
+    /// Inner join rows from key NDVs, when the condition has an equality.
+    inner: Option<f64>,
+    /// Fraction of left rows whose key appears on the right.
+    left_matched: Option<f64>,
+    /// Fraction of right rows whose key appears on the left.
+    right_matched: Option<f64>,
+}
+
+/// Inner rows and match fractions from the column equalities in `on`,
+/// taking the most selective pair. A side's key NDV defaults to its rows.
+fn equi_join_keys(
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    lrows: f64,
+    rrows: f64,
+    on: &Expr,
+) -> EquiKeys {
+    let ln = left.schema().fields().len();
+    let mut keys = EquiKeys {
+        inner: None,
+        left_matched: None,
+        right_matched: None,
+    };
+    for (a, b) in eq_nth_pairs(on) {
+        let (l_idx, r_idx) = if a < ln && b >= ln {
+            (a, b - ln)
+        } else if b < ln && a >= ln {
+            (b, a - ln)
+        } else {
+            continue;
+        };
+        let lndv = col_ndv(left, l_idx).unwrap_or(lrows).max(1.0);
+        let rndv = col_ndv(right, r_idx).unwrap_or(rrows).max(1.0);
+        let rows = inner_equi_rows(lrows, rrows, lndv, rndv);
+        let min = |old: Option<f64>, new: f64| Some(old.map_or(new, |o: f64| o.min(new)));
+        keys.inner = min(keys.inner, rows);
+        // Containment: the side with fewer distinct keys has all of them
+        // on the other side.
+        keys.left_matched = min(keys.left_matched, (rndv / lndv).min(1.0));
+        keys.right_matched = min(keys.right_matched, (lndv / rndv).min(1.0));
+    }
+    keys
 }
 
 struct Optimizer {
@@ -2616,6 +2679,105 @@ mod tests {
         c.set_stats("d0", table_stats(10, 10, 0, 9)).unwrap();
         c.set_stats("d1", table_stats(10, 10, 0, 9)).unwrap();
         c
+    }
+
+    fn stats_scan(table: &str, rows: u64, ndv: u64) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: table.into(),
+            schema: id_schema(),
+            alias: None,
+            projection: None,
+            filters: Vec::new(),
+            stats: Some(table_stats(rows, ndv, 0, ndv as i64 - 1)),
+        }
+    }
+
+    fn id_join(left: LogicalPlan, right: LogicalPlan, join_type: JoinType) -> LogicalPlan {
+        let on = (join_type != JoinType::Cross)
+            .then(|| Expr::Binary(BinaryOp::Eq, Box::new(Expr::nth(0)), Box::new(Expr::nth(1))));
+        LogicalPlan::Join {
+            schema: join_schema(left.schema(), right.schema()),
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type,
+            on,
+        }
+    }
+
+    #[test]
+    fn join_estimates_follow_the_join_type() {
+        // 1000 rows over 100 keys against 10 rows over 10 keys: a tenth of
+        // the left keys match, and every right key does.
+        let est = |join_type| {
+            let plan = id_join(
+                stats_scan("l", 1000, 100),
+                stats_scan("r", 10, 10),
+                join_type,
+            );
+            estimate_rows(&plan).unwrap()
+        };
+        assert_eq!(est(JoinType::Inner), 100.0);
+        assert_eq!(est(JoinType::Cross), 10_000.0);
+        assert_eq!(est(JoinType::Semi), 100.0);
+        assert_eq!(est(JoinType::Anti), 900.0);
+        assert_eq!(est(JoinType::NullAwareAnti), 900.0);
+        assert_eq!(est(JoinType::Left), 1000.0);
+        assert_eq!(est(JoinType::Right), 100.0);
+        assert_eq!(est(JoinType::Full), 1000.0);
+    }
+
+    #[test]
+    fn join_estimates_stay_within_their_type_bounds() {
+        let types = [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+            JoinType::NullAwareAnti,
+        ];
+        for (lrows, lndv, rrows, rndv) in [(1000, 1000, 10, 10), (10, 10, 1000, 2), (50, 5, 50, 5)]
+        {
+            for join_type in types {
+                let plan = id_join(
+                    stats_scan("l", lrows, lndv),
+                    stats_scan("r", rrows, rndv),
+                    join_type,
+                );
+                let rows = estimate_rows(&plan).unwrap();
+                let (l, r) = (lrows as f64, rrows as f64);
+                let case = format!("{join_type} {lrows}/{lndv} x {rrows}/{rndv}: {rows}");
+                assert!((1.0..=l * r).contains(&rows), "{case}");
+                match join_type {
+                    JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti => {
+                        assert!(rows <= l, "{case}")
+                    }
+                    JoinType::Left => assert!(rows >= l, "{case}"),
+                    JoinType::Right => assert!(rows >= r, "{case}"),
+                    JoinType::Full => assert!(rows >= l.max(r), "{case}"),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_semi_join_input_is_not_costed_as_a_cross_product() {
+        let mut c = stats_catalog();
+        c.register("big", id_schema()).unwrap();
+        c.set_stats("big", table_stats(5000, 10, 0, 9)).unwrap();
+        // fact (1000 rows) semi d0 is at most 1000 rows, so it is the
+        // smaller input and builds; as a cross product (10 000) it would
+        // have pushed big to the build side.
+        let sql = "SELECT big.id FROM big JOIN \
+                   (SELECT id FROM fact WHERE id IN (SELECT id FROM d0)) f ON big.id = f.id";
+        let plan = optimize(plan_sql(sql, &c).unwrap()).unwrap();
+        let text = plan.explain();
+        let big = text.find("Scan big").unwrap_or_else(|| panic!("{text}"));
+        let fact = text.find("Scan fact").unwrap_or_else(|| panic!("{text}"));
+        assert!(big < fact, "the semi join side must build:\n{text}");
+        assert_idempotent(plan_sql(sql, &c).unwrap());
     }
 
     #[test]
