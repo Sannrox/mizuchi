@@ -3,11 +3,12 @@
 set -euo pipefail
 
 root="$(git rev-parse --show-toplevel)"
-cd "$root"
-git diff --quiet HEAD -- || { echo 'Source packaging requires a clean tracked tree' >&2; exit 1; }
+git -C "$root" diff --quiet HEAD -- || { echo 'Source packaging requires a clean tracked tree' >&2; exit 1; }
+# Resolve the output against the caller's directory before moving to the root.
 out="${1:?usage: package-source.sh OUTPUT_DIRECTORY}"
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
+cd "$root"
 version="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
 # The release workflow passes the verified tag; a dry run passes none.
 if [[ -n "${RELEASE_TAG:-}" && "$RELEASE_TAG" != "v$version" ]]; then

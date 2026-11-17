@@ -15,8 +15,9 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+# Path flags resolve against the caller's directory; only the defaults
+# point into the repository.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-cd "${ROOT}"
 
 MIZUCHI=""
 DUCKDB=""
