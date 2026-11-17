@@ -146,6 +146,65 @@ mod live {
         assert_eq!(n, 3);
     }
 
+    /// #252: partition bounds split the scan without filtering it, so NULLs
+    /// and values outside the bounds still come back.
+    #[test]
+    #[ignore = "needs a PostgreSQL server; not default cargo test"]
+    fn postgres_partitioned_scan_matches_unpartitioned() {
+        let url = std::env::var("MIZUCHI_POSTGRES_URL").expect("MIZUCHI_POSTGRES_URL");
+        let table = format!("mizuchi_parts_{}", std::process::id());
+        let mut client = Client::connect(&url, NoTls).expect("connect");
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {table};
+                 CREATE TABLE {table} (id BIGINT, name TEXT);
+                 INSERT INTO {table} VALUES
+                   (NULL, 'null'), (-50, 'below'), (0, 'lo'), (3, 'a'), (5, 'b'),
+                   (7, 'c'), (10, 'hi'), (500, 'above');"
+            ))
+            .expect("seed");
+        let source = source_from_url(&url);
+        let rows = |opts: PostgresReadOptions<'_>| -> Vec<(Option<i64>, String)> {
+            let mut out: Vec<_> = read_postgres(&source, opts)
+                .unwrap()
+                .iter()
+                .flat_map(|b| {
+                    let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                    let names = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+                    (0..b.num_rows())
+                        .map(|i| {
+                            (
+                                ids.is_valid(i).then(|| ids.value(i)),
+                                names.value(i).to_string(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let whole = rows(PostgresReadOptions {
+            table: Some(&table),
+            ..PostgresReadOptions::default()
+        });
+        assert_eq!(whole.len(), 8);
+        for n in [1, 4] {
+            let parts = rows(PostgresReadOptions {
+                table: Some(&table),
+                partition_column: Some("id"),
+                lower_bound: Some(0),
+                upper_bound: Some(10),
+                num_partitions: n,
+                ..PostgresReadOptions::default()
+            });
+            assert_eq!(parts, whole, "{n} partitions");
+        }
+        client
+            .batch_execute(&format!("DROP TABLE {table}"))
+            .expect("drop");
+    }
+
     /// #242: selecting a JSON or JSONB column used to panic in the reader.
     #[test]
     #[ignore = "needs a PostgreSQL server; not default cargo test"]

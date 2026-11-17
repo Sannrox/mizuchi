@@ -52,6 +52,9 @@ impl Default for PostgresSource {
     }
 }
 
+/// Most partitions, and so connections, one partitioned scan may open.
+pub const MAX_PARTITIONS: usize = 64;
+
 /// Options for [`read_postgres`] and [`postgres_scan_sql`].
 #[derive(Clone, Debug)]
 pub struct PostgresReadOptions<'a> {
@@ -63,13 +66,16 @@ pub struct PostgresReadOptions<'a> {
     pub projection: Option<&'a [String]>,
     /// Predicates pushed into `WHERE`.
     pub filters: Option<&'a [Expr]>,
-    /// Integer column that splits parallel range scans.
+    /// Integer column that splits parallel range scans. It does not filter:
+    /// NULLs and values outside the bounds land in the first or last range.
     pub partition_column: Option<&'a str>,
-    /// Inclusive lower bound for [`Self::partition_column`].
+    /// Lower split point for [`Self::partition_column`].
     pub lower_bound: Option<i64>,
-    /// Inclusive upper bound for [`Self::partition_column`].
+    /// Upper split point for [`Self::partition_column`].
     pub upper_bound: Option<i64>,
-    /// Parallel range count. `1` is a single scan.
+    /// Parallel range count, at most [`MAX_PARTITIONS`]. Each partition is
+    /// one thread and one PostgreSQL connection. `1` is a single scan. The
+    /// partitions together return exactly the rows of the unpartitioned scan.
     pub num_partitions: usize,
     /// Morsel size for decoded batches.
     pub policy: BatchPolicy,
@@ -144,27 +150,38 @@ pub fn postgres_scan_sql(opts: &PostgresReadOptions<'_>) -> Result<Vec<String>> 
                     "PostgreSQL partition lower_bound is greater than upper_bound".into(),
                 ));
             }
+            if n > MAX_PARTITIONS {
+                return Err(Error::Plan(format!(
+                    "PostgreSQL num_partitions {n} exceeds {MAX_PARTITIONS}; each partition opens one connection"
+                )));
+            }
+            if n == 1 {
+                return Ok(vec![base(None)]);
+            }
+            // The bounds only place the split points. The first range is open
+            // below and also takes NULL, the last is open above, so the
+            // partitions together return every row of the unpartitioned scan.
             let ident = quote_ident(col);
             let span = i128::from(hi) - i128::from(lo);
             let n128 = i128::from(n as u32);
+            let split = |i: usize| {
+                i64::try_from(i128::from(lo) + (span * i128::from(i as u32)) / n128)
+                    .map_err(|_| Error::Plan("PostgreSQL partition bound overflow".into()))
+            };
             let mut sqls = Vec::with_capacity(n);
             for i in 0..n {
-                let start = i64::try_from(i128::from(lo) + (span * i128::from(i as u32)) / n128)
-                    .map_err(|_| Error::Plan("PostgreSQL partition bound overflow".into()))?;
-                if i + 1 == n {
-                    sqls.push(base(Some(format!(
-                        "{ident} >= {start} AND {ident} <= {hi}"
-                    ))));
+                let range = if i == 0 {
+                    format!("({ident} < {end} OR {ident} IS NULL)", end = split(1)?)
+                } else if i + 1 == n {
+                    format!("{ident} >= {start}", start = split(i)?)
                 } else {
-                    let end =
-                        i64::try_from(i128::from(lo) + (span * i128::from((i + 1) as u32)) / n128)
-                            .map_err(|_| {
-                                Error::Plan("PostgreSQL partition bound overflow".into())
-                            })?;
-                    sqls.push(base(Some(format!(
-                        "{ident} >= {start} AND {ident} < {end}"
-                    ))));
-                }
+                    format!(
+                        "{ident} >= {start} AND {ident} < {end}",
+                        start = split(i)?,
+                        end = split(i + 1)?
+                    )
+                };
+                sqls.push(base(Some(range)));
             }
             Ok(sqls)
         }
@@ -211,12 +228,19 @@ fn read_postgres_connect(
             std::thread::spawn(move || run_query(&src, &sql, policy))
         })
         .collect();
+    // Join every worker before reporting an error, so no partition keeps its
+    // connection open after the scan returns.
+    let parts: Vec<Result<Vec<Batch>>> = handles
+        .into_iter()
+        .map(|handle| {
+            handle
+                .join()
+                .map_err(|_| Error::Io("PostgreSQL partition worker panicked".into()))?
+        })
+        .collect();
     let mut out = Vec::new();
-    for handle in handles {
-        let part = handle
-            .join()
-            .map_err(|_| Error::Io("PostgreSQL partition worker panicked".into()))??;
-        out.extend(part);
+    for part in parts {
+        out.extend(part?);
     }
     Ok(out)
 }
@@ -605,9 +629,53 @@ mod tests {
         })
         .unwrap();
         assert_eq!(sqls.len(), 2);
-        assert!(sqls[0].contains("\"id\" >= 0 AND \"id\" < 49"));
-        assert!(sqls[1].contains("\"id\" >= 49 AND \"id\" <= 99"));
+        assert!(sqls[0].ends_with("WHERE (\"id\" < 49 OR \"id\" IS NULL)"));
+        assert!(sqls[1].ends_with("WHERE \"id\" >= 49"));
         assert!(sqls[0].starts_with("SELECT * FROM \"t\" WHERE "));
+    }
+
+    /// Partition bounds only split the scan: one partition reads everything,
+    /// the middle range is half open, and a pushed filter still applies to
+    /// the NULL-taking first range.
+    #[test]
+    fn scan_sql_partitions_cover_null_and_out_of_bound_rows() {
+        let filters = [Expr::Binary(
+            BinaryOp::Gt,
+            Box::new(Expr::column("v")),
+            Box::new(Expr::lit_i64(0)),
+        )];
+        let opts = PostgresReadOptions {
+            table: Some("t"),
+            filters: Some(&filters),
+            partition_column: Some("id"),
+            lower_bound: Some(0),
+            upper_bound: Some(30),
+            num_partitions: 1,
+            ..PostgresReadOptions::default()
+        };
+        let one = postgres_scan_sql(&opts).unwrap();
+        assert_eq!(
+            one,
+            vec!["SELECT * FROM \"t\" WHERE (\"v\" > 0)".to_string()]
+        );
+        let three = postgres_scan_sql(&PostgresReadOptions {
+            num_partitions: 3,
+            ..opts.clone()
+        })
+        .unwrap();
+        assert_eq!(
+            three,
+            vec![
+                "SELECT * FROM \"t\" WHERE (\"v\" > 0) AND (\"id\" < 10 OR \"id\" IS NULL)",
+                "SELECT * FROM \"t\" WHERE (\"v\" > 0) AND \"id\" >= 10 AND \"id\" < 20",
+                "SELECT * FROM \"t\" WHERE (\"v\" > 0) AND \"id\" >= 20",
+            ]
+        );
+        let too_many = postgres_scan_sql(&PostgresReadOptions {
+            num_partitions: MAX_PARTITIONS + 1,
+            ..opts
+        });
+        assert!(too_many.is_err());
     }
 
     #[test]
@@ -622,7 +690,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(sqls.len(), 3);
-        assert!(sqls[2].contains(&format!("<= {max}", max = i64::MAX)));
+        assert!(sqls[1].contains(&format!("< {}", i64::MAX / 3 * 2)));
+        assert!(sqls[2].ends_with(&format!("\"id\" >= {}", i64::MAX / 3 * 2)));
     }
 
     #[test]
