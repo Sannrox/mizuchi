@@ -40,26 +40,41 @@ fn sample() -> Batch {
     .unwrap()
 }
 
+/// Sorted non-null values of an Int64 column. Any other type panics, so a
+/// column that was not widened to Int64 fails the caller.
 fn col_i64(batches: &[Batch], name: &str) -> Vec<i64> {
     let mut out = Vec::new();
     for b in batches {
         let col = b.column_by_name(name).unwrap();
-        if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-            for i in 0..a.len() {
-                if !a.is_null(i) {
-                    out.push(a.value(i));
-                }
-            }
-        } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
-            for i in 0..a.len() {
-                if !a.is_null(i) {
-                    out.push(a.value(i) as i64);
-                }
-            }
-        }
+        let a = col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap_or_else(|| panic!("{name} is {}, not Int64", col.data_type()));
+        out.extend(a.iter().flatten());
     }
     out.sort();
     out
+}
+
+/// After add `label`, rename `id` to `key` and widen `key` to Int64: the
+/// schema holds both, `key` is Int64 with its values, and `label` is null.
+fn assert_evolved(got: &[Batch]) {
+    let schema = got[0].schema();
+    assert_eq!(
+        schema.field_with_name("key").ok().map(|f| f.data_type()),
+        Some(&DataType::Int64),
+        "{schema:?}"
+    );
+    assert!(schema.field_with_name("id").is_err(), "{schema:?}");
+    assert_eq!(col_i64(got, "key"), vec![1, 2]);
+    let label = got[0].column_by_name("label").expect("label column");
+    assert_eq!(label.data_type(), &DataType::Utf8);
+    let rows: usize = got.iter().map(|b| b.num_rows()).sum();
+    let nulls: usize = got
+        .iter()
+        .map(|b| b.column_by_name("label").unwrap().null_count())
+        .sum();
+    assert_eq!(nulls, rows, "label must be null for every existing row");
 }
 
 #[test]
@@ -175,16 +190,7 @@ fn schema_evolution_add_rename_widen() {
         },
     )
     .unwrap();
-    let got = read_delta(&dest, TimeTravel::Latest).unwrap();
-    let schema = got[0].schema();
-    assert!(schema.field_with_name("key").is_ok(), "{schema:?}");
-    assert!(schema.field_with_name("label").is_ok(), "{schema:?}");
-    assert_eq!(
-        schema.field_with_name("key").unwrap().data_type(),
-        &DataType::Int64
-    );
-    assert_eq!(col_i64(&got, "key"), vec![1, 2]);
-    assert!(got[0].column_by_name("label").unwrap().is_null(0));
+    assert_evolved(&read_delta(&dest, TimeTravel::Latest).unwrap());
 
     let ice = tmp("evolve-ice");
     write_iceberg(&ice, &[batch], WriteMode::Overwrite).unwrap();
@@ -212,8 +218,7 @@ fn schema_evolution_add_rename_widen() {
         },
     )
     .unwrap();
-    let got = read_iceberg(&ice, TimeTravel::Latest).unwrap();
-    assert_eq!(col_i64(&got, "key"), vec![1, 2]);
+    assert_evolved(&read_iceberg(&ice, TimeTravel::Latest).unwrap());
     let _ = fs::remove_dir_all(&dest);
     let _ = fs::remove_dir_all(&ice);
 }
@@ -483,10 +488,8 @@ fn merge_delta_conflict_restores_session_table() {
         )
         .unwrap_err();
     fs::set_permissions(&log, original).unwrap();
-    assert!(
-        err.to_string().contains("conflict") || err.to_string().contains("io"),
-        "{err}"
-    );
+    // The log directory is read-only, so the commit fails as an I/O error.
+    assert!(matches!(err, mizuchi::Error::Io(_)), "{err:?}");
     let out = session.execute_sql("SELECT id, v FROM t").unwrap();
     assert_eq!(
         col_i64(&out, "v"),
@@ -591,6 +594,10 @@ fn store_merge_and_rest_catalog() {
     session
         .write_iceberg_store(&store, "ice/t", "t", WriteMode::Overwrite)
         .unwrap();
+    let ice = mizuchi::read_iceberg_store(&store, "ice/t", TimeTravel::Latest).unwrap();
+    assert_eq!(col_i64(&ice, "id"), vec![1, 2]);
+    // The merge above also updated the session table, so row 1 carries 7.
+    assert_eq!(col_i64(&ice, "v"), vec![7, 20]);
     let mut cat = IcebergRestCatalog::memory();
     cat.create_table(TableMeta {
         ident: TableIdent::parse("t").unwrap(),
