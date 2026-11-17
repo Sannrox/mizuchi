@@ -121,7 +121,11 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
+      # python/ is its own Cargo workspace with its own target/; the default
+      # caches only the root target/ and leaves the wheel build cold.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: python
       - name: Clippy Python crate
         run: cargo clippy --manifest-path python/Cargo.toml -- -D warnings
       - name: Build and install wheel
