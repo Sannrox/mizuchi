@@ -99,9 +99,20 @@ expect_failure() {
   [[ "$output" == *"$message"* ]] || fail "verification failed without expected message: ${message}"
 }
 
+# Kills the self-test's gpg-agent and removes its keyring and work tree.
+# Global, not local: the EXIT trap runs after self_test has returned.
+SELF_TEST_TMP=""
+self_test_cleanup() {
+  [[ -n "$SELF_TEST_TMP" ]] || return 0
+  GNUPGHOME="${SELF_TEST_TMP}/gpg" gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+  rm -rf "$SELF_TEST_TMP" || true
+}
+
 self_test() {
   local tmp work gnupg fpr cargo_toml
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/mizuchi-release-tag.XXXXXX")"
+  SELF_TEST_TMP="$tmp"
+  trap self_test_cleanup EXIT
   work="${tmp}/work"
   gnupg="${tmp}/gpg"
   mkdir -m 700 "$gnupg"
@@ -172,8 +183,6 @@ self_test() {
   # commit is refused.
   (cd "$work" && expect_failure "resolves to ${first}, expected ${rc}" v0.1.0-rc.1 "$rc")
 
-  gpgconf --kill gpg-agent >/dev/null 2>&1 || true
-  rm -rf "$tmp" || true
   printf 'self-test passed\n'
 }
 
