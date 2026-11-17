@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Fail when any query is slower with N workers than with one worker.
+# Fail when any query is slower with N workers than with one worker, when a
+# query of either run is missing from the other, or when a run has no
+# queries. Exits 2 on a usage error.
 # Compares two gb_bench JSON runs of the same suite and scale: one at
 # --workers 1 and one at --workers N. A query fails when its N-worker time
 # exceeds FACTOR times its 1-worker time (default 1.25, for runner noise)
@@ -29,7 +31,7 @@ while [ $# -gt 0 ]; do
     --floor-ms) FLOOR_MS="$2"; shift 2 ;;
     --summary) SUMMARY="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -63,6 +65,10 @@ if one.get("sf") != many.get("sf"):
 factor = float(os.environ["FACTOR"])
 floor = float(os.environ["FLOOR_MS"])
 single = {q["id"]: float(q["reported_ms"]) for q in one.get("queries", [])}
+multi = {q["id"]: float(q["reported_ms"]) for q in many.get("queries", [])}
+for path, run in ((os.environ["ONE"], single), (os.environ["MANY"], multi)):
+    if not run:
+        sys.exit(f"{path} has no queries")
 
 lines = [
     f"### Worker scaling ({many.get('sf')}, 1 vs {n} workers)",
@@ -71,8 +77,9 @@ lines = [
     "| --- | ---: | ---: | ---: |",
 ]
 errors = []
-for q in many.get("queries", []):
-    qid, ms = q["id"], float(q["reported_ms"])
+for qid in sorted(single.keys() - multi.keys()):
+    errors.append(f"{qid}: missing from the {n}-worker run")
+for qid, ms in multi.items():
     base = single.get(qid)
     if base is None:
         errors.append(f"{qid}: missing from the 1-worker run")
