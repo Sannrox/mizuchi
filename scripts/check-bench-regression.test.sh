@@ -57,4 +57,10 @@ expect "a scale without baseline entries fails" 1 "has no entries for scale sf1"
 
 expect "a usage error is not a regression" 2 "usage:" --scale tiny
 
+# Relative path flags resolve against the caller's directory, not the root.
+run "$(q tpch_q1 100.0),$(q tpch_q3 110.0)"
+mkdir -p "${WORK}/sub"
+(cd "${WORK}/sub" && expect "relative paths resolve from the caller" 0 \
+  "regression check passed" --scale tiny --mizuchi ../mizuchi.json --baseline ../baseline.json)
+
 echo "check-bench-regression: ok"
