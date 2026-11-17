@@ -138,10 +138,17 @@ fn os_denied_read_is_io() {
     let old = perms.mode();
     perms.set_mode(0o000);
     std::fs::set_permissions(&data, perms.clone()).unwrap();
+    // Root, as in many containers, ignores file modes; only assert when the
+    // OS really denies the open.
+    let denied = std::fs::File::open(&data).is_err();
     let err = s.register_parquet("x", &data, ParquetReadOptions::default());
     perms.set_mode(old);
     let _ = std::fs::set_permissions(&data, perms);
     let _ = std::fs::remove_dir_all(&root);
+    if !denied {
+        eprintln!("skipping os_denied_read_is_io: the OS did not deny a mode-000 read");
+        return;
+    }
     assert!(matches!(err, Err(Error::Io(_))), "{err:?}");
 }
 
