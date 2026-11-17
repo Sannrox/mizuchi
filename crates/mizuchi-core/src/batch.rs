@@ -132,10 +132,17 @@ impl Batch {
         self.inner.column_by_name(name)
     }
 
-    /// Select rows by index. A contiguous run is a zero-copy slice.
+    /// Select rows by index. A contiguous run is a zero-copy slice. An index
+    /// past the last row is an `InvalidBatch` error.
     pub fn gather(&self, indices: &[u32]) -> Result<Self> {
         if indices.is_empty() {
             return Self::empty(self.schema());
+        }
+        let rows = self.num_rows();
+        if let Some(&bad) = indices.iter().find(|&&i| i as usize >= rows) {
+            return Err(Error::InvalidBatch(format!(
+                "gather index {bad} out of range for {rows} rows"
+            )));
         }
         if let Some((offset, length)) = contiguous_indices(indices) {
             return self.slice(offset, length);
@@ -296,6 +303,19 @@ mod tests {
         ]));
         let batch = Batch::try_new(schema, vec![ids.clone(), names.clone()]).unwrap();
         (ids, names, batch)
+    }
+
+    #[test]
+    fn gather_out_of_range_index_is_an_error() {
+        let (_, _, batch) = sample();
+        let rows = batch.num_rows() as u32;
+        for indices in [vec![rows], vec![0, rows], vec![2, 0, rows + 5]] {
+            let err = batch.gather(&indices);
+            assert!(
+                matches!(err, Err(Error::InvalidBatch(_))),
+                "{indices:?}: {err:?}"
+            );
+        }
     }
 
     #[test]
