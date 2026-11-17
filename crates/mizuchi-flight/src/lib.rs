@@ -34,6 +34,7 @@ use arrow_flight::{
 };
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt, stream};
+use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -158,18 +159,60 @@ fn serve_until(
     lease_dir: Option<PathBuf>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
-    let worker = FlightWorker::new(spill_dir, lease_dir)?;
-    let rt = tokio::runtime::Runtime::new().map_err(|e| Error::Io(e.to_string()))?;
-    rt.block_on(async move {
-        Server::builder()
-            .add_service(FlightServiceServer::new(worker))
-            .serve_with_shutdown(bind, shutdown)
-            .await
-            .map_err(|e| Error::Io(e.to_string()))
-    })
+    let listener = std::net::TcpListener::bind(bind).map_err(|e| Error::Io(e.to_string()))?;
+    ReadyWorker::prepare(listener, spill_dir, lease_dir)?.serve(shutdown)
 }
 
-/// Bind `127.0.0.1:0` on a background thread. Fails closed without a grant.
+/// A worker whose fallible setup is done: the runtime, the worker state, and
+/// the listener it serves on. Only serving remains, so a caller that builds
+/// one knows the worker will accept connections on the bound address.
+struct ReadyWorker {
+    rt: tokio::runtime::Runtime,
+    listener: tokio::net::TcpListener,
+    worker: FlightWorker,
+}
+
+impl ReadyWorker {
+    fn prepare(
+        listener: std::net::TcpListener,
+        spill_dir: Option<PathBuf>,
+        lease_dir: Option<PathBuf>,
+    ) -> Result<Self> {
+        let io = |e: std::io::Error| Error::Io(e.to_string());
+        let worker = FlightWorker::new(spill_dir, lease_dir)?;
+        let rt = tokio::runtime::Runtime::new().map_err(io)?;
+        listener.set_nonblocking(true).map_err(io)?;
+        let listener = {
+            let _ctx = rt.enter();
+            tokio::net::TcpListener::from_std(listener).map_err(io)?
+        };
+        Ok(Self {
+            rt,
+            listener,
+            worker,
+        })
+    }
+
+    fn serve(self, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
+        let Self {
+            rt,
+            listener,
+            worker,
+        } = self;
+        rt.block_on(async move {
+            Server::builder()
+                .add_service(FlightServiceServer::new(worker))
+                .serve_with_incoming_shutdown(TcpIncoming::from(listener), shutdown)
+                .await
+                .map_err(|e| Error::Io(e.to_string()))
+        })
+    }
+}
+
+/// Bind `127.0.0.1:0` and serve a worker on a background thread. Fails
+/// closed without a grant. The worker serves on the listener bound here, so
+/// no other process can take the port, and setup errors (spill or lease
+/// directory, runtime) return here instead of from the thread.
 pub fn spawn_worker(
     allow_network: bool,
     spill_dir: Option<PathBuf>,
@@ -185,14 +228,8 @@ pub fn spawn_worker(
     let addr = listener
         .local_addr()
         .map_err(|e| Error::Io(e.to_string()))?;
-    drop(listener);
-    let handle = std::thread::spawn(move || serve_worker(addr, true, spill_dir, lease_dir));
-    for _ in 0..50 {
-        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(20)).is_ok() {
-            return Ok((addr, handle));
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let ready = ReadyWorker::prepare(listener, spill_dir, lease_dir)?;
+    let handle = std::thread::spawn(move || ready.serve(std::future::pending()));
     Ok((addr, handle))
 }
 
@@ -1383,6 +1420,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rows(&empty.unwrap()), 0);
         assert_eq!(rows(&full.unwrap()), 2);
+    }
+
+    #[test]
+    fn a_worker_that_cannot_start_fails_spawn() {
+        // A lease directory path that is a regular file cannot be created,
+        // so the worker never serves; spawn_worker must say so.
+        let dir = spill_dir("not-a-dir");
+        let file = dir.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let res = spawn_worker(true, None, Some(file.join("lease")));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(res, Err(Error::Io(_))),
+            "{:?}",
+            res.map(|(a, _)| a)
+        );
     }
 
     #[test]
