@@ -5,7 +5,7 @@ set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 git -C "$root" diff --quiet HEAD -- || { echo 'Source packaging requires a clean tracked tree' >&2; exit 1; }
 # Resolve the output against the caller's directory before moving to the root.
-out="${1:?usage: package-source.sh OUTPUT_DIRECTORY}"
+out="${1:?usage: package.sh OUTPUT_DIRECTORY}"
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 cd "$root"

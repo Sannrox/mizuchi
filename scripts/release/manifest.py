@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """Write the Tenkai family release manifest (tenkai.family-release-manifest.v1).
 
-    scripts/release-manifest.py --version V --git-sha SHA --dist DIR --out FILE
+    scripts/release/manifest.py --version V --git-sha SHA --dist DIR --out FILE
         [--tag vV] [--image NAME=sha256:...] [--attestation URL]...
-        [--commits FILE --prs FILE]
-    scripts/release-manifest.py --self-test
 
 `binaries` are the downloadable release assets in DIR; the image archive is
-listed under `images` by its registry digest instead. Gate flags come from the
-labels of the pull requests whose squash commits (`... (#N)`) are in the
-release: `--commits` holds one subject per line, `--prs` the JSON of
-`gh pr list --json number,labels`. A commit naming a pull request missing from
-that list fails, so a truncated lookup cannot drop a gate.
+listed under `images` by its registry digest instead. With `--tag`, gate flags
+come from the labels of the pull requests whose squash commits (`... (#N)`)
+are in the release since the previous stable tag, read with `git log` from the
+current directory and `gh pr list` (needs GH_TOKEN and GH_REPO). A failed
+lookup, or a commit naming a pull request missing from the list, fails, so a
+truncated lookup cannot drop a gate.
 """
 
 from __future__ import annotations
@@ -21,8 +20,8 @@ import hashlib
 import json
 import pathlib
 import re
+import subprocess
 import sys
-import tempfile
 
 SCHEMA = "tenkai.family-release-manifest.v1"
 COMPONENT = "mizuchi"
@@ -97,49 +96,29 @@ def build_manifest(
     }
 
 
-def expect_exit(message: str, call) -> None:
-    try:
-        call()
-    except SystemExit as exc:
-        assert message in str(exc), exc
-    else:
-        raise AssertionError(f"expected failure: {message}")
+def run(*args: str) -> str:
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"{' '.join(args[:3])} failed: {result.stderr.strip()}")
+    return result.stdout
 
 
-def self_test() -> None:
-    prs = [
-        {"number": 7, "labels": [{"name": "risk:breaking"}, {"name": "area:exec"}]},
-        {"number": 8, "labels": [{"name": "RISK:migration"}]},
-        {"number": 9, "labels": []},
-    ]
-    subjects = ["feat!: drop x (#7)", "fix: y (#8)", "docs: z (#9)", "direct push"]
-    assert gate_flags(subjects, prs) == ["breaking", "migration"]
-    expect_exit("#10", lambda: gate_flags(["fix: lost (#10)"], prs))
-    for bad in ["ghcr.io/x:latest=sha256:" + "a" * 64, "ghcr.io/x=abc", "ghcr.io/x@sha256:1=sha256:" + "a" * 64]:
-        expect_exit("image must be", lambda bad=bad: parse_image(bad))
-    image = parse_image("ghcr.io/sannrox/mizuchi:0.1.0=sha256:" + "b" * 64)
-    with tempfile.TemporaryDirectory() as tmp:
-        dist = pathlib.Path(tmp)
-        for name in ["mizuchi-0.1.0-source.tar.gz", "mizuchi-0.1.0-image.tar.gz", "SHA256SUMS", "mizuchi.cdx.json"]:
-            (dist / name).write_bytes(b"x")
-        manifest = build_manifest(
-            version="0.1.0", git_sha="a" * 40, tag="v0.1.0", dist=dist,
-            images=[image], attestations=["https://example.invalid/a/1"], flags=[],
-        )
-        assert [item["name"] for item in manifest["binaries"]] == ["mizuchi-0.1.0-source.tar.gz"]
-        assert DIGEST.fullmatch(manifest["binaries"][0]["digest"])
-        assert manifest["images"] == [image]
-        expect_exit("full lowercase SHA", lambda: build_manifest(
-            version="0.1.0", git_sha="abc", tag=None, dist=dist, images=[], attestations=[], flags=[]))
-        expect_exit("does not match", lambda: build_manifest(
-            version="0.1.0", git_sha="a" * 40, tag="v0.2.0", dist=dist, images=[], attestations=[], flags=[]))
-    print("release-manifest self-test passed")
+def release_subjects(tag: str) -> list[str]:
+    """Commit subjects since the previous stable v* tag, so an upgrade from
+    that release sees every gate, including ones shipped in a pre-release."""
+    previous = subprocess.run(
+        ["git", "describe", "--tags", "--abbrev=0", "--match", "v*", "--exclude", "v*-*", f"{tag}^"],
+        capture_output=True, text=True,
+    )
+    span = f"{previous.stdout.strip()}..{tag}" if previous.returncode == 0 else tag
+    return run("git", "log", "--format=%s", span).splitlines()
+
+
+def merged_prs() -> list[dict]:
+    return json.loads(run("gh", "pr", "list", "--state", "merged", "--limit", "1000", "--json", "number,labels"))
 
 
 def main(argv: list[str]) -> None:
-    if argv == ["--self-test"]:
-        self_test()
-        return
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", required=True)
     parser.add_argument("--git-sha", required=True)
@@ -148,14 +127,8 @@ def main(argv: list[str]) -> None:
     parser.add_argument("--out", required=True, type=pathlib.Path)
     parser.add_argument("--image", action="append", default=[], type=parse_image)
     parser.add_argument("--attestation", action="append", default=[])
-    parser.add_argument("--commits", type=pathlib.Path)
-    parser.add_argument("--prs", type=pathlib.Path)
     args = parser.parse_args(argv)
-    if (args.commits is None) != (args.prs is None):
-        parser.error("--commits and --prs go together")
-    flags = []
-    if args.commits is not None:
-        flags = gate_flags(args.commits.read_text().splitlines(), json.loads(args.prs.read_text()))
+    flags = gate_flags(release_subjects(args.tag), merged_prs()) if args.tag else []
     manifest = build_manifest(
         version=args.version, git_sha=args.git_sha, tag=args.tag, dist=args.dist,
         images=args.image, attestations=args.attestation, flags=flags,
