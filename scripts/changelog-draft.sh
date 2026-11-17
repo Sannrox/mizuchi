@@ -28,8 +28,16 @@ labelled() {
 breaking_prs=" $(labelled risk:breaking | tr '\n' ' ') "
 migration_prs=" $(labelled risk:migration | tr '\n' ' ') "
 
+# A plain assignment so `set -e` sees a failed `git log`; a substitution in
+# the `for` word list would hide it and draft an empty section.
+range="${since}..origin/main"
+if ! shas="$(git log --first-parent --reverse --format=%H "${range}")"; then
+  echo "changelog-draft: cannot read commits in ${range}" >&2
+  exit 1
+fi
+
 breaking="" upgrade="" added="" changed="" fixed=""
-for sha in $(git log --first-parent --reverse --format=%H "${since}..origin/main"); do
+for sha in ${shas}; do
   subject="$(git log -1 --format=%s "${sha}")"
   body="$(git log -1 --format=%b "${sha}")"
   pr="$(sed -nE 's/.*\(#([0-9]+)\)$/\1/p' <<<"${subject}")"
