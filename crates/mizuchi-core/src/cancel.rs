@@ -53,18 +53,47 @@ impl CancelToken {
     }
 
     /// A token that is cancelled when either `self` or `other` is cancelled.
-    /// Does not mutate either input, so concurrent queries stay isolated.
+    /// The merged token has its own flag, so cancelling it leaves both inputs
+    /// running and concurrent queries stay isolated.
     pub fn merge(&self, other: &CancelToken) -> CancelToken {
-        let mut extra = self.extra_flags();
+        let mut extra = vec![self.flag.clone()];
+        extra.extend(self.extra_flags());
         extra.push(other.flag.clone());
         extra.extend(other.extra_flags());
         CancelToken {
-            flag: self.flag.clone(),
+            flag: Arc::default(),
             extra: Arc::new(Mutex::new(extra)),
         }
     }
 
     fn extra_flags(&self) -> Vec<Arc<AtomicBool>> {
         self.extra.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merged_token_follows_its_inputs_without_cancelling_them() {
+        let session = CancelToken::new();
+        let query = CancelToken::new();
+        let merged = session.merge(&query);
+        merged.cancel();
+        assert!(merged.is_cancelled());
+        assert!(
+            !session.is_cancelled(),
+            "cancelling the merge cancelled the session"
+        );
+        assert!(
+            !query.is_cancelled(),
+            "cancelling the merge cancelled the query"
+        );
+
+        // Either input, at any merge depth, still cancels the merged token.
+        let outer = session.merge(&query).merge(&CancelToken::new());
+        session.cancel();
+        assert!(outer.is_cancelled());
     }
 }
