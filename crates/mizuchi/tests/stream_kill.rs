@@ -154,16 +154,29 @@ fn unique(tag: &str) -> PathBuf {
     p
 }
 
+/// Where the latest child's stderr goes; each spawn truncates it, so a
+/// failure message shows the run that failed. The child runs with
+/// `--nocapture` so a panic reaches this file instead of libtest's stdout.
+fn stderr_path(root: &Path) -> PathBuf {
+    root.join("child.stderr")
+}
+
+/// The latest child's stderr, for failure messages.
+fn child_stderr(root: &Path) -> String {
+    fs::read_to_string(stderr_path(root)).unwrap_or_else(|e| format!("<no stderr: {e}>"))
+}
+
 fn spawn_child(root: &Path, pause_after: Option<usize>) -> std::process::Child {
+    let stderr = fs::File::create(stderr_path(root)).expect("child stderr file");
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     if let Some(p) = pause_after {
         cmd.env("MIZUCHI_STREAM_PAUSE_AFTER", p.to_string());
     }
     cmd.env("MIZUCHI_STREAM_CHILD", "1")
         .env("MIZUCHI_STREAM_ROOT", root)
-        .args(["--exact", "child_runs_checkpointed_query"])
+        .args(["--exact", "child_runs_checkpointed_query", "--nocapture"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("spawn child")
 }
@@ -206,7 +219,8 @@ fn kill_and_restart_matches_batch_reference() {
         while committed_next(&root.join("chk")) <= pause as u64 {
             assert!(
                 child.try_wait().unwrap().is_none(),
-                "seed {seed} child exited before its pause point"
+                "seed {seed} child exited before its pause point; stderr:\n{}",
+                child_stderr(&root)
             );
             assert!(
                 std::time::Instant::now() < deadline,
@@ -235,7 +249,8 @@ fn kill_and_restart_matches_batch_reference() {
                 Some(status) => {
                     assert!(
                         status.success(),
-                        "seed {seed} child exited {status} after {attempt} restarts"
+                        "seed {seed} child exited {status} after {attempt} restarts; stderr:\n{}",
+                        child_stderr(&root)
                     );
                     break;
                 }
