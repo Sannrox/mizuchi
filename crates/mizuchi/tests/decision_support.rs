@@ -1,8 +1,10 @@
 //! Tiny TPC-H / TPC-DS style suite.
 //!
 //! A deterministic generator loads in-memory Arrow tables. The harness runs a
-//! fixed query set and writes JSON with per-query wall time and memory. Dates
-//! are days since 1992-01-01 (Int64) so filters stay in the engine dialect.
+//! fixed query set and prints JSON with per-query wall time, row count and
+//! `input_plus_result_bytes` (input table bytes plus result bytes, a size
+//! figure rather than measured peak memory). Dates are days since 1992-01-01
+//! (Int64) so filters stay in the engine dialect.
 //! Default `cargo test` uses scale 1 (tens of rows). Larger scales are an
 //! ignored test so offline CI stays free of bulky datasets.
 
@@ -16,7 +18,7 @@ use ds_common::{QUERIES, batch_bytes, load};
 struct QueryRow {
     id: &'static str,
     elapsed_ms: f64,
-    memory_bytes: u64,
+    input_plus_result_bytes: u64,
     rows: usize,
 }
 
@@ -37,7 +39,10 @@ impl SuiteReport {
             s.push_str("    {\n");
             s.push_str(&format!("      \"id\": \"{}\",\n", q.id));
             s.push_str(&format!("      \"elapsed_ms\": {:.3},\n", q.elapsed_ms));
-            s.push_str(&format!("      \"memory_bytes\": {},\n", q.memory_bytes));
+            s.push_str(&format!(
+                "      \"input_plus_result_bytes\": {},\n",
+                q.input_plus_result_bytes
+            ));
             s.push_str(&format!("      \"rows\": {}\n", q.rows));
             s.push_str("    }");
             if i + 1 < self.queries.len() {
@@ -64,7 +69,7 @@ fn run_suite(scale: u32) -> SuiteReport {
         queries.push(QueryRow {
             id: spec.id,
             elapsed_ms,
-            memory_bytes: input_bytes.saturating_add(result_bytes),
+            input_plus_result_bytes: input_bytes.saturating_add(result_bytes),
             rows,
         });
     }
@@ -163,13 +168,13 @@ fn tiny_scale_suite_reports_json() {
     for (q, spec) in report.queries.iter().zip(QUERIES) {
         assert_eq!(q.id, spec.id);
         assert!(q.elapsed_ms >= 0.0, "{}", q.id);
-        assert!(q.memory_bytes >= report.input_bytes, "{}", q.id);
+        assert!(q.input_plus_result_bytes >= report.input_bytes, "{}", q.id);
     }
     let json = report.to_json();
     println!("{json}");
     assert!(json.contains("\"suite\": \"decision-support\""));
     assert!(json.contains("\"elapsed_ms\""));
-    assert!(json.contains("\"memory_bytes\""));
+    assert!(json.contains("\"input_plus_result_bytes\""));
     assert!(json.contains("\"tpch_q1\""));
     assert!(json.contains("\"tpch_q6\""));
     assert!(json.contains("\"tpcds_store_sales\""));
