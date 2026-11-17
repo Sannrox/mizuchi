@@ -85,9 +85,17 @@ fn run_from_checkpoint(root: &Path) {
         StreamQuery::try_new(schema(), cfg(root)).expect("new query")
     };
     let start = committed_next(&root.join("chk")) as usize;
-    for (ts, k, v) in events.into_iter().skip(start) {
+    // A child spawned with a pause point stops after that trigger commits
+    // and waits to be killed, so the parent kills it after known progress.
+    let pause: Option<usize> = std::env::var("MIZUCHI_STREAM_PAUSE_AFTER")
+        .ok()
+        .and_then(|p| p.parse().ok());
+    for (i, (ts, k, v)) in events.into_iter().enumerate().skip(start) {
         q.ingest(row(ts, k, v)).unwrap();
         q.trigger().unwrap();
+        if pause == Some(i) {
+            std::thread::sleep(Duration::from_secs(600));
+        }
     }
 }
 
@@ -146,9 +154,12 @@ fn unique(tag: &str) -> PathBuf {
     p
 }
 
-fn spawn_child(root: &Path) -> std::process::Child {
-    Command::new(std::env::current_exe().unwrap())
-        .env("MIZUCHI_STREAM_CHILD", "1")
+fn spawn_child(root: &Path, pause_after: Option<usize>) -> std::process::Child {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    if let Some(p) = pause_after {
+        cmd.env("MIZUCHI_STREAM_PAUSE_AFTER", p.to_string());
+    }
+    cmd.env("MIZUCHI_STREAM_CHILD", "1")
         .env("MIZUCHI_STREAM_ROOT", root)
         .args(["--exact", "child_runs_checkpointed_query"])
         .stdout(Stdio::null())
@@ -183,18 +194,38 @@ fn kill_and_restart_matches_batch_reference() {
         "late rows must not land in the sink: {expected:?}"
     );
 
-    let mut killed_seeds = 0;
+    let triggers = events().len();
     for seed in 0..SEEDS {
         let root = unique(&format!("s{seed}"));
-        let mut attempt = 0;
+        // Every seed is killed at least once after real progress, however
+        // fast the runner: the first child pauses after a seed-chosen
+        // trigger commits, and is killed there.
+        let pause = seed as usize % (triggers - 1);
+        let mut child = spawn_child(&root, Some(pause));
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while committed_next(&root.join("chk")) <= pause as u64 {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "seed {seed} child exited before its pause point"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seed {seed} never reached trigger {pause}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "seed {seed} child exited past its pause point"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut attempt = 1;
         loop {
-            let mut child = spawn_child(&root);
-            // First wait is long enough for metadata and the first commit.
-            // Later waits mix short kills with occasional long ones so the
+            let mut child = spawn_child(&root, None);
+            // Restarts mix short kills with occasional long waits so the
             // remaining triggers can finish on a slow runner.
-            let wait_ms = if attempt == 0 {
-                30 + (seed % 50)
-            } else if attempt % 8 == 7 {
+            let wait_ms = if attempt % 8 == 7 {
                 150 + (seed % 100)
             } else {
                 2 + ((seed.wrapping_mul(17) + u64::from(attempt) * 13) % 40)
@@ -222,14 +253,5 @@ fn kill_and_restart_matches_batch_reference() {
         let got = sink_rows(&root);
         assert_eq!(got, expected, "seed {seed} after {attempt} kills");
         let _ = fs::remove_dir_all(&root);
-        if attempt > 0 {
-            killed_seeds += 1;
-        }
     }
-    // A run where every child finished on its first spawn proved nothing
-    // about restart; locally about a third of the seeds are killed.
-    assert!(
-        killed_seeds > 0,
-        "no seed was killed mid-run, so restart was never exercised"
-    );
 }
