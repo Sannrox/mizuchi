@@ -32,12 +32,13 @@ jobs:
           toolchain: 1.97.1
       - name: Cache dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # cargo-test-exact.sh fails when a renamed test selects nothing.
       - name: In-memory lake and REST (default tests)
         run: |
-          cargo test --locked -p mizuchi-io --lib store_delta_and_iceberg_round_trip
-          cargo test --locked --test lake store_merge_and_rest_catalog
-          cargo test --locked -p mizuchi-plan --lib memory_rest_catalog_create_load_drop
+          bash scripts/cargo-test-exact.sh lake::tests::store_delta_and_iceberg_round_trip --locked -p mizuchi-io --lib
+          bash scripts/cargo-test-exact.sh store_merge_and_rest_catalog --locked --test lake
+          bash scripts/cargo-test-exact.sh plan::iceberg_rest::tests::memory_rest_catalog_create_load_drop --locked -p mizuchi-plan --lib
       - name: S3 emulator and REST HTTP
         run: cargo test --locked --test s3_emulator --features s3 -- --ignored --test-threads=1
       - name: REST catalog HTTP
-        run: cargo test --locked -p mizuchi-plan --lib http_rest_catalog_round_trip -- --ignored --nocapture
+        run: bash scripts/cargo-test-exact.sh plan::iceberg_rest::tests::http_rest_catalog_round_trip --locked -p mizuchi-plan --lib -- --ignored --nocapture
