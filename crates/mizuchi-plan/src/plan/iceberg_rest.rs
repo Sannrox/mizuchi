@@ -375,6 +375,10 @@ impl CatalogProvider for IcebergRestCatalog {
                     .get("current-schema-id")
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
+                let last_column_id = patched
+                    .get("last-column-id")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
                 let schema_doc = patched
                     .get("schemas")
                     .and_then(Value::as_array)
@@ -396,7 +400,7 @@ impl CatalogProvider for IcebergRestCatalog {
                     },
                     "requirements": requirements,
                     "updates": [
-                        {"action": "add-schema", "schema": schema_doc, "last-column-id": schema_id},
+                        {"action": "add-schema", "schema": schema_doc, "last-column-id": last_column_id},
                         {"action": "set-current-schema", "schema-id": schema_id}
                     ]
                 });
@@ -476,6 +480,7 @@ fn empty_metadata(meta: &TableMeta) -> Result<Value> {
         "location": "",
         "last-updated-ms": 0,
         "current-schema-id": 0,
+        "last-column-id": fields.len(),
         "schemas": [{
             "type": "struct",
             "schema-id": 0,
@@ -607,38 +612,93 @@ fn with_table_location(mut metadata: Value, location: &str) -> Value {
     metadata
 }
 
+/// Arrow field metadata key for an Iceberg field id, as Parquet uses it.
+const FIELD_ID_KEY: &str = "PARQUET:field_id";
+
+/// Add `schema` as a new current schema. Iceberg field ids must stay stable,
+/// because data files map columns by id: a field keeps the id carried in its
+/// metadata, or else the id of the same-named field in the current schema,
+/// and only a new field takes `last-column-id + 1, ...`. The new schema id is
+/// above every existing one, and `last-column-id` is updated.
 fn patch_schema_metadata(md: &Value, schema: &Schema) -> Result<Value> {
     let mut md = md.clone();
     let obj = md
         .as_object_mut()
         .ok_or_else(|| Error::Io("Iceberg metadata is not an object".into()))?;
-    let current_id = obj
-        .get("current-schema-id")
-        .and_then(Value::as_i64)
+    let schemas = obj
+        .get("schemas")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let current_id = obj.get("current-schema-id").and_then(Value::as_i64);
+    let current_fields: Vec<(i64, String)> = schemas
+        .iter()
+        .find(|s| s.get("schema-id").and_then(Value::as_i64) == current_id)
+        .and_then(|s| s.get("fields").and_then(Value::as_array))
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|f| {
+                    Some((f.get("id")?.as_i64()?, f.get("name")?.as_str()?.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let ever_used = schemas
+        .iter()
+        .filter_map(|s| s.get("fields").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|f| f.get("id").and_then(Value::as_i64))
+        .max()
         .unwrap_or(0);
-    let next_id = current_id + 1;
+    let mut last_column_id = obj
+        .get("last-column-id")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(ever_used);
+    let next_schema_id = schemas
+        .iter()
+        .filter_map(|s| s.get("schema-id").and_then(Value::as_i64))
+        .max()
+        .map_or(0, |id| id + 1);
     let mut fields = Vec::new();
-    for (i, f) in schema.fields().iter().enumerate() {
+    let mut taken = std::collections::BTreeSet::new();
+    for f in schema.fields() {
+        let carried = f
+            .metadata()
+            .get(FIELD_ID_KEY)
+            .and_then(|id| id.parse::<i64>().ok())
+            .filter(|id| current_fields.iter().any(|(cur, _)| cur == id));
+        let by_name = || {
+            current_fields
+                .iter()
+                .find(|(_, name)| name == f.name())
+                .map(|(id, _)| *id)
+        };
+        let id = match carried.or_else(by_name).filter(|id| !taken.contains(id)) {
+            Some(id) => id,
+            None => {
+                last_column_id += 1;
+                last_column_id
+            }
+        };
+        taken.insert(id);
         fields.push(json!({
-            "id": i + 1,
+            "id": id,
             "name": f.name(),
             "required": false,
             "type": iceberg_type(f.data_type())?,
         }));
     }
-    let new_schema = json!({
+    let mut schemas = schemas;
+    schemas.push(json!({
         "type": "struct",
-        "schema-id": next_id,
+        "schema-id": next_schema_id,
         "fields": fields
-    });
-    let mut schemas = obj
-        .get("schemas")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    schemas.push(new_schema);
+    }));
     obj.insert("schemas".into(), Value::Array(schemas));
-    obj.insert("current-schema-id".into(), json!(next_id));
+    obj.insert("current-schema-id".into(), json!(next_schema_id));
+    obj.insert("last-column-id".into(), json!(last_column_id));
     Ok(md)
 }
 
@@ -1191,6 +1251,9 @@ fn dispatch_commit(guard: &mut RestState, key: &str, body: Option<&Value>) -> (u
                             .unwrap_or_default();
                         schemas.push(schema.clone());
                         obj.insert("schemas".into(), Value::Array(schemas));
+                        if let Some(last) = u.get("last-column-id") {
+                            obj.insert("last-column-id".into(), last.clone());
+                        }
                     }
                 }
                 "set-current-schema" => {
@@ -1325,6 +1388,136 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// Field ids of the current schema, as `(name, id)` in schema order.
+    fn current_ids(md: &Value) -> Vec<(String, i64)> {
+        let current = md["current-schema-id"].as_i64();
+        md["schemas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["schema-id"].as_i64() == current)
+            .unwrap()["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["name"].as_str().unwrap().to_string(),
+                    f["id"].as_i64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn alter(cat: &mut IcebergRestCatalog, ident: &TableIdent, names: &[&str]) -> Value {
+        let schema = Schema::new(
+            names
+                .iter()
+                .map(|n| Field::new(*n, DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        );
+        cat.alter_table(ident, StdArc::new(schema)).unwrap();
+        cat.load_metadata(ident).unwrap()
+    }
+
+    /// Add, drop and reorder keep every existing field id, give new fields
+    /// fresh ids above any ever used, and keep `last-column-id` current. A
+    /// reader mapping old data files by field id still finds each column.
+    #[test]
+    fn schema_evolution_keeps_field_ids_stable() {
+        let mut cat = IcebergRestCatalog::memory();
+        let ident = TableIdent::parse("t").unwrap();
+        let created = Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+            Field::new("c", DataType::Int64, true),
+        ]);
+        cat.create_table(TableMeta {
+            ident: ident.clone(),
+            schema: StdArc::new(created),
+            stats: TableStats::default(),
+        })
+        .unwrap();
+        let old = current_ids(&cat.load_metadata(&ident).unwrap());
+        let ids = |pairs: &[(&str, i64)]| -> Vec<(String, i64)> {
+            pairs.iter().map(|(n, i)| (n.to_string(), *i)).collect()
+        };
+        assert_eq!(old, ids(&[("a", 1), ("b", 2), ("c", 3)]));
+
+        let md = alter(&mut cat, &ident, &["a", "b", "c", "d"]);
+        assert_eq!(
+            current_ids(&md),
+            ids(&[("a", 1), ("b", 2), ("c", 3), ("d", 4)])
+        );
+        assert_eq!(md["last-column-id"], 4);
+
+        let md = alter(&mut cat, &ident, &["a", "c", "d"]);
+        assert_eq!(current_ids(&md), ids(&[("a", 1), ("c", 3), ("d", 4)]));
+        assert_eq!(md["last-column-id"], 4);
+
+        // A re-added name is a new column: the dropped id 2 is never reused.
+        let md = alter(&mut cat, &ident, &["d", "a", "b", "c"]);
+        assert_eq!(
+            current_ids(&md),
+            ids(&[("d", 4), ("a", 1), ("b", 5), ("c", 3)])
+        );
+        assert_eq!(md["last-column-id"], 5);
+        assert_eq!(md["current-schema-id"], 3);
+
+        // Every column of the original files still resolves by id to its name.
+        for (name, id) in &old {
+            if name != "b" {
+                assert!(current_ids(&md).contains(&(name.clone(), *id)), "{name}");
+            }
+        }
+    }
+
+    /// The new schema id is above every existing one, not just the current.
+    #[test]
+    fn schema_evolution_picks_an_unused_schema_id() {
+        let mut cat = IcebergRestCatalog::memory();
+        cat.create_table(sample_meta("t")).unwrap();
+        let ident = TableIdent::parse("t").unwrap();
+        cat.commit_metadata(
+            &ident,
+            json!({
+                "format-version": 2,
+                "current-schema-id": 0,
+                "last-column-id": 1,
+                "schemas": [
+                    {"schema-id": 0, "fields": [{"id": 1, "name": "id", "type": "long"}]},
+                    {"schema-id": 1, "fields": [{"id": 1, "name": "id", "type": "long"},
+                                                {"id": 2, "name": "x", "type": "long"}]}
+                ]
+            }),
+            "mem://t",
+        )
+        .unwrap();
+        let md = alter(&mut cat, &ident, &["id", "y"]);
+        assert_eq!(md["current-schema-id"], 2);
+        assert_eq!(
+            current_ids(&md),
+            vec![("id".to_string(), 1), ("y".to_string(), 3)]
+        );
+        assert_eq!(md["last-column-id"], 3);
+    }
+
+    /// A field id carried in Arrow field metadata survives a rename.
+    #[test]
+    fn schema_evolution_keeps_a_carried_field_id_across_rename() {
+        let mut cat = IcebergRestCatalog::memory();
+        cat.create_table(sample_meta("t")).unwrap();
+        let ident = TableIdent::parse("t").unwrap();
+        let renamed = Schema::new(vec![
+            Field::new("key", DataType::Int64, true).with_metadata(
+                std::collections::HashMap::from([(FIELD_ID_KEY.to_string(), "1".to_string())]),
+            ),
+        ]);
+        cat.alter_table(&ident, StdArc::new(renamed)).unwrap();
+        let md = cat.load_metadata(&ident).unwrap();
+        assert_eq!(current_ids(&md), vec![("key".to_string(), 1)]);
     }
 
     #[test]
