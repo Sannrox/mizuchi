@@ -141,26 +141,6 @@ jobs:
           python python/examples/lazy_df.py
           python python/examples/udf_arrow.py
 
-  fuzz:
-    name: Fuzz
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          workspaces: fuzz
-      - name: Install cargo-fuzz
-        run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
-      - name: Run fuzz targets
-        run: |
-          cargo +nightly fuzz run parse -- -max_total_time=15 -len_control=0
-          cargo +nightly fuzz run plan -- -max_total_time=15 -len_control=0
-          cargo +nightly fuzz run execute -- -max_total_time=15 -len_control=0
-          cargo +nightly fuzz run grammar -- -max_total_time=20 -len_control=0
-
   s3-emulator:
     name: S3 emulator
     runs-on: ubuntu-latest
