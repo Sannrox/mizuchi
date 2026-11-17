@@ -162,7 +162,77 @@ pub struct RunningQuery {
 /// Thread-safe query history, running set, and cancel tokens.
 pub struct QueryLog {
     inner: Mutex<Inner>,
-    persist: Option<PathBuf>,
+    /// The history file, when persisted. Locked apart from `inner`, so disk
+    /// writes never hold up queries starting or the API reading.
+    journal: Option<Mutex<Journal>>,
+    /// History lines `open` could not read; they were moved to a
+    /// `.corrupt-*` file beside the history.
+    skipped_lines: usize,
+}
+
+/// The append-only history file. Each completion appends one synced line;
+/// the file is rewritten from memory only once it holds about twice the
+/// retained history, so a completion costs O(1) amortized.
+struct Journal {
+    path: PathBuf,
+    file: fs::File,
+    /// Lines in the file, retained or not.
+    lines: usize,
+    /// A write failed and may have left a partial line; the next completion
+    /// rewrites the file instead of appending after it.
+    torn: bool,
+}
+
+impl Journal {
+    /// Replaces the file at `path` with `history` and opens it for appends.
+    fn create(path: PathBuf, history: &[QueryRecord]) -> Result<Self> {
+        rewrite_file(&path, history)?;
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .map_err(|e| Error::Io(e.to_string()))?;
+        Ok(Self {
+            path,
+            file,
+            lines: history.len(),
+            torn: false,
+        })
+    }
+
+    fn needs_rewrite(&self, retained: usize) -> bool {
+        self.torn || self.lines >= retained.max(1).saturating_mul(2)
+    }
+
+    fn append(&mut self, line: &str) -> Result<()> {
+        let written = self
+            .file
+            .write_all(format!("{line}\n").as_bytes())
+            .and_then(|()| self.file.sync_data());
+        match written {
+            Ok(()) => {
+                self.lines += 1;
+                Ok(())
+            }
+            Err(e) => {
+                self.torn = true;
+                Err(Error::Io(e.to_string()))
+            }
+        }
+    }
+
+    fn rewrite(&mut self, history: &[QueryRecord]) -> Result<()> {
+        let path = self.path.clone();
+        match Self::create(path, history) {
+            Ok(fresh) => {
+                *self = fresh;
+                Ok(())
+            }
+            Err(e) => {
+                self.torn = true;
+                Err(e)
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for QueryLog {
@@ -213,26 +283,40 @@ impl QueryLog {
                 history: Vec::new(),
                 running: BTreeMap::new(),
             }),
-            persist: None,
+            journal: None,
+            skipped_lines: 0,
         }
     }
 
-    /// Load completed queries from `path` (created if missing).
+    /// Load completed queries from `path` (created if missing). A line that
+    /// does not parse (a hand edit, a torn write) is skipped and kept in a
+    /// `<file>.corrupt-*` file beside it; see [`QueryLog::skipped_lines`].
     pub fn open(path: impl AsRef<Path>, retention: QueryRetention) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
         }
         let mut history = Vec::new();
+        let mut bad = Vec::new();
         let mut seq = 0;
         if path.exists() {
             let file = fs::File::open(&path).map_err(|e| Error::Io(e.to_string()))?;
-            for line in BufReader::new(file).lines() {
+            for line in BufReader::new(file).split(b'\n') {
                 let line = line.map_err(|e| Error::Io(e.to_string()))?;
-                if line.trim().is_empty() {
+                let Some(rec) = std::str::from_utf8(&line)
+                    .ok()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(record_from_json)
+                else {
+                    if !line.trim_ascii().is_empty() {
+                        bad.push(line);
+                    }
                     continue;
-                }
-                let rec = record_from_json(&line)?;
+                };
+                let Ok(rec) = rec else {
+                    bad.push(line);
+                    continue;
+                };
                 if let Some(n) = rec.id.strip_prefix("q-")
                     && let Ok(v) = n.parse::<u64>()
                 {
@@ -241,21 +325,29 @@ impl QueryLog {
                 history.push(rec);
             }
         }
-        let log = Self {
-            inner: Mutex::new(Inner {
-                seq,
-                retention,
-                history,
-                running: BTreeMap::new(),
-            }),
-            persist: Some(path),
-        };
-        {
-            let mut inner = lock(&log.inner)?;
-            prune(&mut inner);
-            persist_all(log.persist.as_deref(), &inner.history)?;
+        // The unreadable lines are kept before the rewrite drops them.
+        if !bad.is_empty() {
+            quarantine(&path, &bad)?;
         }
-        Ok(log)
+        let mut inner = Inner {
+            seq,
+            retention,
+            history,
+            running: BTreeMap::new(),
+        };
+        prune(&mut inner);
+        let journal = Journal::create(path, &inner.history)?;
+        Ok(Self {
+            inner: Mutex::new(inner),
+            journal: Some(Mutex::new(journal)),
+            skipped_lines: bad.len(),
+        })
+    }
+
+    /// History lines the last [`QueryLog::open`] skipped because they did not
+    /// parse. They are kept in a `<file>.corrupt-*` file beside the history.
+    pub fn skipped_lines(&self) -> usize {
+        self.skipped_lines
     }
 
     /// Completed records, newest last, after filter/search/pagination.
@@ -268,25 +360,21 @@ impl QueryLog {
     ) -> Result<(Vec<QueryRecord>, usize)> {
         let inner = lock(&self.inner)?;
         let search = search.map(|s| s.to_ascii_lowercase());
-        let filtered: Vec<QueryRecord> = inner
-            .history
-            .iter()
-            .rev()
-            .filter(|r| status.is_none_or(|s| r.status == s))
-            .filter(|r| {
-                search
-                    .as_ref()
-                    .is_none_or(|q| r.sql.to_ascii_lowercase().contains(q))
-            })
-            .cloned()
-            .collect();
-        let total = filtered.len();
-        let end = offset.saturating_add(limit).min(total);
-        let page = if offset >= total {
-            Vec::new()
-        } else {
-            filtered[offset..end].to_vec()
+        let matches = || {
+            inner
+                .history
+                .iter()
+                .rev()
+                .filter(|r| status.is_none_or(|s| r.status == s))
+                .filter(|r| {
+                    search
+                        .as_ref()
+                        .is_none_or(|q| r.sql.to_ascii_lowercase().contains(q))
+                })
         };
+        // Only the page is cloned; the total is a count.
+        let total = matches().count();
+        let page = matches().skip(offset).take(limit).cloned().collect();
         Ok((page, total))
     }
 
@@ -445,12 +533,30 @@ impl Drop for QuerySpan {
 }
 
 impl QueryLog {
+    /// Moves a finished query into history and appends it to the journal.
+    /// The journal lock is taken first, so the file keeps history order; the
+    /// history lock is held only for the in-memory update.
     fn complete(&self, rec: QueryRecord) -> Result<()> {
-        let mut inner = lock(&self.inner)?;
-        inner.running.remove(&rec.id);
-        inner.history.push(rec);
-        prune(&mut inner);
-        persist_all(self.persist.as_deref(), &inner.history)
+        let line = match &self.journal {
+            Some(_) => Some(record_line(&rec)?),
+            None => None,
+        };
+        let mut journal = self.journal.as_ref().map(lock).transpose()?;
+        let snapshot = {
+            let mut inner = lock(&self.inner)?;
+            inner.running.remove(&rec.id);
+            inner.history.push(rec);
+            prune(&mut inner);
+            journal
+                .as_ref()
+                .filter(|j| j.needs_rewrite(inner.retention.max_entries))
+                .map(|_| inner.history.clone())
+        };
+        match (journal.as_mut(), snapshot, line) {
+            (Some(journal), Some(history), _) => journal.rewrite(&history),
+            (Some(journal), None, Some(line)) => journal.append(&line),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -885,10 +991,14 @@ fn record_from_json(line: &str) -> Result<QueryRecord> {
     })
 }
 
-fn persist_all(path: Option<&Path>, history: &[QueryRecord]) -> Result<()> {
-    let Some(path) = path else {
-        return Ok(());
-    };
+fn record_line(rec: &QueryRecord) -> Result<String> {
+    serde_json::to_string(&record_json(rec, true)).map_err(|e| Error::Io(e.to_string()))
+}
+
+/// Replaces `path` with `history`, one line per record. The new file is
+/// written beside it, synced, renamed over it, and the directory synced, so
+/// a crash leaves the old file or the new one.
+fn rewrite_file(path: &Path, history: &[QueryRecord]) -> Result<()> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -896,21 +1006,55 @@ fn persist_all(path: Option<&Path>, history: &[QueryRecord]) -> Result<()> {
     let tmp = path.with_file_name(format!("{name}.{}.{}.tmp", std::process::id(), now_us()));
     let mut file = persist_create_tmp(&tmp, path).map_err(|e| Error::Io(e.to_string()))?;
     let write = (|| {
+        let mut buf = std::io::BufWriter::new(&mut file);
         for rec in history {
-            let line = serde_json::to_string(&record_json(rec, true))
-                .map_err(|e| Error::Io(e.to_string()))?;
-            writeln!(file, "{line}").map_err(|e| Error::Io(e.to_string()))?;
+            writeln!(buf, "{}", record_line(rec)?).map_err(|e| Error::Io(e.to_string()))?;
         }
-        file.flush().map_err(|e| Error::Io(e.to_string()))
+        buf.flush().map_err(|e| Error::Io(e.to_string()))?;
+        drop(buf);
+        file.sync_all().map_err(|e| Error::Io(e.to_string()))?;
+        fs::rename(&tmp, path).map_err(|e| Error::Io(e.to_string()))
     })();
     if let Err(e) = write {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        Error::Io(e.to_string())
-    })?;
+    sync_parent(path)
+}
+
+/// Keeps history lines `open` could not read in a new
+/// `<file>.corrupt-<pid>-<time>` file beside the history.
+fn quarantine(path: &Path, lines: &[Vec<u8>]) -> Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "history.jsonl".into());
+    let dest = path.with_file_name(format!(
+        "{name}.corrupt-{}-{}",
+        std::process::id(),
+        now_us()
+    ));
+    let mut file = persist_create_tmp(&dest, path).map_err(|e| Error::Io(e.to_string()))?;
+    for line in lines {
+        file.write_all(line)
+            .and_then(|()| file.write_all(b"\n"))
+            .map_err(|e| Error::Io(e.to_string()))?;
+    }
+    file.sync_all().map_err(|e| Error::Io(e.to_string()))?;
+    sync_parent(path)
+}
+
+/// Syncs the directory holding `path`, so a rename or new file in it
+/// survives a crash. A no-op where directories cannot be opened.
+fn sync_parent(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| Error::Io(e.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -1305,6 +1449,107 @@ mod tests {
         let rec = again.get(&id).unwrap().expect("restored");
         assert_eq!(rec.sql, "SELECT a FROM t WHERE a > 0");
         assert_eq!(rec.status, QueryStatus::Completed);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A finished record with id `q-<n>`, for driving the log directly.
+    fn done(n: u64) -> QueryRecord {
+        QueryRecord {
+            id: format!("q-{n}"),
+            sql: format!("SELECT {n}"),
+            status: QueryStatus::Completed,
+            started_at_us: now_us(),
+            ended_at_us: Some(now_us()),
+            duration_ns: 1,
+            rows: n,
+            peak_bytes: 0,
+            spilled_bytes: 0,
+            error: None,
+            plan: None,
+            report: None,
+            metrics: None,
+        }
+    }
+
+    fn history_root(tag: &str) -> PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "mizuchi-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn open_skips_and_quarantines_an_unreadable_line() {
+        let root = history_root("qcorrupt");
+        let path = root.join("history.jsonl");
+        let lines = [
+            record_line(&done(1)).unwrap(),
+            "{\"id\": \"q-2\", truncated".to_string(),
+            record_line(&done(3)).unwrap(),
+        ];
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let log = QueryLog::open(&path, QueryRetention::default()).unwrap();
+        let ids: Vec<String> = log
+            .list(None, None, 0, 10)
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, ["q-3", "q-1"]);
+        assert_eq!(log.skipped_lines(), 1);
+        let kept: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains(".corrupt-"))
+            .map(|p| fs::read_to_string(p).unwrap())
+            .collect();
+        assert_eq!(kept, [format!("{}\n", lines[1])]);
+        drop(log);
+        let again = QueryLog::open(&path, QueryRetention::default()).unwrap();
+        assert_eq!(again.skipped_lines(), 0, "the rewrite drops the bad line");
+        assert_eq!(again.list(None, None, 0, 10).unwrap().1, 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completions_append_and_compact_only_past_twice_the_retention() {
+        use std::os::unix::fs::MetadataExt;
+        let root = history_root("qappend");
+        let path = root.join("history.jsonl");
+        let retention = QueryRetention {
+            max_entries: 4,
+            max_age_us: None,
+        };
+        let log = QueryLog::open(&path, retention.clone()).unwrap();
+        let line_count = || fs::read_to_string(&path).unwrap().lines().count();
+        let inode = fs::metadata(&path).unwrap().ino();
+        for n in 1..=8 {
+            log.complete(done(n)).unwrap();
+            assert_eq!(line_count(), n as usize, "one line appended per query");
+            assert_eq!(fs::metadata(&path).unwrap().ino(), inode, "not rewritten");
+        }
+        // The file holds twice the retention, so the next completion rewrites it.
+        log.complete(done(9)).unwrap();
+        assert_ne!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(line_count(), 4);
+        log.complete(done(10)).unwrap();
+        assert_eq!(line_count(), 5);
+        drop(log);
+        let again = QueryLog::open(&path, retention).unwrap();
+        let ids: Vec<String> = again
+            .list(None, None, 0, 10)
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, ["q-10", "q-9", "q-8", "q-7"]);
         let _ = fs::remove_dir_all(&root);
     }
 
