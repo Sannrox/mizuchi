@@ -10,8 +10,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
+    Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::compute::concat_batches;
@@ -412,42 +412,28 @@ fn encode_array(
             }
             push_data(streams, col, data);
         }
-        KIND_STRING => {
-            let a = downcast::<StringArray>(arr, "STRING")?;
-            let mut data = Vec::new();
-            let mut lengths = Vec::new();
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    let v = a.value(i);
-                    lengths.push(v.len() as i64);
-                    data.extend_from_slice(v.as_bytes());
-                }
+        KIND_STRING | KIND_BINARY => match (ty.kind, arr.data_type()) {
+            (KIND_STRING, DataType::Utf8) => push_bytes(
+                streams,
+                col,
+                arr.as_string::<i32>().iter().map(|v| v.map(str::as_bytes)),
+            ),
+            (KIND_STRING, DataType::LargeUtf8) => push_bytes(
+                streams,
+                col,
+                arr.as_string::<i64>().iter().map(|v| v.map(str::as_bytes)),
+            ),
+            (KIND_BINARY, DataType::Binary) => {
+                push_bytes(streams, col, arr.as_binary::<i32>().iter())
             }
-            push_data(streams, col, data);
-            streams.push(StreamOut {
-                kind: STREAM_LENGTH,
-                column: col,
-                bytes: int_rle_encode(&lengths, false),
-            });
-        }
-        KIND_BINARY => {
-            let a = downcast::<BinaryArray>(arr, "BINARY")?;
-            let mut data = Vec::new();
-            let mut lengths = Vec::new();
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    let v = a.value(i);
-                    lengths.push(v.len() as i64);
-                    data.extend_from_slice(v);
-                }
+            (KIND_BINARY, DataType::LargeBinary) => {
+                push_bytes(streams, col, arr.as_binary::<i64>().iter())
             }
-            push_data(streams, col, data);
-            streams.push(StreamOut {
-                kind: STREAM_LENGTH,
-                column: col,
-                bytes: int_rle_encode(&lengths, false),
-            });
-        }
+            (KIND_STRING, _) => {
+                return Err(Error::InvalidBatch("ORC STRING array type mismatch".into()));
+            }
+            _ => return Err(Error::InvalidBatch("ORC BINARY array type mismatch".into())),
+        },
         KIND_LIST => {
             let a = arr
                 .as_any()
@@ -510,6 +496,27 @@ fn push_data(streams: &mut Vec<StreamOut>, col: u32, bytes: Vec<u8>) {
             bytes,
         });
     }
+}
+
+/// Writes the DATA and LENGTH streams of a STRING or BINARY column from its
+/// values; nulls are skipped because PRESENT already records them.
+fn push_bytes<'a>(
+    streams: &mut Vec<StreamOut>,
+    col: u32,
+    values: impl Iterator<Item = Option<&'a [u8]>>,
+) {
+    let mut data = Vec::new();
+    let mut lengths = Vec::new();
+    for v in values.flatten() {
+        lengths.push(v.len() as i64);
+        data.extend_from_slice(v);
+    }
+    push_data(streams, col, data);
+    streams.push(StreamOut {
+        kind: STREAM_LENGTH,
+        column: col,
+        bytes: int_rle_encode(&lengths, false),
+    });
 }
 
 fn downcast<'a, T: 'static>(arr: &'a dyn Array, what: &str) -> Result<&'a T> {
@@ -1217,6 +1224,34 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn orc_large_string_and_binary_round_trip() {
+        use arrow::array::{LargeBinaryArray, LargeStringArray};
+        let text = [Some("a"), None, Some("ccc")];
+        let bytes: [Option<&[u8]>; 3] = [None, Some(b"\x00\x01"), Some(b"")];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("text", DataType::LargeUtf8, true),
+            Field::new("bytes", DataType::LargeBinary, true),
+        ]));
+        let batch = Batch::try_new(
+            schema,
+            vec![
+                Arc::new(LargeStringArray::from(text.to_vec())),
+                Arc::new(LargeBinaryArray::from(bytes.to_vec())),
+            ],
+        )
+        .unwrap();
+        let path = tmp("large.orc");
+        write_file(&path, std::slice::from_ref(&batch)).unwrap();
+        let out = read_file(&path, None, BatchPolicy::default()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let col = |name| out[0].column_by_name(name).unwrap();
+        let read_text: Vec<_> = col("text").as_string::<i32>().iter().collect();
+        let read_bytes: Vec<_> = col("bytes").as_binary::<i32>().iter().collect();
+        assert_eq!(read_text, text);
+        assert_eq!(read_bytes, bytes);
     }
 
     #[test]
