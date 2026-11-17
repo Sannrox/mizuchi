@@ -55,9 +55,13 @@ it builds, in every job before it pushes the image, attests or changes the
 release, and before it publishes; cut a new version instead. A failed release
 lookup fails the run rather than counting as no release. Before drafting and
 before publishing, the run also checks that the remote tag still names the
-tagged commit. One run per tag executes at a time. A
-re-run rebuilds and re-pushes the versioned image, so the image digest in the
-manifest is the one from the run that published.
+tagged commit. One run per tag executes at a time.
+
+The image job pushes only `staging-<version>`. The version tag is applied
+after attestation and the draft, to the attested digest only, and
+`image.sh promote` refuses to move a version tag that already names another
+digest. A re-run rebuilds the image at a new digest, so a run that failed
+after tagging the image cannot be resumed; cut a new version instead.
 
 `workflow_dispatch` without a tag is a dry run on the chosen ref.
 
@@ -80,9 +84,10 @@ and registry dependencies when checking or building the archive.
 
 A dry run verifies source packaging, writes and checks the SBOM, and builds
 the wheels without publishing. A tagged run first verifies the tag, then
-builds and pushes the versioned image, checksums and attests all artifacts,
-and writes and attests the manifest. It uploads all assets to a draft with
-the CHANGELOG section as the body (`scripts/release/notes.py`) before
+builds and pushes the image under its staging tag, checksums and attests all
+artifacts, and writes and attests the manifest. It uploads all assets to a
+draft with the CHANGELOG section as the body (`scripts/release/notes.py`),
+then points the version tag at the attested image digest, before
 publishing. A failed check, build or attestation prevents publication and
 leaves any draft for a re-run.
 
@@ -102,7 +107,7 @@ subject naming a pull request whose labels cannot be read fails the release.
 
 The workflows orchestrate; the logic lives in `scripts/release/`, one entry
 point per stage: `verify-tag.sh` (signed tag), `package.sh` (source
-archive), `sbom.py`, `image.sh` (versioned image and its registry digest),
+archive), `sbom.py`, `image.sh` (staging image and its registry digest, then the version tag),
 `tenkai_profile.py`, `manifest.py`, `notes.py`, and `github-release.sh`, the
 only script that changes a GitHub Release. Each refusal above is enforced in
 the script at the step it protects.
