@@ -50,6 +50,7 @@ cargo fmt --all -- --check
 cargo build --locked --workspace --all-targets --exclude mizuchi-flight
 cargo clippy --locked --workspace --all-targets --exclude mizuchi-flight -- -D warnings
 cargo test --locked --workspace --exclude mizuchi-flight
+cargo check --locked -p mizuchi -p mizuchi-flight --all-targets --features mizuchi/flight
 bash scripts/validate-workflow-skills.sh
 python3 scripts/adr-index.py --check
 bash scripts/check-workflows.sh
@@ -58,6 +59,10 @@ python3 -m unittest discover -s tests -t .
 
 - `cargo fmt --all` formats before review.
 - `cargo clippy ... -D warnings` is required for ship-level local gates.
+- The Flight `cargo check` compiles `mizuchi-flight` and every
+  `flight`-gated target (the `flight_cluster` fencing and resume tests) on
+  every pull request (CI `Build & Test`). Running those tests stays in the
+  dispatch-only `flight.yml`.
 - `scripts/validate-workflow-skills.sh` checks the shared Skill stubs and the
   contract headings of this file against agent-kit `main`.
 - `python3 scripts/adr-index.py --check` fails when the decision index in
