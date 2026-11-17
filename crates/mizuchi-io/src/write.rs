@@ -59,6 +59,20 @@ impl Default for ParquetWriteOptions<'static> {
 
 static JOB: AtomicU64 = AtomicU64::new(1);
 
+/// A write id unique across processes: pid, start time, and a per-process
+/// counter. Staging and rollback directories carry it, so a crashed writer's
+/// leftovers or a concurrent writer's directories are never reused.
+pub(crate) fn job_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!(
+        "{}-{nanos:x}-{}",
+        std::process::id(),
+        JOB.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Write `batches` as Parquet under `dest`.
 pub fn write_parquet(
     dest: impl AsRef<Path>,
@@ -185,9 +199,11 @@ fn write_inner(
     // Finish or roll back an overwrite that a crashed writer left behind
     // before this write builds on the directory.
     recover_overwrite(dest)?;
-    let id = JOB.fetch_add(1, Ordering::Relaxed);
+    let id = job_id();
     let staging = dest.join(format!(".mizuchi-staging-{id}"));
-    fs::create_dir_all(&staging).map_err(|e| io_err(&staging, e))?;
+    // `create_dir` fails on an existing directory, so a write never stages
+    // into, and never publishes, another writer's files.
+    fs::create_dir(&staging).map_err(|e| io_err(&staging, e))?;
 
     let run = (|| {
         cancel.check()?;
@@ -203,7 +219,7 @@ fn write_inner(
         if ctrl.fail_before_commit {
             return Err(Error::Io("injected commit failure".into()));
         }
-        publish(dest, &staging, opts.mode, id, ctrl)?;
+        publish(dest, &staging, opts.mode, &id, ctrl)?;
         write_success(dest)?;
         dataset_write_stats(dest, batches, opts)
     })();
@@ -435,7 +451,7 @@ fn escape_segment(s: &str) -> String {
     out
 }
 
-fn publish(dest: &Path, staging: &Path, mode: WriteMode, id: u64, ctrl: CommitCtrl) -> Result<()> {
+fn publish(dest: &Path, staging: &Path, mode: WriteMode, id: &str, ctrl: CommitCtrl) -> Result<()> {
     match mode {
         WriteMode::Overwrite => match publish_overwrite(dest, staging, id, ctrl.fail_move_after) {
             Err(e) if !ctrl.leave_staging => match recover_overwrite(dest) {
@@ -467,7 +483,7 @@ const OVERWRITE_DONE: &str = ".mizuchi-done-";
 fn publish_overwrite(
     dest: &Path,
     staging: &Path,
-    id: u64,
+    id: &str,
     fail_move_after: Option<usize>,
 ) -> Result<()> {
     let old = dest.join(format!("{OVERWRITE_OLD}{id}"));
@@ -550,11 +566,29 @@ fn publish_append(dest: &Path, staging: &Path) -> Result<()> {
         let parent_rel = rel.parent().unwrap_or(Path::new(""));
         let dest_dir = dest.join(parent_rel);
         fs::create_dir_all(&dest_dir).map_err(|e| io_err(&dest_dir, e))?;
-        let n = next_part_index(&dest_dir)?;
-        let dest_file = dest_dir.join(format!("part-{n:05}.parquet"));
-        fs::rename(&file, &dest_file).map_err(|e| io_err(&dest_file, e))?;
+        link_part(&file, &dest_dir, next_part_index(&dest_dir)?)?;
+        let _ = fs::remove_file(&file);
     }
     Ok(())
+}
+
+/// Publish `file` as `part-{n}.parquet` in `dir`, starting at index `first`.
+/// A hard link fails when the target exists, so a part another appender
+/// published meanwhile is never overwritten: the next index is tried instead.
+fn link_part(file: &Path, dir: &Path, first: u32) -> Result<PathBuf> {
+    let mut n = first;
+    loop {
+        let dest_file = dir.join(format!("part-{n:05}.parquet"));
+        match fs::hard_link(file, &dest_file) {
+            Ok(()) => return Ok(dest_file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                n = n
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Io("part index overflow".into()))?;
+            }
+            Err(e) => return Err(io_err(&dest_file, e)),
+        }
+    }
 }
 
 fn move_tree(from: &Path, to: &Path, fail_after: Option<usize>) -> Result<()> {
@@ -819,6 +853,46 @@ mod tests {
         );
         assert!(dest.join("_SUCCESS").is_file());
         assert_eq!(read_ids(&dest), vec![1, 2, 3, 4]);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// A crashed writer's staging directory, named as the per-process counter
+    /// used to name it, is neither reused nor published by later writes.
+    #[test]
+    fn stale_staging_is_never_published() {
+        let dest = tmp_dest();
+        let stale = dest.join(".mizuchi-staging-1").join("year=2020");
+        fs::create_dir_all(&stale).unwrap();
+        let batch = sample_batch();
+        write_parquet_file(
+            stale.join("part-00000.parquet"),
+            std::slice::from_ref(&batch),
+            batch.schema(),
+        )
+        .unwrap();
+        write_year(&dest, &[sample_batch()], WriteMode::Append).unwrap();
+        write_year(&dest, &[sample_batch()], WriteMode::Append).unwrap();
+        assert_eq!(read_ids(&dest), vec![1, 1, 2, 2, 3, 3, 4, 4]);
+        write_year(&dest, &[sample_batch()], WriteMode::Overwrite).unwrap();
+        assert_eq!(read_ids(&dest), vec![1, 2, 3, 4]);
+        assert!(stale.join("part-00000.parquet").exists());
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// Append never overwrites a part that appeared after it chose an index.
+    #[test]
+    fn append_skips_a_part_that_already_exists() {
+        let dest = tmp_dest();
+        fs::write(dest.join("part-00000.parquet"), b"theirs").unwrap();
+        let staged = dest.join(".mizuchi-staging-test-part");
+        fs::write(&staged, b"ours").unwrap();
+        let published = link_part(&staged, &dest, 0).unwrap();
+        assert_eq!(published, dest.join("part-00001.parquet"));
+        assert_eq!(
+            fs::read(dest.join("part-00000.parquet")).unwrap(),
+            b"theirs"
+        );
+        assert_eq!(fs::read(&published).unwrap(), b"ours");
         let _ = fs::remove_dir_all(&dest);
     }
 

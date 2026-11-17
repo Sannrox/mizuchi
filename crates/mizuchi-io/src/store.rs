@@ -6,7 +6,6 @@
 //! groups inside a fetched file (same rules as [`crate::read::read_parquet`]).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::array::Array;
 use futures::TryStreamExt;
@@ -27,8 +26,6 @@ use crate::write::{
 use mizuchi_core::batch::Batch;
 use mizuchi_core::error::{Error, Result};
 use mizuchi_core::expr::{BinaryOp, Expr};
-
-static JOB: AtomicU64 = AtomicU64::new(1);
 
 /// Read Parquet objects under `prefix`. Partition directories that cannot
 /// match `opts.filters` are not fetched.
@@ -148,7 +145,7 @@ fn write_store_inner(
 
     let root = object_path(prefix)?;
     recover_store(store, &root)?;
-    let id = JOB.fetch_add(1, Ordering::Relaxed);
+    let id = crate::write::job_id();
     let staging_prefix = join_path(&root, &format!(".mizuchi-staging-{id}"))?;
 
     let run = (|| {
@@ -165,7 +162,7 @@ fn write_store_inner(
             &staging_prefix,
             &staged,
             opts.mode,
-            id,
+            &id,
             fail_move_after,
         );
         if let Err(e) = published {
@@ -226,7 +223,7 @@ fn publish_store(
     staging: &ObjectPath,
     staged: &[ObjectPath],
     mode: WriteMode,
-    id: u64,
+    id: &str,
     fail_move_after: Option<usize>,
 ) -> Result<()> {
     let old_prefix = join_path(root, &format!("{OLD_PREFIX}{id}"))?;
@@ -249,7 +246,7 @@ fn publish_store(
             .strip_prefix(staging.as_ref())
             .unwrap_or(src.as_ref())
             .trim_start_matches('/');
-        let dest = if mode == WriteMode::Append {
+        if mode == WriteMode::Append {
             let parent_rel = match rel.rsplit_once('/') {
                 Some((dir, _)) => dir,
                 None => "",
@@ -259,22 +256,51 @@ fn publish_store(
             } else {
                 join_path(root, parent_rel)?
             };
-            let n = next_part_index(store, &dest_dir)?;
-            if parent_rel.is_empty() {
-                join_path(root, &format!("part-{n:05}.parquet"))?
-            } else {
-                join_path(root, &format!("{parent_rel}/part-{n:05}.parquet"))?
-            }
+            let first = next_part_index(store, &dest_dir)?;
+            append_part(store, &dest_dir, src, id, first)?;
         } else {
-            join_path(root, rel)?
-        };
-        block_on(store.rename(src, &dest)).map_err(store_err)?;
+            block_on(store.rename(src, &join_path(root, rel)?)).map_err(store_err)?;
+        }
     }
     if mode == WriteMode::Overwrite {
         put_marker(store, &old_prefix, DONE_MARKER)?;
         let _ = recover_store(store, root);
     }
     Ok(())
+}
+
+/// Publish one appended part into `dest_dir`, starting at index `first`,
+/// without overwriting a part another appender published: a no-overwrite
+/// rename that moves to the next index on a clash. A store without
+/// no-overwrite renames gets a name that carries this write's unique `id`.
+fn append_part(
+    store: &dyn ObjectStore,
+    dest_dir: &ObjectPath,
+    src: &ObjectPath,
+    id: &str,
+    first: u32,
+) -> Result<ObjectPath> {
+    let mut n = first;
+    loop {
+        let dest = join_path(dest_dir, &format!("part-{n:05}.parquet"))?;
+        match block_on(store.rename_if_not_exists(src, &dest)) {
+            Ok(()) => return Ok(dest),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                n = n
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Io("part index overflow".into()))?;
+            }
+            Err(
+                object_store::Error::NotSupported { .. }
+                | object_store::Error::NotImplemented { .. },
+            ) => {
+                let dest = join_path(dest_dir, &format!("part-{n:05}-{id}.parquet"))?;
+                block_on(store.rename(src, &dest)).map_err(store_err)?;
+                return Ok(dest);
+            }
+            Err(e) => return Err(store_err(e)),
+        }
+    }
 }
 
 /// Rollback prefix of an overwrite, `.mizuchi-rollback-{id}/`. Object stores have
@@ -692,6 +718,24 @@ mod tests {
             "{:?}",
             objects(&store)
         );
+    }
+
+    /// Append never overwrites a part that appeared after it chose an index.
+    #[test]
+    fn store_append_skips_a_part_that_already_exists() {
+        let store = InMemory::new();
+        let dir = object_path("t").unwrap();
+        let theirs = join_path(&dir, "part-00000.parquet").unwrap();
+        block_on(store.put(&theirs, PutPayload::from(b"theirs".to_vec()))).unwrap();
+        let src = join_path(&dir, ".mizuchi-staging-x/part-00000.parquet").unwrap();
+        block_on(store.put(&src, PutPayload::from(b"ours".to_vec()))).unwrap();
+        let published = append_part(&store, &dir, &src, "x", 0).unwrap();
+        assert_eq!(published, join_path(&dir, "part-00001.parquet").unwrap());
+        let read = |loc: &ObjectPath| {
+            block_on(async { store.get(loc).await.unwrap().bytes().await.unwrap() }).to_vec()
+        };
+        assert_eq!(read(&theirs), b"theirs");
+        assert_eq!(read(&published), b"ours");
     }
 
     #[test]
