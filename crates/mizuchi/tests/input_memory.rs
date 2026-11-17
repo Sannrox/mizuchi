@@ -1,7 +1,8 @@
 //! A Parquet table larger than the session cap stays out of memory: the
 //! process heap grows by at most the cap plus [`MARGIN`] across registration
 //! and the queries (scheduled and instrumented), and the engine's own peak
-//! stays at or below the cap.
+//! is reported and stays at or below the cap. The narrow query scans only the
+//! two columns it names, and the capped aggregations return exact sums.
 //!
 //! This binary installs a counting global allocator, so it holds exactly one
 //! test; a second test running alongside would count into the same heap.
@@ -13,7 +14,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
-use mizuchi::{ParquetReadOptions, QueryLog, QueryRetention, Session, SessionConfig};
+use mizuchi::{ParquetReadOptions, QueryLog, QueryResult, QueryRetention, Session, SessionConfig};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
@@ -83,8 +84,9 @@ impl Drop for TempDir {
     }
 }
 
-/// `ROWS` x `COLS` Int64 (64 MiB decoded, 4x the cap). Column `k` has eight
-/// groups; `c1..` are wide filler a narrow query must not decode.
+/// `ROWS` x `COLS` Int64 (64 MiB decoded, 4x the cap). Column `k` is `i % 8`
+/// and column `cN` is `i * N` for row `i`; a narrow query over `k` and `c1`
+/// must not decode `c2..`.
 fn write_table(path: &std::path::Path) {
     let mut fields = vec![Field::new("k", DataType::Int64, false)];
     fields.extend((1..COLS).map(|i| Field::new(format!("c{i}"), DataType::Int64, false)));
@@ -110,6 +112,34 @@ fn write_table(path: &std::path::Path) {
             .unwrap();
     }
     writer.close().unwrap();
+}
+
+/// Exact `(k, SUM(c<mult>))` per group, computed from the generator.
+fn expected_sums(mult: i64) -> Vec<(i64, i64)> {
+    (0..8)
+        .map(|k| (k, (k..ROWS).step_by(8).map(|i| i * mult).sum()))
+        .collect()
+}
+
+/// `(k, sum)` rows of a two-column Int64 result, in result order.
+fn pairs(result: &QueryResult) -> Vec<(i64, i64)> {
+    let int = |b: &mizuchi::Batch, c: usize| {
+        b.column(c)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .clone()
+    };
+    result
+        .batches
+        .iter()
+        .flat_map(|b| {
+            let (k, s) = (int(b, 0), int(b, 1));
+            (0..b.num_rows())
+                .map(|r| (k.value(r), s.value(r)))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 #[test]
@@ -140,12 +170,18 @@ fn parquet_input_larger_than_the_cap_stays_within_cap_plus_margin() {
     // A query log routes execution through the instrumented operator tree.
     let s = s.with_query_log(Arc::new(QueryLog::memory(QueryRetention::default())));
     let logged = s
-        .execute_sql_reported("SELECT k, SUM(c2) AS s FROM t GROUP BY k")
+        .execute_sql_reported("SELECT k, SUM(c2) AS s FROM t GROUP BY k ORDER BY k")
         .unwrap();
     let grown = (PEAK.load(Ordering::Relaxed) - base) as u64;
 
-    let rows: usize = narrow.batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(rows, 8);
+    assert_eq!(pairs(&narrow), expected_sums(1));
+    let scanned: Vec<_> = narrow
+        .report
+        .inputs
+        .iter()
+        .map(|i| i.columns.clone())
+        .collect();
+    assert_eq!(scanned, [["c1", "k"]], "narrow query must prune to k, c1");
     let n = wide.batches[0]
         .column(0)
         .as_any()
@@ -153,14 +189,11 @@ fn parquet_input_larger_than_the_cap_stays_within_cap_plus_margin() {
         .unwrap()
         .value(0);
     assert_eq!(n, ROWS - 1_000_000);
-    assert_eq!(
-        logged.batches.iter().map(|b| b.num_rows()).sum::<usize>(),
-        8
-    );
+    assert_eq!(pairs(&logged), expected_sums(2));
     for result in [&narrow, &wide, &logged] {
         assert!(
-            result.peak_bytes <= CAP,
-            "engine peak {}",
+            result.peak_bytes > 0 && result.peak_bytes <= CAP,
+            "engine peak {} must be reported and within the cap",
             result.peak_bytes
         );
     }
