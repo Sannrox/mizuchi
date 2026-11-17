@@ -102,7 +102,9 @@ pub trait CatalogProvider {
     fn list_namespaces(&self) -> Result<Vec<NamespaceIdent>>;
     /// Tables in `ns`.
     fn list_tables(&self, ns: &NamespaceIdent) -> Result<Vec<String>>;
-    /// Create or replace `meta`.
+    /// Create `meta`. An existing table with the same identifier is
+    /// [`Error::Plan`]; callers that want to replace it drop it first. A
+    /// remote catalog cannot replace atomically, so no backend replaces.
     fn create_table(&mut self, meta: TableMeta) -> Result<()>;
     /// Drop a table. Missing names are [`Error::Plan`] unless `if_exists`.
     fn drop_table(&mut self, ident: &TableIdent, if_exists: bool) -> Result<()>;
@@ -359,6 +361,12 @@ impl CatalogProvider for Catalog {
     }
 
     fn create_table(&mut self, meta: TableMeta) -> Result<()> {
+        if self.get_table(&meta.ident).is_ok() {
+            return Err(Error::Plan(format!(
+                "table already exists: {}",
+                meta.ident.sql_name()
+            )));
+        }
         self.register(meta.ident.key(), meta.schema.clone())?;
         if meta.stats != TableStats::default() {
             self.set_stats(meta.ident.key(), meta.stats)?;
