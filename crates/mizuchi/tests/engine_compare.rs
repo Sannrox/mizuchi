@@ -2,7 +2,12 @@
 //!
 //! Same SQL and same generated tables. Live CLIs are used when present;
 //! otherwise committed goldens under `tests/compare/goldens` keep CI offline.
-//! Timing ratios are `reference_ms / mizuchi_ms`.
+//!
+//! Timing is not like for like. mizuchi's figure is query execution on
+//! preloaded tables. A reference CLI is timed as one whole process (startup,
+//! CSV load and every query) divided evenly across the queries, reported as
+//! `amortized_process_ms`; `amortized_time_ratio` is that figure over
+//! `mizuchi_ms`. Use `scripts/bench-gb.sh` for per-query comparisons.
 
 mod ds_common;
 
@@ -20,6 +25,7 @@ use ds_common::{QUERIES, load, tables};
 
 struct EngineRun {
     source: &'static str,
+    /// Query time for mizuchi; amortized whole-process time for a reference.
     elapsed_ms: f64,
     rows: Vec<Vec<String>>,
 }
@@ -120,17 +126,41 @@ fn cells_close(a: &str, b: &str) -> bool {
     diff <= 1e-6 || diff <= 1e-6 * x.abs().max(y.abs())
 }
 
+/// Golden format: one row per line, cells joined by `|`. A backslash,
+/// `|` or newline inside a cell is escaped as `\\`, `\|` or `\n`.
 fn encode_rows(rows: &[Vec<String>]) -> String {
+    let escape = |c: &String| {
+        c.replace('\\', "\\\\")
+            .replace('|', "\\|")
+            .replace('\n', "\\n")
+    };
     rows.iter()
-        .map(|r| r.join("|"))
+        .map(|r| r.iter().map(escape).collect::<Vec<_>>().join("|"))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
+/// Inverse of [`encode_rows`].
 fn decode_rows(s: &str) -> Vec<Vec<String>> {
     s.lines()
         .filter(|l| !l.is_empty())
-        .map(|l| l.split('|').map(|c| c.to_string()).collect())
+        .map(|line| {
+            let mut cells = vec![String::new()];
+            let mut chars = line.chars();
+            while let Some(ch) = chars.next() {
+                let cell = cells.last_mut().unwrap();
+                match ch {
+                    '\\' => match chars.next() {
+                        Some('n') => cell.push('\n'),
+                        Some(other) => cell.push(other),
+                        None => cell.push('\\'),
+                    },
+                    '|' => cells.push(String::new()),
+                    other => cell.push(other),
+                }
+            }
+            cells
+        })
         .collect()
 }
 
@@ -164,47 +194,112 @@ fn write_tables_csv(dir: &Path) {
     }
 }
 
+/// `path` as a single-quoted SQL string literal, with `'` doubled.
+fn sql_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "''"))
+}
+
 fn csv_create_sql(dir: &Path) -> String {
     let mut s = String::new();
     for name in tables(1).keys() {
         let path = dir.join(format!("{name}.csv"));
         s.push_str(&format!(
-            "CREATE TABLE {name} AS SELECT * FROM read_csv_auto('{}', HEADER=true);\n",
-            path.display()
+            "CREATE TABLE {name} AS SELECT * FROM read_csv_auto({}, HEADER=true);\n",
+            sql_path(&path)
         ));
     }
     s
 }
 
-fn parse_csv_rows(stdout: &str) -> Vec<Vec<String>> {
-    let mut lines = stdout.lines().filter(|l| !l.trim().is_empty());
-    let header = match lines.next() {
-        Some(h) => h,
-        None => return Vec::new(),
-    };
-    let width = header.split(',').count();
-    lines
-        .map(|line| {
-            let mut cells: Vec<String> = line.split(',').map(|c| c.trim().to_string()).collect();
-            if cells.len() < width {
-                cells.resize(width, String::new());
+/// One CSV cell and whether it was quoted. Only an unquoted empty cell is
+/// NULL; `""` is an empty string.
+#[derive(Default)]
+struct CsvCell {
+    text: String,
+    quoted: bool,
+}
+
+/// RFC 4180 records: quoted cells may hold commas, newlines and `""` for a
+/// quote. Blank lines are skipped.
+fn parse_csv_records(text: &str) -> Vec<Vec<CsvCell>> {
+    let mut records = Vec::new();
+    let mut record = Vec::new();
+    let mut cell = CsvCell::default();
+    let mut in_quotes = false;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if in_quotes {
+            match ch {
+                '"' if chars.peek() == Some(&'"') => {
+                    chars.next();
+                    cell.text.push('"');
+                }
+                '"' => in_quotes = false,
+                other => cell.text.push(other),
             }
-            cells
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_quotes = true;
+                cell.quoted = true;
+            }
+            ',' => record.push(std::mem::take(&mut cell)),
+            '\r' => {}
+            '\n' => {
+                record.push(std::mem::take(&mut cell));
+                let blank =
+                    record.len() == 1 && !record[0].quoted && record[0].text.trim().is_empty();
+                if blank {
+                    record.clear();
+                } else {
+                    records.push(std::mem::take(&mut record));
+                }
+            }
+            other => cell.text.push(other),
+        }
+    }
+    if cell.quoted || !cell.text.trim().is_empty() || !record.is_empty() {
+        record.push(cell);
+        records.push(record);
+    }
+    records
+}
+
+/// Reference CSV output (header first) as normalized cells: NULL for an
+/// unquoted empty cell, integers without a fraction, other numbers to eight
+/// places.
+fn parse_csv_rows(text: &str) -> Vec<Vec<String>> {
+    let mut records = parse_csv_records(text).into_iter();
+    let Some(header) = records.next() else {
+        return Vec::new();
+    };
+    let width = header.len();
+    records
+        .map(|record| {
+            let mut cells: Vec<String> = record
                 .into_iter()
                 .map(|c| {
-                    if c.is_empty() {
+                    let text = if c.quoted {
+                        c.text
+                    } else {
+                        c.text.trim().to_string()
+                    };
+                    if text.is_empty() && !c.quoted {
                         "NULL".into()
-                    } else if let Ok(v) = c.parse::<f64>() {
+                    } else if let Ok(v) = text.parse::<f64>() {
                         if v.fract() == 0.0 && v.abs() < 1e15 {
                             format!("{:.0}", v)
                         } else {
                             format!("{v:.8}")
                         }
                     } else {
-                        c.trim_matches('"').to_string()
+                        text
                     }
                 })
-                .collect()
+                .collect();
+            cells.resize(width.max(cells.len()), "NULL".into());
+            cells
         })
         .collect()
 }
@@ -216,9 +311,9 @@ fn run_duckdb(dir: &Path, bin: &Path) -> Result<Vec<EngineRun>, String> {
     for q in QUERIES {
         let out = dir.join(format!("duckdb-{}.csv", q.id));
         sql.push_str(&format!(
-            "COPY ({}) TO '{}' (FORMAT CSV, HEADER true);\n",
+            "COPY ({}) TO {} (FORMAT CSV, HEADER true);\n",
             q.sql,
-            out.display()
+            sql_path(&out)
         ));
     }
     let start = Instant::now();
@@ -253,8 +348,8 @@ fn df_create_sql(dir: &Path) -> String {
     for name in tables(1).keys() {
         let path = dir.join(format!("{name}.csv"));
         s.push_str(&format!(
-            "CREATE EXTERNAL TABLE {name} STORED AS CSV LOCATION '{}' OPTIONS ('has_header' 'true');\n",
-            path.display()
+            "CREATE EXTERNAL TABLE {name} STORED AS CSV LOCATION {} OPTIONS ('has_header' 'true');\n",
+            sql_path(&path)
         ));
     }
     s
@@ -420,11 +515,11 @@ fn report_json(
         s.push_str(&format!("      \"id\": \"{}\",\n", QUERIES[i].id));
         s.push_str(&format!("      \"mizuchi_ms\": {:.3},\n", m.elapsed_ms));
         s.push_str(&format!(
-            "      \"duckdb\": {{\"source\": \"{}\", \"elapsed_ms\": {:.3}, \"match\": {}, \"time_ratio\": {:.3}}},\n",
+            "      \"duckdb\": {{\"source\": \"{}\", \"amortized_process_ms\": {:.3}, \"match\": {}, \"amortized_time_ratio\": {:.3}}},\n",
             d.source, d.elapsed_ms, d_match, d_ratio
         ));
         s.push_str(&format!(
-            "      \"datafusion\": {{\"source\": \"{}\", \"elapsed_ms\": {:.3}, \"match\": {}, \"time_ratio\": {:.3}}}\n",
+            "      \"datafusion\": {{\"source\": \"{}\", \"amortized_process_ms\": {:.3}, \"match\": {}, \"amortized_time_ratio\": {:.3}}}\n",
             f.source, f.elapsed_ms, f_match, f_ratio
         ));
         s.push_str("    }");
@@ -485,7 +580,7 @@ fn tiny_compare_matches_reference_goldens() {
     );
     let (json, ok) = report_json(&mizuchi, &duckdb, &datafusion);
     println!("{json}");
-    assert!(json.contains("\"time_ratio\""));
+    assert!(json.contains("\"amortized_time_ratio\""));
     assert!(json.contains("\"match\""));
     assert!(ok, "result diffs against reference engines");
 }
@@ -548,4 +643,26 @@ fn an_installed_reference_that_fails_reports_its_stderr() {
 #[should_panic(expected = "duckdb is installed but its run failed: stub-engine-broke")]
 fn a_failed_reference_run_does_not_fall_back_to_goldens() {
     reference_for("duckdb", Some(Err("stub-engine-broke".into())));
+}
+
+#[test]
+fn reference_csv_with_quoted_commas_round_trips_through_goldens() {
+    let csv =
+        "name,note,v\n\"a,b\",\"say \"\"hi\"\"\",1\n\"x|y\",\"\",\n\"two\nlines\",plain,2.5\n";
+    let rows = parse_csv_rows(csv);
+    let want: Vec<Vec<String>> = [
+        ["a,b", "say \"hi\"", "1"],
+        ["x|y", "", "NULL"],
+        ["two\nlines", "plain", "2.50000000"],
+    ]
+    .iter()
+    .map(|r| r.iter().map(|c| c.to_string()).collect())
+    .collect();
+    assert_eq!(rows, want);
+    assert_eq!(decode_rows(&encode_rows(&rows)), rows);
+}
+
+#[test]
+fn sql_paths_escape_single_quotes() {
+    assert_eq!(sql_path(Path::new("/tmp/it's.csv")), "'/tmp/it''s.csv'");
 }
