@@ -718,8 +718,63 @@ struct Resolved {
     schema: SchemaRef,
     files: Vec<String>,
     physical: BTreeMap<String, String>,
+    /// Iceberg field ids recorded in the metadata; empty for Delta.
+    field_ids: FieldIds,
     /// `mizuchi.encryption` from the latest metadata commit, if any.
     encryption: Option<Value>,
+}
+
+/// Iceberg field ids by column name, plus the table's `last-column-id`.
+/// An id stays with its field for the table's lifetime; a new field takes
+/// `last + 1`, so a dropped id is never reused.
+#[derive(Clone, Debug, Default)]
+struct FieldIds {
+    by_name: BTreeMap<String, i64>,
+    last: i64,
+}
+
+impl FieldIds {
+    /// Ids recorded in the current schema of Iceberg metadata `md`.
+    fn recorded(md: &Value) -> Self {
+        let mut by_name = BTreeMap::new();
+        let fields = iceberg_current_schema(md)
+            .ok()
+            .and_then(|s| s.get("fields"))
+            .and_then(Value::as_array);
+        for f in fields.into_iter().flatten() {
+            if let (Some(name), Some(id)) = (
+                f.get("name").and_then(Value::as_str),
+                f.get("id").and_then(Value::as_i64).filter(|id| *id > 0),
+            ) {
+                by_name.insert(name.to_string(), id);
+            }
+        }
+        let max = by_name.values().copied().max().unwrap_or(0);
+        let last = md
+            .get("last-column-id")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(max);
+        Self { by_name, last }
+    }
+
+    /// Ids for `schema`: a recorded field keeps its id, a new one takes the
+    /// next unused id.
+    fn assign(&self, schema: &Schema) -> Self {
+        let mut last = self.last;
+        let by_name = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let id = self.by_name.get(f.name()).copied().unwrap_or_else(|| {
+                    last += 1;
+                    last
+                });
+                (f.name().clone(), id)
+            })
+            .collect();
+        Self { by_name, last }
+    }
 }
 
 fn write_delta_io(
@@ -925,6 +980,7 @@ fn delta_replay(io: &dyn LakeIo, travel: TimeTravel) -> Result<Resolved> {
         schema,
         files,
         physical,
+        field_ids: FieldIds::default(),
         encryption,
     })
 }
@@ -1006,7 +1062,11 @@ fn write_iceberg_io(
             .map_err(|e| Error::Io(e.to_string()))?
             .as_bytes(),
     )?;
-    let field_ids = field_ids_of(&schema, current.as_ref().map(|c| c.schema.as_ref()));
+    let field_ids = current
+        .as_ref()
+        .map(|c| c.field_ids.clone())
+        .unwrap_or_default()
+        .assign(&schema);
     let metadata = iceberg_metadata(
         io,
         next_ver,
@@ -1040,12 +1100,18 @@ fn write_iceberg_io(
 
 fn evolve_iceberg_io(io: &dyn LakeIo, change: SchemaEvolution) -> Result<LakeSnapshot> {
     let cur = iceberg_replay(io, TimeTravel::Latest)?;
+    let mut recorded = cur.field_ids.clone();
+    if let SchemaEvolution::RenameColumn { from, to } = &change
+        && let Some(id) = recorded.by_name.remove(from)
+    {
+        recorded.by_name.insert(to.clone(), id);
+    }
     let (schema, physical) = apply_evolution(cur.schema.clone(), cur.physical.clone(), change)?;
     let now = now_ms();
     let next_ver = cur.meta.version + 1;
     let snapshot_id = cur.meta.snapshot_id;
     let manifest_rel = format!("metadata/snap-{snapshot_id}.json");
-    let field_ids = field_ids_of(&schema, Some(cur.schema.as_ref()));
+    let field_ids = recorded.assign(&schema);
     let metadata = iceberg_metadata(
         io,
         next_ver,
@@ -1131,6 +1197,7 @@ fn iceberg_replay(io: &dyn LakeIo, travel: TimeTravel) -> Result<Resolved> {
         schema,
         files,
         physical,
+        field_ids: FieldIds::recorded(&md),
         encryption,
     })
 }
@@ -1183,7 +1250,7 @@ fn iceberg_metadata(
     now: i64,
     schema: &Schema,
     physical: &BTreeMap<String, String>,
-    field_ids: &BTreeMap<String, i64>,
+    field_ids: &FieldIds,
     manifest_rel: &str,
     previous: Option<&Resolved>,
     keep_encryption: Option<&Value>,
@@ -1215,7 +1282,7 @@ fn iceberg_metadata(
     for f in schema.fields() {
         let ty = iceberg_type(f.data_type())?;
         fields.push(json!({
-            "id": field_ids.get(f.name()).copied().unwrap_or(0),
+            "id": field_ids.by_name.get(f.name()).copied().unwrap_or(0),
             "name": f.name(),
             "required": false,
             "type": ty,
@@ -1228,7 +1295,7 @@ fn iceberg_metadata(
         "location": io.label(),
         "last-sequence-number": version,
         "last-updated-ms": now,
-        "last-column-id": field_ids.values().copied().max().unwrap_or(0),
+        "last-column-id": field_ids.last,
         "current-schema-id": version,
         "schemas": [{
             "type": "struct",
@@ -1314,17 +1381,22 @@ fn iceberg_properties(io: &dyn LakeIo, keep: Option<&Value>) -> Value {
     }
 }
 
-fn parse_iceberg_schema(md: &Value) -> Result<SchemaRef> {
+/// The schema `current-schema-id` names, else the last one listed.
+fn iceberg_current_schema(md: &Value) -> Result<&Value> {
     let schemas = md
         .get("schemas")
         .and_then(Value::as_array)
         .ok_or_else(|| Error::Io("Iceberg metadata missing schemas".into()))?;
     let current = md.get("current-schema-id").and_then(Value::as_i64);
-    let schema = schemas
+    schemas
         .iter()
         .find(|s| s.get("schema-id").and_then(Value::as_i64) == current)
         .or(schemas.last())
-        .ok_or_else(|| Error::Io("Iceberg schema not found".into()))?;
+        .ok_or_else(|| Error::Io("Iceberg schema not found".into()))
+}
+
+fn parse_iceberg_schema(md: &Value) -> Result<SchemaRef> {
+    let schema = iceberg_current_schema(md)?;
     let fields = schema
         .get("fields")
         .and_then(Value::as_array)
@@ -1368,25 +1440,6 @@ fn iceberg_physical(md: &Value) -> BTreeMap<String, String> {
         }
     }
     map
-}
-
-fn field_ids_of(schema: &Schema, previous: Option<&Schema>) -> BTreeMap<String, i64> {
-    let mut ids = BTreeMap::new();
-    let mut next = 1i64;
-    if let Some(prev) = previous {
-        for (i, f) in prev.fields().iter().enumerate() {
-            ids.insert(f.name().clone(), (i as i64) + 1);
-            next = next.max((i as i64) + 2);
-        }
-    }
-    for f in schema.fields() {
-        if !ids.contains_key(f.name()) {
-            // renamed: try to keep id by matching later; assign next
-            ids.insert(f.name().clone(), next);
-            next += 1;
-        }
-    }
-    ids
 }
 
 fn schema_of(batches: &[Batch]) -> Result<SchemaRef> {
@@ -2138,6 +2191,100 @@ mod tests {
         assert!(got[0].schema().field_with_name("extra").is_ok());
         let extra = got[0].column_by_name("extra").unwrap();
         assert!(extra.is_null(0));
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// Field ids and `last-column-id` from the latest Iceberg metadata.
+    fn iceberg_field_ids(dest: &Path) -> (Vec<(String, i64)>, i64) {
+        let hint = fs::read_to_string(dest.join("metadata/version-hint.text")).unwrap();
+        let md: Value = serde_json::from_slice(
+            &fs::read(dest.join(format!("metadata/v{hint}.metadata.json"))).unwrap(),
+        )
+        .unwrap();
+        let fields = md["schemas"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["name"].as_str().unwrap().to_string(),
+                    f["id"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        (fields, md["last-column-id"].as_i64().unwrap())
+    }
+
+    fn named(fields: &[(&str, i64)]) -> Vec<(String, i64)> {
+        fields.iter().map(|(n, id)| (n.to_string(), *id)).collect()
+    }
+
+    /// Ids follow a field across add, rename, and an overwrite that drops and
+    /// reorders columns; a new field never reuses an id, even a dropped one.
+    #[test]
+    fn iceberg_field_ids_survive_schema_changes() {
+        let dest = tmp();
+        write_iceberg(&dest, &[batch_i64()], WriteMode::Overwrite).unwrap();
+        assert_eq!(
+            iceberg_field_ids(&dest),
+            (named(&[("id", 1), ("name", 2)]), 2)
+        );
+
+        let add = |name: &str| SchemaEvolution::AddColumn {
+            name: name.into(),
+            data_type: DataType::Int64,
+        };
+        evolve_iceberg(&dest, add("extra")).unwrap();
+        evolve_iceberg(
+            &dest,
+            SchemaEvolution::RenameColumn {
+                from: "name".into(),
+                to: "label".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            iceberg_field_ids(&dest),
+            (named(&[("id", 1), ("label", 2), ("extra", 3)]), 3)
+        );
+        let got = read_iceberg(&dest, TimeTravel::Latest).unwrap();
+        assert_eq!(ids(&got), vec![1, 2]);
+        let label = got[0]
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!((label.value(0), label.value(1)), ("a", "b"));
+
+        // Drop `extra` and reorder the rest.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("label", DataType::Utf8, true),
+            Field::new("id", DataType::Int64, true),
+        ]));
+        let reordered = Batch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("c")])),
+                Arc::new(Int64Array::from(vec![Some(3)])),
+            ],
+        )
+        .unwrap();
+        write_iceberg(&dest, &[reordered], WriteMode::Overwrite).unwrap();
+        assert_eq!(
+            iceberg_field_ids(&dest),
+            (named(&[("label", 2), ("id", 1)]), 3)
+        );
+
+        evolve_iceberg(&dest, add("extra")).unwrap();
+        assert_eq!(
+            iceberg_field_ids(&dest),
+            (named(&[("label", 2), ("id", 1), ("extra", 4)]), 4)
+        );
+        assert_eq!(
+            ids(&read_iceberg(&dest, TimeTravel::Latest).unwrap()),
+            vec![3]
+        );
         let _ = fs::remove_dir_all(&dest);
     }
 
