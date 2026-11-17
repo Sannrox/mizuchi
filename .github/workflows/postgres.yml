@@ -44,4 +44,4 @@ jobs:
       - name: Pushdown SQL (default tests)
         run: cargo test --locked -p mizuchi-postgres --lib
       - name: Live source
-        run: cargo test --locked --test postgres --features postgres -- --ignored --test-threads=1
+        run: cargo test --locked -p mizuchi --test postgres --features postgres -- --ignored --test-threads=1
