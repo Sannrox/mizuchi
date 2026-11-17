@@ -209,8 +209,9 @@ fn parse_csv_rows(stdout: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn run_duckdb(dir: &Path) -> Option<Vec<EngineRun>> {
-    let bin = which("duckdb")?;
+/// Runs the queries on an installed duckdb CLI. Any failure is an error: a
+/// present binary that cannot produce results must not fall back to goldens.
+fn run_duckdb(dir: &Path, bin: &Path) -> Result<Vec<EngineRun>, String> {
     let mut sql = csv_create_sql(dir);
     for q in QUERIES {
         let out = dir.join(format!("duckdb-{}.csv", q.id));
@@ -221,23 +222,30 @@ fn run_duckdb(dir: &Path) -> Option<Vec<EngineRun>> {
         ));
     }
     let start = Instant::now();
-    let got = Command::new(&bin).args(["-c", &sql]).output().ok()?;
+    let got = Command::new(bin)
+        .args(["-c", &sql])
+        .output()
+        .map_err(|e| format!("could not start {}: {e}", bin.display()))?;
     let total = start.elapsed().as_secs_f64() * 1000.0;
     if !got.status.success() {
-        eprintln!("duckdb failed: {}", String::from_utf8_lossy(&got.stderr));
-        return None;
+        return Err(format!(
+            "exited with {}: {}",
+            got.status,
+            String::from_utf8_lossy(&got.stderr)
+        ));
     }
     let per = total / QUERIES.len() as f64;
     let mut out = Vec::new();
     for q in QUERIES {
-        let text = fs::read_to_string(dir.join(format!("duckdb-{}.csv", q.id))).ok()?;
+        let path = dir.join(format!("duckdb-{}.csv", q.id));
+        let text = fs::read_to_string(&path).map_err(|e| format!("no result for {}: {e}", q.id))?;
         out.push(EngineRun {
             source: "live",
             elapsed_ms: per,
             rows: parse_csv_rows(&text),
         });
     }
-    Some(out)
+    Ok(out)
 }
 
 fn df_create_sql(dir: &Path) -> String {
@@ -252,49 +260,49 @@ fn df_create_sql(dir: &Path) -> String {
     s
 }
 
-fn run_datafusion(dir: &Path) -> Option<Vec<EngineRun>> {
-    let bin = which("datafusion-cli")?;
+/// Runs the queries on an installed datafusion-cli; failures are errors, as
+/// for [`run_duckdb`].
+fn run_datafusion(dir: &Path, bin: &Path) -> Result<Vec<EngineRun>, String> {
     let mut script = df_create_sql(dir);
     for q in QUERIES {
         script.push_str(q.sql);
         script.push_str(";\n");
     }
     let path = dir.join("datafusion.sql");
-    fs::write(&path, &script).ok()?;
+    fs::write(&path, &script).map_err(|e| format!("could not write script: {e}"))?;
     let start = Instant::now();
-    let got = Command::new(&bin)
-        .args(["-f", path.to_str()?])
+    let got = Command::new(bin)
+        .arg("-f")
+        .arg(&path)
         .output()
-        .ok()?;
+        .map_err(|e| format!("could not start {}: {e}", bin.display()))?;
     let total = start.elapsed().as_secs_f64() * 1000.0;
     if !got.status.success() {
-        eprintln!(
-            "datafusion failed: {}",
+        return Err(format!(
+            "exited with {}: {}",
+            got.status,
             String::from_utf8_lossy(&got.stderr)
-        );
-        return None;
+        ));
     }
     let blocks = split_df_tables(&String::from_utf8_lossy(&got.stdout));
     if blocks.len() != QUERIES.len() {
-        eprintln!(
-            "datafusion expected {} result tables, got {}",
+        return Err(format!(
+            "expected {} result tables, got {}; stderr: {}",
             QUERIES.len(),
-            blocks.len()
-        );
-        return None;
+            blocks.len(),
+            String::from_utf8_lossy(&got.stderr)
+        ));
     }
     let per = total / QUERIES.len() as f64;
-    Some(
-        QUERIES
-            .iter()
-            .zip(blocks)
-            .map(|(_q, rows)| EngineRun {
-                source: "live",
-                elapsed_ms: per,
-                rows,
-            })
-            .collect(),
-    )
+    Ok(QUERIES
+        .iter()
+        .zip(blocks)
+        .map(|(_q, rows)| EngineRun {
+            source: "live",
+            elapsed_ms: per,
+            rows,
+        })
+        .collect())
 }
 
 fn split_df_tables(stdout: &str) -> Vec<Vec<Vec<String>>> {
@@ -356,9 +364,16 @@ fn which(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn reference_for(engine: &'static str, live: Option<Vec<EngineRun>>) -> Vec<EngineRun> {
-    if let Some(live) = live {
-        return live;
+/// Live results when the engine's binary is installed, goldens only when it
+/// is absent. An installed binary whose run fails panics with its error.
+fn reference_for(
+    engine: &'static str,
+    live: Option<Result<Vec<EngineRun>, String>>,
+) -> Vec<EngineRun> {
+    match live {
+        Some(Ok(live)) => return live,
+        Some(Err(e)) => panic!("{engine} is installed but its run failed: {e}"),
+        None => {}
     }
     QUERIES
         .iter()
@@ -463,8 +478,11 @@ fn tiny_compare_matches_reference_goldens() {
     let tmp = &dir.0;
     write_tables_csv(tmp);
     let mizuchi = run_mizuchi();
-    let duckdb = reference_for("duckdb", run_duckdb(tmp));
-    let datafusion = reference_for("datafusion", run_datafusion(tmp));
+    let duckdb = reference_for("duckdb", which("duckdb").map(|b| run_duckdb(tmp, &b)));
+    let datafusion = reference_for(
+        "datafusion",
+        which("datafusion-cli").map(|b| run_datafusion(tmp, &b)),
+    );
     let (json, ok) = report_json(&mizuchi, &duckdb, &datafusion);
     println!("{json}");
     assert!(json.contains("\"time_ratio\""));
@@ -481,8 +499,16 @@ fn record_goldens_if_requested() {
     let dir = TempDir::new("engine-compare-record");
     let tmp = &dir.0;
     write_tables_csv(tmp);
-    let duck = run_duckdb(tmp).expect("duckdb CLI required to record goldens");
-    let df = run_datafusion(tmp).expect("datafusion-cli required to record goldens");
+    let duck = run_duckdb(
+        tmp,
+        &which("duckdb").expect("duckdb CLI required to record goldens"),
+    )
+    .unwrap_or_else(|e| panic!("duckdb failed: {e}"));
+    let df = run_datafusion(
+        tmp,
+        &which("datafusion-cli").expect("datafusion-cli required to record goldens"),
+    )
+    .unwrap_or_else(|e| panic!("datafusion failed: {e}"));
     for (engine, runs) in [("duckdb", duck), ("datafusion", df)] {
         let dir = golden_dir().join(engine);
         fs::create_dir_all(&dir).unwrap();
@@ -490,4 +516,36 @@ fn record_goldens_if_requested() {
             fs::write(dir.join(format!("{}.txt", q.id)), encode_rows(&run.rows)).unwrap();
         }
     }
+}
+
+/// Writes an executable shell script that prints to stderr and exits 1.
+#[cfg(unix)]
+fn failing_stub(dir: &Path, name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    fs::write(&path, "#!/bin/sh\necho stub-engine-broke >&2\nexit 3\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn an_installed_reference_that_fails_reports_its_stderr() {
+    let dir = TempDir::new("engine-compare-stub");
+    let tmp = &dir.0;
+    write_tables_csv(tmp);
+    let duck = run_duckdb(tmp, &failing_stub(tmp, "duckdb"))
+        .err()
+        .expect("a failing stub must not succeed");
+    assert!(duck.contains("stub-engine-broke"), "{duck}");
+    let df = run_datafusion(tmp, &failing_stub(tmp, "datafusion-cli"))
+        .err()
+        .expect("a failing stub must not succeed");
+    assert!(df.contains("stub-engine-broke"), "{df}");
+}
+
+#[test]
+#[should_panic(expected = "duckdb is installed but its run failed: stub-engine-broke")]
+fn a_failed_reference_run_does_not_fall_back_to_goldens() {
+    reference_for("duckdb", Some(Err("stub-engine-broke".into())));
 }
