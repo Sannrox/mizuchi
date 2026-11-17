@@ -198,9 +198,13 @@ jobs:
   # a Breaking/Upgrade line or section, as scripts/changelog-draft.sh reads
   # it) and labelled `risk:breaking`, which the release manifest turns into a
   # gate.
+  #
+  # A pull request reads caches only from its own ref and its base branch, so
+  # pushes to main run the same builds to save the dependency cache that every
+  # pull request restores; they check nothing.
   semver:
     name: Semver
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -219,13 +223,23 @@ jobs:
         with:
           # Bump with the toolchain: each release reads a range of rustdoc JSON formats.
           tool: cargo-semver-checks@0.51.0
+      - name: Warm the dependency cache
+        if: github.event_name == 'push'
+        run: cargo semver-checks --workspace --baseline-rev HEAD
       - name: cargo-semver-checks
+        if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
+          # Only crates, manifests, the toolchain, or this workflow can change
+          # what the check reports. A failed diff falls through to the check.
+          if git diff --quiet "$BASE" HEAD -- crates Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows/ci.yml; then
+            echo "::notice::No crate, manifest, toolchain or CI change against the base; nothing to check."
+            exit 0
+          fi
           # Every workspace library crate, so a new crate is covered without editing this list.
           metadata="$(cargo metadata --locked --no-deps --format-version 1)"
           mapfile -t packages < <(jq -r '.packages[] | select(any(.targets[]; .kind | index("lib"))) | .name' <<<"$metadata")
