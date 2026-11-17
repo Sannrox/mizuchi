@@ -641,13 +641,22 @@ fn split_name(body: &[u8]) -> std::result::Result<(String, &[u8]), Status> {
     Ok((name, &body[1 + n..]))
 }
 
-fn prefix_name(name: &str, payload: &[u8]) -> Vec<u8> {
+/// Frames `name` ahead of `payload` behind a one-byte length, the format
+/// `split_name` reads. A name longer than 255 bytes cannot be framed and is
+/// refused rather than misframing the payload.
+fn prefix_name(name: &str, payload: &[u8]) -> Result<Vec<u8>> {
     let bytes = name.as_bytes();
+    let len = u8::try_from(bytes.len()).map_err(|_| {
+        Error::Plan(format!(
+            "name of {} bytes exceeds the 255-byte limit",
+            bytes.len()
+        ))
+    })?;
     let mut out = Vec::with_capacity(1 + bytes.len() + payload.len());
-    out.push(u8::try_from(bytes.len()).unwrap_or(255));
+    out.push(len);
     out.extend_from_slice(bytes);
     out.extend_from_slice(payload);
-    out
+    Ok(out)
 }
 
 struct Peer {
@@ -762,7 +771,7 @@ impl RemoteCluster {
     /// A refusal (a bad table, a fence) is returned at once; an unreachable
     /// worker is marked dead and skipped.
     pub fn register(&self, name: &str, schema: SchemaRef, batches: Vec<Batch>) -> Result<()> {
-        let payload = prefix_name(name, &encode_table(&schema, &batches)?);
+        let payload = prefix_name(name, &encode_table(&schema, &batches)?)?;
         let mut last = None;
         for peer in &self.peers {
             if is_dead(peer) {
@@ -879,10 +888,10 @@ impl RemoteCluster {
         let reader = peers
             .get(reader)
             .ok_or_else(|| Error::Plan("unknown shuffle reader".into()))?;
-        let payload = prefix_name(key, &encode_batches(batches)?);
+        let payload = prefix_name(key, &encode_batches(batches)?)?;
         action(&owner.addr, "put_shuffle", &payload, self.token()?)?;
         touch(owner);
-        let ticket = prefix_name(&owner.addr, key.as_bytes());
+        let ticket = prefix_name(&owner.addr, key.as_bytes())?;
         let token = self.token()?;
         let fetched = match action(&reader.addr, "fetch_shuffle", &ticket, token) {
             Ok(body) => {
@@ -1137,6 +1146,26 @@ mod tests {
     }
 
     #[test]
+    fn a_table_name_over_255_bytes_is_refused_and_255_round_trips() {
+        let cluster = two_workers();
+        let (schema, batches) = numbers(3);
+        let err = cluster
+            .register(&"n".repeat(256), schema.clone(), batches.clone())
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Plan(m) if m.contains("255-byte limit")),
+            "{err:?}"
+        );
+        let name = "n".repeat(255);
+        cluster.register(&name, schema, batches).unwrap();
+        let out = cluster
+            .execute_sql(&format!("SELECT a FROM {name}"))
+            .unwrap();
+        assert_eq!(rows(&out), 3);
+        assert_eq!(cluster.live_workers(), 2);
+    }
+
+    #[test]
     fn an_empty_table_registers_and_leaves_workers_live() {
         let cluster = two_workers();
         let (schema, _) = numbers(0);
@@ -1281,11 +1310,11 @@ mod tests {
         const THREADS: usize = 2;
         let (addr, _state, stop, handle) = narrow_worker(THREADS);
         let (_, batches) = numbers(3);
-        let put = prefix_name("p", &encode_batches(&batches).unwrap());
+        let put = prefix_name("p", &encode_batches(&batches).unwrap()).unwrap();
         action(&addr.to_string(), "put_shuffle", &put, None).unwrap();
         // Each fetch asks this same worker for the partition, so every fetch
         // needs a free runtime thread to serve the owner's side.
-        let ticket = prefix_name(&addr.to_string(), b"p");
+        let ticket = prefix_name(&addr.to_string(), b"p").unwrap();
         let rt = rt().unwrap();
         let out = rt.block_on(async {
             tokio::time::timeout(
@@ -1307,7 +1336,7 @@ mod tests {
         const THREADS: usize = 2;
         let (addr, state, stop, handle) = narrow_worker(THREADS);
         let (schema, batches) = numbers(3);
-        let table = prefix_name("t", &encode_table(&schema, &batches).unwrap());
+        let table = prefix_name("t", &encode_table(&schema, &batches).unwrap()).unwrap();
         action(&addr.to_string(), "register", &table, None).unwrap();
         let session = state.sessions.lock().unwrap().get(&None).cloned().unwrap();
         let held = session.lock().unwrap();
