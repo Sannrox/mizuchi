@@ -196,7 +196,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.verify-tag.outputs.tag }}
         run: bash scripts/release/github-release.sh guard "$TAG"
-      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -388,7 +388,7 @@ jobs:
           bash scripts/release/github-release.sh draft "$TAG" "$SHA" dist/RELEASE_NOTES.md
           dist/*.tar.gz dist/*.whl dist/mizuchi.cdx.json dist/mizuchi-release.json
           dist/mizuchi-tenkai.toml dist/SHA256SUMS
-      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
