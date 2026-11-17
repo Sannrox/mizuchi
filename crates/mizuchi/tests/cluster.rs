@@ -8,16 +8,21 @@ use std::sync::Arc;
 use arrow::array::Int64Array;
 use mizuchi::{Batch, Cluster, ClusterConfig, DataType, Field, RecordBatch, Schema, Session};
 
+/// Column `a` holding `0..n`, split into batches of four rows so results do
+/// not depend on a single-batch input.
 fn numbered(n: i64) -> (arrow::datatypes::SchemaRef, Vec<Batch>) {
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int64Array::from(
-            (0..n).map(Some).collect::<Vec<_>>(),
-        ))],
-    )
-    .unwrap();
-    (schema, vec![Batch::from_arrow(batch).unwrap()])
+    let batches = (0..n)
+        .step_by(4)
+        .map(|start| {
+            let rows = (start..(start + 4).min(n)).map(Some).collect::<Vec<_>>();
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(rows))])
+                    .unwrap();
+            Batch::from_arrow(batch).unwrap()
+        })
+        .collect();
+    (schema, batches)
 }
 
 fn root() -> std::path::PathBuf {
@@ -64,8 +69,10 @@ fn two_workers_match_single_session() {
     let sql = "SELECT a FROM t WHERE a < 10";
     let a = one.execute_sql(sql).unwrap();
     let b = two.execute_sql(sql).unwrap();
+    // No ORDER BY: compare the rows as a set.
     let col = |out: &[Batch]| {
-        out.iter()
+        let mut values = out
+            .iter()
             .flat_map(|batch| {
                 batch
                     .as_arrow()
@@ -76,8 +83,11 @@ fn two_workers_match_single_session() {
                     .iter()
                     .map(|v| v.unwrap())
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        values
     };
+    assert_eq!(col(&a), (0..10).collect::<Vec<_>>());
     assert_eq!(col(&a), col(&b));
 }
 
