@@ -4,6 +4,7 @@
 
 mod agg;
 mod cache;
+pub use cache::DEFAULT_RESULT_CACHE_BYTES;
 mod cluster;
 mod config;
 mod engine;
@@ -105,6 +106,8 @@ pub struct Session {
     advisory_partition_size: u64,
     /// Results of executed plans, keyed by plan text and table generations.
     cache: Mutex<cache::QueryCache>,
+    /// Byte budget of `cache`; `None` is [`DEFAULT_RESULT_CACHE_BYTES`].
+    result_cache_bytes: Option<u64>,
     /// Selects a physical implementation per operator. CPU by default.
     lowering: op::LoweringArc,
     allowed_read_paths: Vec<PathBuf>,
@@ -145,6 +148,7 @@ impl Default for Session {
             skew_threshold: 256 * 1024 * 1024,
             advisory_partition_size: 64 * 1024 * 1024,
             cache: Mutex::new(cache::QueryCache::default()),
+            result_cache_bytes: None,
             lowering: op::LoweringArc::default(),
             allowed_read_paths: Vec::new(),
             allowed_write_paths: Vec::new(),
@@ -179,6 +183,7 @@ impl Clone for Session {
             // A clone is a new session copy (forked worker counts, tests).
             // It does not inherit cached results.
             cache: Mutex::new(cache::QueryCache::default()),
+            result_cache_bytes: self.result_cache_bytes,
             lowering: self.lowering.clone(),
             allowed_read_paths: self.allowed_read_paths.clone(),
             allowed_write_paths: self.allowed_write_paths.clone(),
@@ -368,6 +373,18 @@ impl Session {
     /// cannot be met and no spill directory is set.
     pub fn with_memory_limit(mut self, bytes: u64) -> Self {
         self.memory_limit = Some(bytes);
+        self
+    }
+
+    /// Byte budget for stored query results (Arrow bytes); 0 turns the
+    /// result cache off. The least recently used results are evicted to stay
+    /// within it. The budget is separate from the per-query memory limit and
+    /// never larger than it. Defaults to [`DEFAULT_RESULT_CACHE_BYTES`].
+    pub fn with_result_cache_bytes(mut self, bytes: u64) -> Self {
+        self.result_cache_bytes = Some(bytes);
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.clear();
+        }
         self
     }
 
@@ -1304,6 +1321,18 @@ impl Session {
         self.cache.lock().map(|c| c.hits).unwrap_or(0)
     }
 
+    /// Arrow bytes the result cache holds now; see
+    /// [`Self::with_result_cache_bytes`].
+    pub fn cached_result_bytes(&self) -> u64 {
+        self.cache.lock().map(|c| c.bytes()).unwrap_or(0)
+    }
+
+    fn result_cache_budget(&self) -> u64 {
+        self.result_cache_bytes
+            .unwrap_or(DEFAULT_RESULT_CACHE_BYTES)
+            .min(self.memory_limit.unwrap_or(u64::MAX))
+    }
+
     /// Plan and run `sql` against registered tables.
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<Batch>> {
         Ok(self.execute_sql_reported(sql)?.batches)
@@ -1584,7 +1613,7 @@ impl Session {
         self.cache
             .lock()
             .map_err(|_| Error::Eval("query cache lock poisoned".into()))?
-            .store(key, &out);
+            .store(key, &out, self.result_cache_budget());
         Ok(out)
     }
 
