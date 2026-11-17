@@ -44,6 +44,10 @@ use mizuchi_exec::{DirLeaseStore, Fence, LeaderStatus, Leadership, Session, Stag
 
 const HEARTBEAT_STALE: Duration = Duration::from_secs(2);
 
+/// How long a worker waits on a peer for one shuffle partition before it
+/// reports the fetch as failed, so the coordinator can fall back.
+const PEER_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Request metadata carrying the coordinator's fencing token.
 pub const FENCING_HEADER: &str = "x-mizuchi-fencing-token";
 
@@ -359,14 +363,18 @@ impl FlightService for FlightWorker {
             let sh = self.state.shuffle.lock().map_err(|_| lock_err())?;
             sh.get(&key).cloned()
         };
-        let batches = match batches {
-            Some(b) => b,
-            None => match &self.state.spill_dir {
-                Some(dir) if dir.join(format!("{key}.arrow")).exists() => {
-                    read_shuffle_spill(dir, &key).map_err(|e| Status::internal(e.to_string()))?
-                }
-                _ => return Err(Status::not_found(key)),
-            },
+        let batches = match (batches, self.state.spill_dir.clone()) {
+            (Some(b), _) => b,
+            (None, Some(dir)) => {
+                blocking(move || {
+                    if !dir.join(format!("{key}.arrow")).exists() {
+                        return Err(Status::not_found(key));
+                    }
+                    read_shuffle_spill(&dir, &key).map_err(|e| Status::internal(e.to_string()))
+                })
+                .await?
+            }
+            (None, None) => return Err(Status::not_found(key)),
         };
         // Data read after a successor raised the fence is not returned.
         self.state.fence.still_current(token).map_err(fenced)?;
@@ -395,19 +403,22 @@ impl FlightService for FlightWorker {
             self.state.fence.admit(token).map_err(fenced)?;
             self.state.retire_before(token);
         }
-        let state = &self.state;
+        let state = Arc::clone(&self.state);
+        let body = action.body;
+        // Engine work blocks, so it runs on the blocking pool; the runtime
+        // threads stay free for heartbeats and peer fetches meanwhile.
         let body = match action.r#type.as_str() {
             "heartbeat" => Vec::new(),
-            "register" => register_table(state, &action.body, token)?,
-            "execute" => execute_sql(state, &action.body, token)?,
+            "register" => blocking(move || register_table(&state, &body, token)).await?,
+            "execute" => blocking(move || execute_sql(&state, &body, token)).await?,
             "execute_slow" => {
                 // Yields the runtime while it waits, so other assignments
                 // (a successor's, say) are served meanwhile.
                 tokio::time::sleep(Duration::from_millis(400)).await;
-                execute_sql(state, &action.body, token)?
+                blocking(move || execute_sql(&state, &body, token)).await?
             }
-            "put_shuffle" => put_shuffle(state, &action.body, token)?,
-            "fetch_shuffle" => fetch_remote(state, &action.body, token)?,
+            "put_shuffle" => blocking(move || put_shuffle(&state, &body, token)).await?,
+            "fetch_shuffle" => fetch_remote(state, &body, token).await?,
             other => return Err(Status::invalid_argument(format!("unknown action {other}"))),
         };
         Ok(Response::new(
@@ -547,28 +558,39 @@ fn read_shuffle_spill(dir: &std::path::Path, key: &str) -> Result<Vec<Batch>> {
     )
 }
 
-fn fetch_remote(
-    state: &WorkerState,
+/// Fetches shuffle partition `owner`/`key` from its owner for this reader.
+/// The call is awaited on the runtime, bounded by [`PEER_FETCH_TIMEOUT`], so
+/// a slow or hung owner never holds a runtime thread.
+async fn fetch_remote(
+    state: Arc<WorkerState>,
     body: &[u8],
     token: Option<u64>,
 ) -> std::result::Result<Vec<u8>, Status> {
     let (owner, key) = split_name(body)?;
-    let key = std::str::from_utf8(key)
-        .map_err(|_| Status::invalid_argument("key"))?
-        .to_string();
-    // The Flight handler already sits on a Tokio runtime. A nested
-    // `Runtime::new().block_on` panics, so the client call runs on its own thread.
+    let key = std::str::from_utf8(key).map_err(|_| Status::invalid_argument("key"))?;
     // The owner checks the same token the reader was assigned under.
-    let batches = std::thread::spawn(move || fetch_shuffle(&owner, &key, token))
-        .join()
-        .map_err(|_| Status::internal("shuffle fetch thread"))?
+    let batches = tokio::time::timeout(PEER_FETCH_TIMEOUT, fetch_shuffle_async(&owner, key, token))
+        .await
+        .map_err(|_| Status::deadline_exceeded(format!("shuffle fetch from {owner}")))?
         .map_err(|e| match Error::from(e) {
             // The owner's fence refusal reaches the coordinator as such.
             e @ Error::Fenced(_) => fenced(e),
             e => Status::internal(e.to_string()),
         })?;
-    state.fence.still_current(token).map_err(fenced)?;
-    encode_batches(&batches).map_err(|e| Status::internal(e.to_string()))
+    blocking(move || {
+        state.fence.still_current(token).map_err(fenced)?;
+        encode_batches(&batches).map_err(|e| Status::internal(e.to_string()))
+    })
+    .await
+}
+
+/// Runs blocking `work` on the runtime's blocking pool and awaits it.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> std::result::Result<T, Status> + Send + 'static,
+) -> std::result::Result<T, Status> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| Status::internal(format!("worker task: {e}")))?
 }
 
 fn split_name(body: &[u8]) -> std::result::Result<(String, &[u8]), Status> {
@@ -937,21 +959,23 @@ fn action(addr: &str, kind: &str, body: &[u8], token: Option<u64>) -> CallResult
 }
 
 fn fetch_shuffle(owner: &str, key: &str, token: Option<u64>) -> CallResult<Vec<Batch>> {
-    let rt = rt().map_err(CallError::Transport)?;
-    rt.block_on(async {
-        let mut client = connect(owner, token).await.map_err(CallError::Transport)?;
-        let stream = client
-            .do_get(Ticket {
-                ticket: key.as_bytes().to_vec().into(),
-            })
-            .await
-            .map_err(flight_error)?;
-        let rbs: Vec<RecordBatch> = stream.try_collect().await.map_err(flight_error)?;
-        rbs.into_iter()
-            .map(Batch::from_arrow)
-            .collect::<Result<_>>()
-            .map_err(CallError::Refused)
-    })
+    rt().map_err(CallError::Transport)?
+        .block_on(fetch_shuffle_async(owner, key, token))
+}
+
+async fn fetch_shuffle_async(owner: &str, key: &str, token: Option<u64>) -> CallResult<Vec<Batch>> {
+    let mut client = connect(owner, token).await.map_err(CallError::Transport)?;
+    let stream = client
+        .do_get(Ticket {
+            ticket: key.as_bytes().to_vec().into(),
+        })
+        .await
+        .map_err(flight_error)?;
+    let rbs: Vec<RecordBatch> = stream.try_collect().await.map_err(flight_error)?;
+    rbs.into_iter()
+        .map(Batch::from_arrow)
+        .collect::<Result<_>>()
+        .map_err(CallError::Refused)
 }
 
 /// Sorts a failed call into a worker's refusal or a transport failure. The
@@ -1128,6 +1152,153 @@ mod tests {
         assert_eq!(rows(&cluster.execute_sql("SELECT a FROM t").unwrap()), 3);
         stop.send(()).unwrap();
         handle.join().unwrap().unwrap();
+    }
+
+    /// A worker served on a runtime with only `threads` worker threads, so a
+    /// handler that blocks a runtime thread starves the rest. The returned
+    /// sender stops it; the state lets a test hold its locks.
+    fn narrow_worker(
+        threads: usize,
+    ) -> (
+        SocketAddr,
+        Arc<WorkerState>,
+        tokio::sync::oneshot::Sender<()>,
+        JoinHandle<()>,
+    ) {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let worker = FlightWorker::new(None, None).unwrap();
+        let state = Arc::clone(&worker.state);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(threads)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(
+                Server::builder()
+                    .add_service(FlightServiceServer::new(worker))
+                    .serve_with_shutdown(addr, async {
+                        let _ = stopped.await;
+                    }),
+            )
+            .unwrap();
+        });
+        let start = Instant::now();
+        while std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(20)).is_err() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "worker did not bind"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        (addr, state, stop, handle)
+    }
+
+    /// Sends `count` copies of one action to `addr` at once, each on its own
+    /// connection, and waits at most `limit` for all of them.
+    async fn concurrent_actions(
+        addr: SocketAddr,
+        kind: &'static str,
+        body: Vec<u8>,
+        count: usize,
+    ) -> Vec<CallResult<Vec<u8>>> {
+        let calls = (0..count).map(|_| {
+            let body = body.clone();
+            tokio::spawn(async move { action_async(&addr.to_string(), kind, &body, None).await })
+        });
+        futures::future::join_all(calls)
+            .await
+            .into_iter()
+            .map(|joined| joined.unwrap())
+            .collect()
+    }
+
+    async fn action_async(
+        addr: &str,
+        kind: &str,
+        body: &[u8],
+        token: Option<u64>,
+    ) -> CallResult<Vec<u8>> {
+        let mut client = connect(addr, token).await.map_err(CallError::Transport)?;
+        let mut stream = client
+            .do_action(Action {
+                r#type: kind.into(),
+                body: body.to_vec().into(),
+            })
+            .await
+            .map_err(flight_error)?;
+        let msg = stream
+            .try_next()
+            .await
+            .map_err(flight_error)?
+            .ok_or_else(|| CallError::Transport(Error::Io("empty action result".into())))?;
+        Ok(msg.to_vec())
+    }
+
+    #[test]
+    fn more_peer_fetches_than_runtime_threads_all_complete() {
+        const THREADS: usize = 2;
+        let (addr, _state, stop, handle) = narrow_worker(THREADS);
+        let (_, batches) = numbers(3);
+        let put = prefix_name("p", &encode_batches(&batches).unwrap());
+        action(&addr.to_string(), "put_shuffle", &put, None).unwrap();
+        // Each fetch asks this same worker for the partition, so every fetch
+        // needs a free runtime thread to serve the owner's side.
+        let ticket = prefix_name(&addr.to_string(), b"p");
+        let rt = rt().unwrap();
+        let out = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                concurrent_actions(addr, "fetch_shuffle", ticket, THREADS + 1),
+            )
+            .await
+        });
+        let _ = stop.send(());
+        let out = out.expect("peer fetches starved the worker runtime");
+        handle.join().unwrap();
+        for body in out {
+            assert_eq!(rows(&decode_batches(&body.unwrap()).unwrap()), 3);
+        }
+    }
+
+    #[test]
+    fn a_heartbeat_is_answered_while_queries_wait_on_the_session() {
+        const THREADS: usize = 2;
+        let (addr, state, stop, handle) = narrow_worker(THREADS);
+        let (schema, batches) = numbers(3);
+        let table = prefix_name("t", &encode_table(&schema, &batches).unwrap());
+        action(&addr.to_string(), "register", &table, None).unwrap();
+        let session = state.sessions.lock().unwrap().get(&None).cloned().unwrap();
+        let held = session.lock().unwrap();
+        let rt = rt().unwrap();
+        // More queries than runtime threads, all blocked on the held session.
+        let queries = rt.spawn(concurrent_actions(
+            addr,
+            "execute",
+            b"SELECT a FROM t".to_vec(),
+            THREADS + 1,
+        ));
+        std::thread::sleep(Duration::from_millis(200));
+        let beat = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                action_async(&addr.to_string(), "heartbeat", &[], None),
+            )
+            .await
+        });
+        drop(held);
+        let out = rt.block_on(queries).unwrap();
+        let _ = stop.send(());
+        handle.join().unwrap();
+        beat.expect("heartbeat waited behind blocked queries")
+            .unwrap();
+        for body in out {
+            assert_eq!(rows(&decode_batches(&body.unwrap()).unwrap()), 3);
+        }
     }
 
     /// A unique spill directory for one test.
