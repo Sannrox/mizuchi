@@ -101,7 +101,16 @@ impl Default for PostgresReadOptions<'static> {
 pub fn postgres_scan_sql(opts: &PostgresReadOptions<'_>) -> Result<Vec<String>> {
     let from = match (opts.table, opts.query) {
         (Some(table), None) => quote_table(table),
-        (None, Some(query)) => format!("({query}) AS _mizuchi_src"),
+        (None, Some(query)) => {
+            // A trailing `;` would end the wrapped statement, and the closing
+            // parenthesis sits on its own line so a trailing `--` comment
+            // cannot swallow it.
+            let query = query.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+            if query.trim_start().is_empty() {
+                return Err(Error::Plan("PostgreSQL source query is empty".into()));
+            }
+            format!("({query}\n) AS _mizuchi_src")
+        }
         _ => {
             return Err(Error::Plan(
                 "PostgreSQL source needs a table or a query".into(),
@@ -615,6 +624,33 @@ mod tests {
             sqls[0],
             "SELECT \"id\", \"name\" FROM \"public\".\"items\" WHERE (\"id\" > 5)"
         );
+    }
+
+    /// A trailing line comment must not swallow the closing parenthesis, and
+    /// a trailing semicolon must not end the wrapped statement early.
+    #[test]
+    fn scan_sql_wraps_queries_ending_in_a_comment_or_semicolon() {
+        let sql = |query| {
+            postgres_scan_sql(&PostgresReadOptions {
+                query: Some(query),
+                ..PostgresReadOptions::default()
+            })
+            .unwrap()
+            .remove(0)
+        };
+        assert_eq!(
+            sql("SELECT 1 AS a -- note"),
+            "SELECT * FROM (SELECT 1 AS a -- note\n) AS _mizuchi_src"
+        );
+        assert_eq!(
+            sql("SELECT 1 AS a; \n"),
+            "SELECT * FROM (SELECT 1 AS a\n) AS _mizuchi_src"
+        );
+        let empty = postgres_scan_sql(&PostgresReadOptions {
+            query: Some(" ; "),
+            ..PostgresReadOptions::default()
+        });
+        assert!(empty.is_err());
     }
 
     #[test]
